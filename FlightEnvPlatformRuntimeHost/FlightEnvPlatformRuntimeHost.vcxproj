@@ -84,7 +84,7 @@
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)..\include;$(FlightEnvSharedDepsRoot)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)..\include;$(FlightEnvWorkspaceHome)flightenv-platform-pdk\include;$(FlightEnvSharedDepsRoot)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -105,9 +105,12 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\src\main.cpp" />
+    <ClCompile Include="..\src\NativeWorkflowRunner.cpp" />
     <ClCompile Include="..\src\PlatformRuntimeHost.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\AdapterSession.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\NativeWorkflowRunner.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\PlatformRuntimeHost.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

@@ -15,7 +15,16 @@ param(
 
     [int]$FutureMaxIterations = 1,
 
+    [int]$BranchChunkIterations = 1,
+
+    [int]$BranchWaitTimeoutSeconds = 120,
+
+    [ValidateSet('native_adapter_sessions')]
+    [string]$ExecutionBackend = 'native_adapter_sessions',
+
     [string]$ExternalObservationStream = "",
+
+    [string]$AdapterRegistry = "",
 
     [switch]$PreflightAdapters,
 
@@ -40,7 +49,9 @@ $compiledRoot = Join-Path $workspaceRoot '_local_artifacts\platform-pdk\compiled
 $compiledOnline = Join-Path $compiledRoot 'reentry.online_filtering_external_input.v1'
 $compiledFuture = Join-Path $compiledRoot 'reentry.posterior_future_prediction.v1'
 $exe = Join-Path $workspaceRoot "_deps\workspace\$Platform\$Configuration\FlightEnvPlatformRuntimeHost.exe"
-$registry = Join-Path $objectRoot 'tools\adapter_registries\ballistic_adapters.local.json'
+if ([string]::IsNullOrWhiteSpace($AdapterRegistry)) {
+    $AdapterRegistry = Join-Path $objectRoot 'tools\adapter_registries\ballistic_adapters.local.json'
+}
 
 if (-not $SkipBuild) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $runtimeRoot 'tools\build_platform_runtime.ps1') `
@@ -81,22 +92,29 @@ $hostArgs = @(
     '--object-package-root', $objectRoot,
     '--compiled-online', $compiledOnline,
     '--compiled-future', $compiledFuture,
-    '--adapter-registry', $registry,
+    '--adapter-registry', $AdapterRegistry,
     '--external-observation-stream', $ExternalObservationStream,
     '--run-id-prefix', $RunIdPrefix,
     '--run-root', $runRoot,
     '--chain-dir', $chainDir,
     '--python', $Python,
+    '--execution-backend', $ExecutionBackend,
     '--online-frames', "$OnlineFrames",
     '--prediction-every-frames', "$PredictionEveryFrames",
     '--future-max-iterations', "$FutureMaxIterations",
+    '--branch-chunk-iterations', "$BranchChunkIterations",
     '--max-concurrent-branches', '2'
 )
 if ($PreflightAdapters) {
     $hostArgs += '--preflight-adapters'
 }
 
-& $exe @hostArgs
+Push-Location $workspaceRoot
+try {
+    & $exe @hostArgs
+} finally {
+    Pop-Location
+}
 
 if ($LASTEXITCODE -ne 0) {
     throw "C++ Runtime Host smoke failed with exit code $LASTEXITCODE"
@@ -106,12 +124,38 @@ $summaryPath = Join-Path $chainDir 'mainline_summary.json'
 if (-not (Test-Path -LiteralPath $summaryPath -PathType Leaf)) {
     throw "mainline summary not generated: $summaryPath"
 }
+$deadline = (Get-Date).AddSeconds($BranchWaitTimeoutSeconds)
+do {
+    $summary = Get-Content -LiteralPath $summaryPath -Encoding UTF8 -Raw | ConvertFrom-Json
+    $prediction = $summary.prediction
+    $running = 0
+    $runCount = 0
+    if ($null -ne $prediction.PSObject.Properties['running_branch_count']) {
+        $running = [int]$prediction.running_branch_count
+    }
+    if ($null -ne $prediction.PSObject.Properties['run_count']) {
+        $runCount = [int]$prediction.run_count
+    }
+    if ($runCount -gt 0 -and $running -eq 0) {
+        break
+    }
+    Start-Sleep -Milliseconds 500
+} while ((Get-Date) -lt $deadline)
 $summary = Get-Content -LiteralPath $summaryPath -Encoding UTF8 -Raw | ConvertFrom-Json
 if ([int]$summary.online.effective_frames -le 0) {
     throw "online effective frames is zero"
 }
 if ([int]$summary.prediction.run_count -le 0) {
     throw "prediction branch count is zero"
+}
+
+$healthLedgerPath = Join-Path $chainDir 'health_ledger.json'
+if (-not (Test-Path -LiteralPath $healthLedgerPath -PathType Leaf)) {
+    throw "health ledger not generated: $healthLedgerPath"
+}
+$healthLedger = Get-Content -LiteralPath $healthLedgerPath -Encoding UTF8 -Raw | ConvertFrom-Json
+if ($healthLedger.schema_version -ne 'flightenv.platform.health_ledger.v1') {
+    throw "bad health ledger schema: $($healthLedger.schema_version)"
 }
 
 Write-Host "[OK] C++ Runtime Host smoke passed."
