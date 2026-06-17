@@ -1,0 +1,8 @@
+# Local build/package outputs
+*.zip
+*.7z
+*.log
+x64/
+Debug/
+Release/
+.vs/
