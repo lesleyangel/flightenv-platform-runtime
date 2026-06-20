@@ -107,11 +107,35 @@
     <ClCompile Include="..\src\main.cpp" />
     <ClCompile Include="..\src\NativeWorkflowRunner.cpp" />
     <ClCompile Include="..\src\PlatformRuntimeHost.cpp" />
+    <ClCompile Include="..\src\RuntimeProfileUtils.cpp" />
+    <ClCompile Include="..\src\RuntimeTypedBufferStore.cpp" />
+    <ClCompile Include="..\src\RuntimeTypedPayloadBridge.cpp" />
+    <ClCompile Include="..\src\RuntimeZeroCopyPolicy.cpp" />
+    <ClCompile Include="..\src\RuntimeTimeScheduler.cpp" />
+    <ClCompile Include="..\src\time\RuntimeEventQueue.cpp" />
+    <ClCompile Include="..\src\time\RuntimeInputAlignment.cpp" />
+    <ClCompile Include="..\src\time\RuntimeMaterialization.cpp" />
+    <ClCompile Include="..\src\time\RuntimePortSampleBuffer.cpp" />
+    <ClCompile Include="..\src\time\RuntimeTensorAlignment.cpp" />
+    <ClCompile Include="..\src\time\RuntimeTensorInterpolator.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\AdapterSession.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\NativeWorkflowRunner.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\PlatformRuntimeHost.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeProfileUtils.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeTypedBufferStore.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeTypedPayloadBridge.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeZeroCopyPolicy.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeTimeScheduler.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\time\RuntimeEventQueue.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\time\RuntimeInputAlignment.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\time\RuntimeMaterialization.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\time\RuntimeNodeClockState.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\time\RuntimePortSampleBuffer.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\time\RuntimeTensorAlignment.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\time\RuntimeTensorInterpolator.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\time\RuntimeTimeTypes.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

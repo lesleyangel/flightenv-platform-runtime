@@ -1,6 +1,20 @@
+/**
+ * @file PlatformRuntimeHost.cpp
+ * @brief 实现平台运行宿主门面。
+ *
+ * 大概：这是上层程序实际调用的平台 runtime 外壳。
+ * 具体：它把加载、启动、停止、推进、分支查询和 evidence 聚合包装成稳定入口。
+ * 被谁使用：被 runtime exe、launcher、SDK、UI 集成层和端到端测试使用。
+ * 使用谁：使用 NativeWorkflowRunner、RuntimeTimeScheduler、PDK runtime/evidence 类型。
+ * 拆分判断：能总结但偏门面聚合；新增复杂分支或证据逻辑时应拆成 BranchService/EvidenceService。
+ */
+
 #include "FlightEnvPlatformRuntime/PlatformRuntimeHost.hpp"
 
 #include "FlightEnvPlatformRuntime/NativeWorkflowRunner.hpp"
+#include "FlightEnvPlatformRuntime/RuntimeProfileUtils.hpp"
+#include "FlightEnvPlatformRuntime/RuntimeTypedBufferStore.hpp"
+#include "FlightEnvPlatformRuntime/RuntimeZeroCopyPolicy.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -404,11 +418,6 @@ json lastLoopIteration(const json& loop) {
 std::string branchStopReasonFromLoop(const json& loop) {
   const json last = lastLoopIteration(loop);
   return jsonString(last, "stop_reason", "");
-}
-
-bool branchLoopReachedPhysicalStop(const json& loop) {
-  const std::string reason = branchStopReasonFromLoop(loop);
-  return reason == "landing_point_reached" || reason == "failure_reached";
 }
 
 bool startsWith(const std::string& value, const std::string& prefix) {
@@ -840,29 +849,6 @@ bool matchesAccumulatedStatePolicy(const json& item, const json& profile) {
   return false;
 }
 
-double findNumberRecursive(const json& value, const std::vector<std::string>& keys, int depth = 0);
-
-double findMetricByProfile(const json& primary,
-                           const json& secondary,
-                           const json& profile,
-                           const std::string& metric_name,
-                           std::initializer_list<const char*> fallback_keys = {}) {
-  const json metric_keys =
-      profile.value("health_ledger", json::object()).value("metric_keys", json::object());
-  std::vector<std::string> keys = jsonStringArray(metric_keys, metric_name);
-  if (keys.empty()) {
-    for (const char* key : fallback_keys) {
-      keys.push_back(key);
-    }
-  }
-  for (const std::string& key : keys) {
-    if (primary.contains(key) && primary.at(key).is_number()) {
-      return primary.at(key).get<double>();
-    }
-  }
-  return findNumberRecursive(secondary, keys);
-}
-
 int extractFrameIndexFromSeedPath(const std::string& seed_runtime_outputs_ref) {
   const std::string token = "online_frame_";
   const std::size_t pos = seed_runtime_outputs_ref.find(token);
@@ -936,10 +922,60 @@ void offsetTimePoint(json& point, double time_offset_s, int tick_offset) {
   }
 }
 
+double publicTimeFromItem(const json& item, double fallback = 0.0) {
+  if (!item.is_object()) {
+    return fallback;
+  }
+  const double public_time = jsonDouble(item, "public_time_s", std::numeric_limits<double>::quiet_NaN());
+  if (std::isfinite(public_time)) {
+    return public_time;
+  }
+  const double public_output_time =
+      jsonDouble(item, "public_output_time_s", std::numeric_limits<double>::quiet_NaN());
+  if (std::isfinite(public_output_time)) {
+    return public_output_time;
+  }
+  const json time_point = item.value("time_point", json::object());
+  const double point_time = jsonDouble(time_point, "run_time_s", std::numeric_limits<double>::quiet_NaN());
+  if (std::isfinite(point_time)) {
+    return point_time;
+  }
+  return jsonDouble(item, "run_time_s", fallback);
+}
+
+void offsetNumericTimeField(json& item, const std::string& key, double time_offset_s) {
+  if (item.is_object() && item.contains(key) && item.at(key).is_number()) {
+    item[key] = item.at(key).get<double>() + time_offset_s;
+  }
+}
+
+void offsetPublicTimingMetadata(json& item, double time_offset_s) {
+  for (const std::string key : {"public_time_s", "public_output_time_s", "run_time_s",
+                                "source_time_s", "state_time_s"}) {
+    offsetNumericTimeField(item, key, time_offset_s);
+  }
+  if (item.contains("time_summary") && item.at("time_summary").is_object()) {
+    for (const std::string key : {"public_time_s", "public_output_time_s", "run_time_s"}) {
+      offsetNumericTimeField(item["time_summary"], key, time_offset_s);
+    }
+    if (item["time_summary"].contains("public_tick") &&
+        item["time_summary"]["public_tick"].is_object()) {
+      offsetNumericTimeField(item["time_summary"]["public_tick"], "output_time_s", time_offset_s);
+    }
+  }
+  if (item.contains("public_tick") && item.at("public_tick").is_object()) {
+    offsetNumericTimeField(item["public_tick"], "output_time_s", time_offset_s);
+  }
+  if (item.contains("time_info") && item.at("time_info").is_object()) {
+    offsetPublicTimingMetadata(item["time_info"], time_offset_s);
+  }
+}
+
 void offsetNestedTime(json& item, double time_offset_s, int tick_offset) {
   if (!item.is_object()) {
     return;
   }
+  offsetPublicTimingMetadata(item, time_offset_s);
   if (item.contains("time_point")) {
     offsetTimePoint(item["time_point"], time_offset_s, tick_offset);
   }
@@ -953,6 +989,44 @@ void offsetNestedTime(json& item, double time_offset_s, int tick_offset) {
     if (item["time_info"].contains("output_time_point")) {
       offsetTimePoint(item["time_info"]["output_time_point"], time_offset_s, tick_offset);
     }
+  }
+}
+
+void setTimePointToPublicTime(json& point, double public_time_s, int tick_index) {
+  if (!point.is_object()) {
+    point = json::object();
+  }
+  point["run_time_s"] = public_time_s;
+  point["source_time_s"] = public_time_s;
+  point["tick_index"] = tick_index;
+  point["stamp_ns"] = static_cast<long long>(public_time_s * 1.0e9);
+}
+
+void forceMainlinePublicTime(json& item, double public_time_s, int tick_index) {
+  if (!item.is_object() || !std::isfinite(public_time_s)) {
+    return;
+  }
+  const double local_public_time = publicTimeFromItem(item, public_time_s);
+  item["branch_relative_time_s"] = local_public_time;
+  item["public_time_s"] = public_time_s;
+  item["public_output_time_s"] = public_time_s;
+  item["run_time_s"] = public_time_s;
+  item["source_time_s"] = public_time_s;
+  if (item.contains("sample_time_s") && item.at("sample_time_s").is_number()) {
+    item["sample_time_s"] = public_time_s;
+  }
+  setTimePointToPublicTime(item["time_point"], public_time_s, tick_index);
+  if (item.contains("output_time_point")) {
+    setTimePointToPublicTime(item["output_time_point"], public_time_s, tick_index);
+  }
+  if (!item.contains("time_summary") || !item["time_summary"].is_object()) {
+    item["time_summary"] = json::object();
+  }
+  item["time_summary"]["public_time_s"] = public_time_s;
+  item["time_summary"]["public_output_time_s"] = public_time_s;
+  item["time_summary"]["branch_relative_time_s"] = local_public_time;
+  if (item.contains("time_info") && item.at("time_info").is_object()) {
+    forceMainlinePublicTime(item["time_info"], public_time_s, tick_index);
   }
 }
 
@@ -1158,34 +1232,6 @@ class ScopedDirectoryLock {
   bool locked_ = false;
 };
 
-double findNumberRecursive(const json& value, const std::vector<std::string>& keys, int depth) {
-  if (depth > 18) {
-    return std::numeric_limits<double>::quiet_NaN();
-  }
-  if (value.is_object()) {
-    for (const auto& key : keys) {
-      auto it = value.find(key);
-      if (it != value.end() && it->is_number()) {
-        return it->get<double>();
-      }
-    }
-    for (auto it = value.begin(); it != value.end(); ++it) {
-      const double found = findNumberRecursive(it.value(), keys, depth + 1);
-      if (std::isfinite(found)) {
-        return found;
-      }
-    }
-  } else if (value.is_array()) {
-    for (const auto& item : value) {
-      const double found = findNumberRecursive(item, keys, depth + 1);
-      if (std::isfinite(found)) {
-        return found;
-      }
-    }
-  }
-  return std::numeric_limits<double>::quiet_NaN();
-}
-
 int countFieldArtifacts(const fs::path& run_dir) {
   const fs::path root = run_dir / "field_artifacts";
   if (!fs::exists(root)) {
@@ -1221,10 +1267,30 @@ int countFieldArtifactEntries(const json& data_plane_manifest) {
   return count;
 }
 
+int countHeldOutputsInLoop(const json& runtime_loop_summary) {
+  int count = 0;
+  const json iterations = runtime_loop_summary.value("iterations", json::array());
+  if (!iterations.is_array()) {
+    return 0;
+  }
+  for (const auto& iteration : iterations) {
+    if (iteration.is_object()) {
+      count += jsonInt(iteration, "held_output_count", 0);
+    }
+  }
+  return count;
+}
+
 double workflowBaseDtS(const json& workflow_snapshot) {
   const json workflow = workflowFromSnapshot(workflow_snapshot);
   const json solver = workflow.value("solver_policy", json::object());
   return jsonDouble(solver, "base_dt_s", 0.0);
+}
+
+double workflowOutputPeriodS(const json& workflow_snapshot) {
+  const json workflow = workflowFromSnapshot(workflow_snapshot);
+  const json solver = workflow.value("solver_policy", json::object());
+  return jsonDouble(solver, "output_period_s", jsonDouble(solver, "base_dt_s", 0.0));
 }
 
 std::vector<std::string> splitArgs(int argc, char** argv) {
@@ -1275,6 +1341,7 @@ void printUsage() {
       << "FlightEnvPlatformRuntimeHost\n"
       << "  --workspace-root <path>\n"
       << "  --run-id-prefix <id>\n"
+      << "  --object-package-root <path>  # or FLIGHTENV_OBJECT_PACKAGE_ROOT\n"
       << "  --compiled-online <dir>\n"
       << "  --compiled-future <dir>\n"
       << "  --external-observation-stream <sensor_stream.json>\n"
@@ -1282,6 +1349,8 @@ void printUsage() {
       << "  --prediction-every-frames <N>\n"
       << "  --future-max-iterations <N>\n"
       << "  [--execution-backend native_adapter_sessions]\n"
+      << "  [--zero-copy-mode auto|prefer|require|off]\n"
+      << "  [--typed-buffer-persistence shadow_artifact|memory_only]\n"
       << "  [--execution-backend compiled_workflow_process_backend --allow-legacy-process-backend]  # compatibility only\n"
       << "  [--preflight-adapters]\n"
       << "  [--branch-chunk-iterations <N>]\n"
@@ -1314,10 +1383,12 @@ void PlatformRuntimeHost::resolveDefaults() {
   options_.pdk_root = fs::absolute(options_.pdk_root);
   if (options_.object_package_root.empty()) {
     const char* env_object_root = std::getenv("FLIGHTENV_OBJECT_PACKAGE_ROOT");
-    options_.object_package_root =
-        env_object_root && *env_object_root
-            ? fs::path(env_object_root)
-            : options_.workspace_root / "flightenv-object-reentry-vehicle";
+    if (env_object_root && *env_object_root) {
+      options_.object_package_root = fs::path(env_object_root);
+    } else {
+      throw std::runtime_error(
+          "object package root is required; pass --object-package-root or set FLIGHTENV_OBJECT_PACKAGE_ROOT");
+    }
   }
   options_.object_package_root = fs::absolute(options_.object_package_root);
   object_runtime_profile_ = loadObjectRuntimeProfile(options_.object_package_root);
@@ -1392,6 +1463,8 @@ void PlatformRuntimeHost::resolveDefaults() {
     }
   }
   options_.branch_chunk_iterations = std::max(1, options_.branch_chunk_iterations);
+  (void)resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode);
+  (void)resolveRuntimeTypedBufferPersistence(options_.typed_buffer_persistence);
   if (options_.execution_backend != "native_adapter_sessions" &&
       options_.execution_backend != "compiled_workflow_process_backend") {
     throw std::runtime_error(
@@ -1519,6 +1592,8 @@ NativeWorkflowRunner& PlatformRuntimeHost::onlineNativeRunner() {
     native_options.adapter_registry = options_.adapter_registry;
     native_options.require_adapter_registry = options_.require_adapter_registry;
     native_options.python = options_.python;
+    native_options.runtime_zero_copy_mode = options_.runtime_zero_copy_mode;
+    native_options.typed_buffer_persistence = options_.typed_buffer_persistence;
     online_native_runner_ = std::make_unique<NativeWorkflowRunner>(std::move(native_options));
   }
   return *online_native_runner_;
@@ -1558,6 +1633,8 @@ void PlatformRuntimeHost::runCompiledWorkflow(
     native_options.adapter_registry = options_.adapter_registry;
     native_options.require_adapter_registry = options_.require_adapter_registry;
     native_options.python = options_.python;
+    native_options.runtime_zero_copy_mode = options_.runtime_zero_copy_mode;
+    native_options.typed_buffer_persistence = options_.typed_buffer_persistence;
     local_runner = std::make_unique<NativeWorkflowRunner>(std::move(native_options));
     active_runner = local_runner.get();
   }
@@ -1859,8 +1936,24 @@ void PlatformRuntimeHost::writeRuntimeBranchIndex(const fs::path& run_dir) const
       }
       const int step_index = jsonInt(iteration, "iteration_index", jsonInt(iteration, "loop_iteration_index", static_cast<int>(steps.size())));
       const double time_s = jsonDouble(iteration, "run_time_s", static_cast<double>(step_index));
+      const double public_time_s = jsonDouble(iteration, "public_output_time_s", time_s);
       iteration["branch_id"] = branch_id;
       iteration["step_index"] = step_index;
+      iteration["public_time_s"] = public_time_s;
+      if (!iteration.contains("time_point") || !iteration["time_point"].is_object()) {
+        iteration["time_point"] = {
+            {"run_time_s", public_time_s},
+            {"tick_index", step_index + 1},
+            {"source_time_s", public_time_s},
+        };
+      }
+      iteration["time_summary"] = {
+          {"base_dt_s", jsonDouble(iteration, "base_dt_s", 0.0)},
+          {"output_period_s", jsonDouble(iteration, "output_period_s", 0.0)},
+          {"effective_delta_t_s_by_node", iteration.value("effective_delta_t_s_by_node", json::object())},
+          {"held_output_count", jsonInt(iteration, "held_output_count", 0)},
+          {"held_outputs", iteration.value("held_outputs", json::array())},
+      };
       auto label_it = future_labels.find(step_index);
       if (label_it != future_labels.end()) {
         applyStateLabel(iteration, label_it->second);
@@ -1904,6 +1997,10 @@ void PlatformRuntimeHost::writeRuntimeBranchIndex(const fs::path& run_dir) const
           applyStateLabel(entry, label_it->second);
         }
       }
+      const json entry_time_point = entry.value("time_point", json::object());
+      entry["public_time_s"] = jsonDouble(entry, "public_time_s",
+                                          jsonDouble(entry_time_point, "run_time_s",
+                                                     step_index >= 0 ? static_cast<double>(step_index) : 0.0));
       artifact_refs.push_back(entry);
       if (startsWith(jsonString(entry, "port_id"), "qoi.")) {
         qoi_refs.push_back(entry);
@@ -2111,7 +2208,8 @@ void PlatformRuntimeHost::appendRuntimeIndex(
     const fs::path& run_dir,
     const std::string& branch_id,
     bool online_branch,
-    int mainline_frame_index) {
+    int mainline_frame_index,
+    double mainline_time_origin_s) {
   const json timeline = readJsonIfExists(run_dir / "run_timeline_index.json");
   const std::map<int, json> future_step_labels =
       (!online_branch && isFuturePredictionBranchId(branch_id))
@@ -2135,6 +2233,7 @@ void PlatformRuntimeHost::appendRuntimeIndex(
         item["frame_index"] = mainline_frame_index;
         item["loop_iteration_index"] = mainline_frame_index;
         item["step_index"] = mainline_frame_index;
+        forceMainlinePublicTime(item, mainline_time_origin_s, mainline_frame_index);
       }
       if (online_branch && target_branch_id == kRealtimePredictionBranchId) {
         item["source_online_branch_id"] = kOnlineFilterBranchId;
@@ -2147,6 +2246,12 @@ void PlatformRuntimeHost::appendRuntimeIndex(
         }
       }
       if (!online_branch && isFuturePredictionBranchId(target_branch_id)) {
+        if (std::isfinite(mainline_time_origin_s)) {
+          item["branch_relative_time_s"] = publicTimeFromItem(item, 0.0);
+          item["trigger_time_s"] = mainline_time_origin_s;
+          item["mainline_time_origin_s"] = mainline_time_origin_s;
+          offsetNestedTime(item, mainline_time_origin_s, mainline_frame_index);
+        }
         const int label_index =
             jsonInt(item, "source_loop_iteration_index",
                     jsonInt(item, "loop_iteration_index", jsonInt(item, "step_index", -1)));
@@ -2200,6 +2305,10 @@ void PlatformRuntimeHost::appendRuntimeIndex(
         frame["mainline_frame_index"] = mainline_frame_index;
         frame["frame_index"] = mainline_frame_index;
         frame["loop_iteration_index"] = mainline_frame_index;
+        forceMainlinePublicTime(
+            frame,
+            jsonDouble(frame, "sample_time_s", mainline_time_origin_s),
+            mainline_frame_index);
         frame["frame_role"] = "online_fusion_frame";
         frame["display_role"] = "online_filter.fusion_frame";
         frame["realtime_prediction_branch_id"] = kRealtimePredictionBranchId;
@@ -2464,6 +2573,8 @@ void PlatformRuntimeHost::launchPredictionBranchWorker(const PredictionTask& tas
       "--chain-dir", pathString(options_.chain_dir),
       "--python", options_.python,
       "--execution-backend", options_.execution_backend,
+      "--zero-copy-mode", options_.runtime_zero_copy_mode,
+      "--typed-buffer-persistence", options_.typed_buffer_persistence,
       "--run-id-prefix", options_.run_id_prefix,
       "--future-max-iterations", std::to_string(options_.future_max_iterations),
       "--branch-chunk-iterations", std::to_string(options_.branch_chunk_iterations),
@@ -2552,12 +2663,8 @@ void PlatformRuntimeHost::runPredictionBranch(PredictionTask task) {
     const json evidence = readJson(task.run_dir / "runtime_evidence.json");
     const int iteration_count = jsonInt(loop.value("summary", json::object()), "iteration_count", 0);
     const int field_count = countFieldArtifacts(task.run_dir);
-    const double remaining_life =
-        findMetricByProfile(json::object(),
-                            outputs,
-                            object_runtime_profile_,
-                            "remaining_life",
-                            {});
+    const json prediction_metrics =
+        collectConfiguredMetrics(json::object(), outputs, object_runtime_profile_, "prediction_summary_metrics");
     json last_iteration = json::object();
     if (loop.contains("iterations") && loop.at("iterations").is_array() && !loop.at("iterations").empty()) {
       last_iteration = loop.at("iterations").back();
@@ -2580,8 +2687,8 @@ void PlatformRuntimeHost::runPredictionBranch(PredictionTask task) {
         {"last_altitude_m", last_altitude},
         {"field_artifact_count", field_count},
     };
-    if (std::isfinite(remaining_life)) {
-      prediction["remaining_life_s"] = remaining_life;
+    for (auto it = prediction_metrics.begin(); it != prediction_metrics.end(); ++it) {
+      prediction[it.key()] = it.value();
     }
 
     json summary = {
@@ -2590,15 +2697,15 @@ void PlatformRuntimeHost::runPredictionBranch(PredictionTask task) {
         {"field_artifact_count", field_count},
         {"last_altitude_m", last_altitude},
     };
-    if (std::isfinite(remaining_life)) {
-      summary["remaining_life_s"] = remaining_life;
+    for (auto it = prediction_metrics.begin(); it != prediction_metrics.end(); ++it) {
+      summary[it.key()] = it.value();
     }
 
     {
       StateLock lock(*this);
       ++completed_prediction_runs_;
       prediction_runs_.push_back(prediction);
-      appendRuntimeIndex(task.run_dir, task.branch_id, false, task.trigger_frame_index);
+      appendRuntimeIndex(task.run_dir, task.branch_id, false, task.trigger_frame_index, task.trigger_time_s);
       appendRuntimeEventLocked(
           "prediction_branch_completed",
           task.branch_id,
@@ -2720,6 +2827,7 @@ int PlatformRuntimeHost::runBranchWorker() {
             ? std::max(1, jsonInt(state, "chunk_iterations", options_.branch_chunk_iterations))
             : std::max(1, options_.branch_chunk_iterations);
     const double base_dt_s = workflowBaseDtS(future_workflow_snapshot_);
+    const double output_period_s = workflowOutputPeriodS(future_workflow_snapshot_);
     const std::string created_at = jsonString(state, "created_at_utc", nowUtcIso());
 
     json aggregate_loop = options_.resume_existing_branch
@@ -2813,6 +2921,9 @@ int PlatformRuntimeHost::runBranchWorker() {
           {"stop_reason", stop_reason},
           {"target_iterations", target_iterations},
           {"chunk_iterations", chunk_iterations},
+          {"base_dt_s", base_dt_s},
+          {"output_period_s", output_period_s},
+          {"held_output_count", countHeldOutputsInLoop(aggregate_loop)},
       };
       aggregate_data["generated_at_utc"] = nowUtcIso();
       aggregate_data["summary"] = {
@@ -2857,6 +2968,11 @@ int PlatformRuntimeHost::runBranchWorker() {
                     {"status", status},
                     {"generated_at_utc", nowUtcIso()},
                     {"execution_backend", options_.execution_backend},
+                    {"runtime_zero_copy_mode", runtimeZeroCopyModeName(
+                                                   resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode))},
+                    {"typed_buffer_persistence", runtimeTypedBufferPersistenceName(
+                                                     resolveRuntimeTypedBufferPersistence(
+                                                         options_.typed_buffer_persistence))},
                     {"compiled_workflow_dir", pathString(options_.compiled_future_workflow)},
                     {"adapter_registry_ref", pathString(options_.adapter_registry)},
                     {"seed_runtime_outputs_ref", pathString(options_.seed_runtime_outputs)},
@@ -2867,6 +2983,8 @@ int PlatformRuntimeHost::runBranchWorker() {
                          {"iteration_count", completed_iterations},
                          {"target_iterations", target_iterations},
                          {"chunk_iterations", chunk_iterations},
+                         {"base_dt_s", base_dt_s},
+                         {"output_period_s", output_period_s},
                          {"field_artifact_count", countFieldArtifactEntries(aggregate_data)},
                          {"stop_reason", stop_reason},
                          {"trigger_frame_index", options_.trigger_frame_index},
@@ -2928,6 +3046,8 @@ int PlatformRuntimeHost::runBranchWorker() {
                {"iteration_count", completed_iterations},
                {"target_iterations", target_iterations},
                {"chunk_iterations", chunk_iterations},
+               {"base_dt_s", base_dt_s},
+               {"output_period_s", output_period_s},
                {"field_artifact_count", countFieldArtifactEntries(aggregate_data)},
                {"stop_reason", stop_reason},
            }},
@@ -3015,6 +3135,11 @@ int PlatformRuntimeHost::runBranchWorker() {
           if (!item.is_object()) {
             continue;
           }
+          const double branch_relative_time_s = publicTimeFromItem(item, 0.0);
+          item["branch_relative_time_s"] = branch_relative_time_s;
+          item["trigger_time_s"] = options_.trigger_time_s;
+          item["mainline_time_origin_s"] = options_.trigger_time_s;
+          offsetNestedTime(item, options_.trigger_time_s, options_.trigger_frame_index);
           item["branch_id"] = options_.branch_id;
           item["source_run_dir"] = pathString(options_.branch_run_dir);
           item["mainline_frame_index"] = options_.trigger_frame_index;
@@ -3037,6 +3162,8 @@ int PlatformRuntimeHost::runBranchWorker() {
           {"iteration_count", completed_iterations},
           {"target_iterations", target_iterations},
           {"chunk_iterations", chunk_iterations},
+          {"base_dt_s", base_dt_s},
+          {"output_period_s", output_period_s},
           {"field_artifact_count", countFieldArtifactEntries(aggregate_data)},
           {"stop_reason", stop_reason},
       });
@@ -3150,6 +3277,8 @@ int PlatformRuntimeHost::runBranchWorker() {
       native_options.adapter_registry = options_.adapter_registry;
       native_options.require_adapter_registry = options_.require_adapter_registry;
       native_options.python = options_.python;
+      native_options.runtime_zero_copy_mode = options_.runtime_zero_copy_mode;
+      native_options.typed_buffer_persistence = options_.typed_buffer_persistence;
       branch_runner = std::make_unique<NativeWorkflowRunner>(std::move(native_options));
     }
 
@@ -3228,18 +3357,19 @@ int PlatformRuntimeHost::runBranchWorker() {
       completed_iterations += produced_iterations;
       latest_seed = options_.branch_run_dir / "runtime_outputs.json";
       const fs::path chunk_seed = chunk_dir / "runtime_outputs.json";
-      const bool physical_stop = branchLoopReachedPhysicalStop(chunk_loop);
+      const bool terminal_stop =
+          stopReasonMatchesTerminalPolicy(branchStopReasonFromLoop(chunk_loop), object_runtime_profile_);
       const bool limit_stop = completed_iterations >= target_iterations;
-      final_stop_reason = physical_stop ? branchStopReasonFromLoop(chunk_loop)
+      final_stop_reason = terminal_stop ? branchStopReasonFromLoop(chunk_loop)
                                         : (limit_stop ? "target_iterations_reached" : "chunk_completed");
-      final_status = physical_stop || limit_stop ? "completed" : "running";
+      final_status = terminal_stop || limit_stop ? "completed" : "running";
       chunk_index = current_chunk_index + 1;
 
       write_root_artifacts(final_status, final_stop_reason, chunk_seed);
       write_worker_state(final_status, final_stop_reason, latest_seed);
       merge_branch_index_to_mainline(final_status, final_stop_reason);
 
-      if (physical_stop || limit_stop) {
+      if (terminal_stop || limit_stop) {
         return 0;
       }
     }
@@ -3267,6 +3397,12 @@ int PlatformRuntimeHost::runBranchWorker() {
                     {"object_id", object_id_},
                     {"status", "failed"},
                     {"generated_at_utc", nowUtcIso()},
+                    {"execution_backend", options_.execution_backend},
+                    {"runtime_zero_copy_mode", runtimeZeroCopyModeName(
+                                                   resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode))},
+                    {"typed_buffer_persistence", runtimeTypedBufferPersistenceName(
+                                                     resolveRuntimeTypedBufferPersistence(
+                                                         options_.typed_buffer_persistence))},
                     {"branch_id", options_.branch_id},
                     {"summary", {{"reason", exc.what()}}},
                 });
@@ -3342,6 +3478,8 @@ int PlatformRuntimeHost::applyBranchControl() {
           "--chain-dir", pathString(options_.chain_dir),
           "--python", options_.python,
           "--execution-backend", options_.execution_backend,
+          "--zero-copy-mode", options_.runtime_zero_copy_mode,
+          "--typed-buffer-persistence", options_.typed_buffer_persistence,
           "--run-id-prefix", options_.run_id_prefix,
           "--future-max-iterations", std::to_string(target_iterations),
           "--branch-chunk-iterations", std::to_string(chunk_iterations),
@@ -3433,7 +3571,7 @@ void PlatformRuntimeHost::executeOnlineLoop() {
     {
       StateLock lock(*this);
       completed_online_frames_ = i + 1;
-      appendRuntimeIndex(online_run_dir, kOnlineFilterBranchId, true, i);
+      appendRuntimeIndex(online_run_dir, kOnlineFilterBranchId, true, i, sample_time);
       for (auto& branch : branch_records_) {
         const std::string branch_id = jsonString(branch, "branch_id", "");
         if (branch_id == kOnlineFilterBranchId) {
@@ -3677,18 +3815,8 @@ nlohmann::json PlatformRuntimeHost::buildHealthLedgerLocked() const {
     const fs::path run_dir = jsonString(prediction, "run_dir");
     const json trend = run_dir.empty() ? json::object() : readJsonIfExists(run_dir / "health_trend_summary.json");
     const bool has_health_trend = !run_dir.empty() && fs::exists(run_dir / "health_trend_summary.json");
-    const double remaining_life =
-        findMetricByProfile(prediction,
-                            trend,
-                            object_runtime_profile_,
-                            "remaining_life",
-                            {});
-    const double damage =
-        findMetricByProfile(prediction,
-                            trend,
-                            object_runtime_profile_,
-                            "damage_max",
-                            {});
+    const json prediction_health_metrics =
+        collectConfiguredMetrics(prediction, trend, object_runtime_profile_, "prediction_health_metrics");
     json entry = {
         {"entry_kind", "future_prediction_health"},
         {"branch_id", jsonString(prediction, "branch_id")},
@@ -3702,8 +3830,6 @@ nlohmann::json PlatformRuntimeHost::buildHealthLedgerLocked() const {
         {"iteration_count", jsonInt(prediction, "iteration_count", 0)},
         {"stop_reason", jsonString(prediction, "stop_reason")},
         {"field_artifact_count", jsonInt(prediction, "field_artifact_count", 0)},
-        {"remaining_life_s", std::isfinite(remaining_life) ? json(remaining_life) : json(nullptr)},
-        {"damage_max", std::isfinite(damage) ? json(damage) : json(nullptr)},
         {"health_trend_ref", has_health_trend ? pathString(run_dir / "health_trend_summary.json") : ""},
         {"semantics",
          {
@@ -3712,6 +3838,9 @@ nlohmann::json PlatformRuntimeHost::buildHealthLedgerLocked() const {
              {"does_not_mutate_online_mainline", true},
          }},
     };
+    for (auto it = prediction_health_metrics.begin(); it != prediction_health_metrics.end(); ++it) {
+      entry[it.key()] = it.value();
+    }
     prediction_entries.push_back(entry);
     entries.push_back(entry);
     latest_prediction_health = entry;
@@ -4052,6 +4181,11 @@ void PlatformRuntimeHost::writeProgressLocked() {
       {"stage", current_stage_},
       {"message", current_message_},
       {"execution_backend", options_.execution_backend},
+      {"runtime_zero_copy_mode", runtimeZeroCopyModeName(
+                                     resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode))},
+      {"typed_buffer_persistence", runtimeTypedBufferPersistenceName(
+                                      resolveRuntimeTypedBufferPersistence(
+                                          options_.typed_buffer_persistence))},
       {"total_progress_percent", total_progress},
       {"clock",
        {
@@ -4104,6 +4238,12 @@ void PlatformRuntimeHost::writeRuntimeHostEvidenceLocked(const std::string& stat
            {"implementation", "FlightEnvPlatformRuntimeHost.cpp"},
            {"role", "C++ online mainline and prediction branch scheduler"},
            {"execution_backend", options_.execution_backend},
+           {"runtime_zero_copy_mode", runtimeZeroCopyModeName(
+                                          resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode))},
+           {"typed_buffer_persistence", runtimeTypedBufferPersistenceName(
+                                           resolveRuntimeTypedBufferPersistence(
+                                               options_.typed_buffer_persistence))},
+           {"in_process_adapter_sessions", useNativeBackend()},
            {"branch_execution_mode",
             options_.branch_manager_enabled ? "background_branch_worker_process"
                                             : "native_in_process_branch_threads"},
@@ -4142,6 +4282,11 @@ void PlatformRuntimeHost::writeRuntimeHostEvidenceLocked(const std::string& stat
       {"summary",
        {
            {"online_frame_count", completed_online_frames_},
+           {"runtime_zero_copy_mode", runtimeZeroCopyModeName(
+                                          resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode))},
+           {"typed_buffer_persistence", runtimeTypedBufferPersistenceName(
+                                           resolveRuntimeTypedBufferPersistence(
+                                               options_.typed_buffer_persistence))},
            {"requested_prediction_count", requested_prediction_runs_},
            {"completed_prediction_count", completed_prediction_runs_.load()},
            {"failed_prediction_count", failed_prediction_runs_.load()},
@@ -4224,6 +4369,16 @@ void PlatformRuntimeHost::writeFinalSummary(const std::string& status) {
       {"object_id", object_id_},
       {"generated_at_utc", nowUtcIso()},
       {"status", status},
+      {"host",
+       {
+           {"execution_backend", options_.execution_backend},
+           {"in_process_adapter_sessions", useNativeBackend()},
+           {"runtime_zero_copy_mode", runtimeZeroCopyModeName(
+                                          resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode))},
+           {"typed_buffer_persistence", runtimeTypedBufferPersistenceName(
+                                           resolveRuntimeTypedBufferPersistence(
+                                               options_.typed_buffer_persistence))},
+       }},
       {"online",
        {
            {"workflow_id", online_workflow_id_},
@@ -4349,6 +4504,10 @@ int RunPlatformRuntimeHostCli(int argc, char** argv) {
     if (args.count("chain-dir")) options.chain_dir = args.at("chain-dir");
     if (args.count("python")) options.python = args.at("python");
     if (args.count("execution-backend")) options.execution_backend = args.at("execution-backend");
+    if (args.count("zero-copy-mode")) options.runtime_zero_copy_mode = args.at("zero-copy-mode");
+    if (args.count("typed-buffer-persistence")) {
+      options.typed_buffer_persistence = args.at("typed-buffer-persistence");
+    }
     if (args.count("run-id-prefix")) options.run_id_prefix = args.at("run-id-prefix");
     if (args.count("online-frames")) options.online_frames = std::stoi(args.at("online-frames"));
     if (args.count("prediction-every-frames")) {

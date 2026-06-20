@@ -1,0 +1,162 @@
+/**
+ * @file RuntimeEventQueue.cpp
+ * @brief 实现 runtime 事件队列。
+ *
+ * 大概：这是统一时钟按事件驱动推进的基础实现。
+ * 具体：它负责入队、出队、清空、排序和处理相同时间事件的优先级。
+ * 被谁使用：被 RuntimeTimeScheduler 和事件队列单测使用。
+ * 使用谁：使用 RuntimeEventQueue.hpp、RuntimeTimeTypes 和标准优先队列。
+ * 拆分判断：当前职责能一句话说清，暂不需要拆；如果继续加入新的运行行为，应另建文件承接。
+ */
+
+#include "FlightEnvPlatformRuntime/time/RuntimeEventQueue.hpp"
+
+#include <cmath>
+#include <iomanip>
+#include <sstream>
+#include <stdexcept>
+#include <utility>
+
+namespace FlightEnvPlatformRuntime {
+namespace {
+
+double comparableTime(double value) {
+  return std::isfinite(value) ? value : 0.0;
+}
+
+std::string generatedEventId(const std::string& kind, std::uint64_t sequence) {
+  std::ostringstream oss;
+  oss << "evt.runtime." << (kind.empty() ? "event" : kind) << "."
+      << std::setw(6) << std::setfill('0') << sequence;
+  return oss.str();
+}
+
+}  // namespace
+
+bool RuntimeEventQueue::EventOrder::operator()(
+    const QueuedEvent& lhs,
+    const QueuedEvent& rhs) const {
+  const double lhs_time = comparableTime(lhs.event.event_time_s);
+  const double rhs_time = comparableTime(rhs.event.event_time_s);
+  if (lhs_time != rhs_time) {
+    return lhs_time > rhs_time;
+  }
+  if (lhs.event.priority != rhs.event.priority) {
+    return lhs.event.priority > rhs.event.priority;
+  }
+  return lhs.sequence > rhs.sequence;
+}
+
+void RuntimeEventQueue::push(RuntimeEvent event) {
+  const std::uint64_t sequence = next_sequence_++;
+  if (event.event_id.empty()) {
+    event.event_id = generatedEventId(event.event_kind, sequence);
+  }
+  queue_.push(QueuedEvent{std::move(event), sequence});
+}
+
+void RuntimeEventQueue::pushFixedPublicTicks(
+    int max_iterations,
+    double base_dt_s,
+    double output_period_s) {
+  for (int iteration = 0; iteration < max_iterations; ++iteration) {
+    push(publicTickEvent(makeRuntimeLoopTick(iteration, base_dt_s, output_period_s)));
+  }
+}
+
+bool RuntimeEventQueue::empty() const {
+  return queue_.empty();
+}
+
+std::size_t RuntimeEventQueue::size() const {
+  return queue_.size();
+}
+
+RuntimeEvent RuntimeEventQueue::pop() {
+  if (queue_.empty()) {
+    throw std::runtime_error("RuntimeEventQueue::pop called on an empty queue");
+  }
+  RuntimeEvent event = queue_.top().event;
+  queue_.pop();
+  return event;
+}
+
+RuntimeEvent RuntimeEventQueue::publicTickEvent(const RuntimeLoopTick& tick) {
+  RuntimeEvent event;
+  event.event_kind = "public_tick";
+  event.event_time_s = tick.public_output_time_s;
+  event.priority = 100000;
+  event.iteration_index = tick.iteration_index;
+  event.target_id = "workflow";
+  event.loop_tick = tick;
+  event.payload = tick.toJson();
+
+  std::ostringstream oss;
+  oss << "evt.runtime.public_tick." << std::setw(6) << std::setfill('0')
+      << tick.iteration_index;
+  event.event_id = oss.str();
+  return event;
+}
+
+RuntimeEvent RuntimeEventQueue::nodeDueEvent(
+    const std::string& node_id,
+    double event_time_s,
+    int public_iteration_index,
+    int priority,
+    nlohmann::json payload) {
+  RuntimeEvent event;
+  event.event_kind = "node_due";
+  event.event_time_s = event_time_s;
+  event.priority = priority;
+  event.iteration_index = public_iteration_index;
+  event.target_id = node_id;
+  event.payload = std::move(payload);
+
+  std::ostringstream oss;
+  oss << "evt.runtime.node_due." << node_id << "."
+      << std::fixed << std::setprecision(9) << event_time_s;
+  event.event_id = oss.str();
+  return event;
+}
+
+RuntimeEvent RuntimeEventQueue::inputArrivedEvent(
+    const std::string& input_id,
+    double event_time_s,
+    int public_iteration_index,
+    nlohmann::json payload) {
+  RuntimeEvent event;
+  event.event_kind = "input_arrived";
+  event.event_time_s = event_time_s;
+  event.priority = 0;
+  event.iteration_index = public_iteration_index;
+  event.target_id = input_id;
+  event.payload = std::move(payload);
+
+  std::ostringstream oss;
+  oss << "evt.runtime.input_arrived." << input_id << "."
+      << std::fixed << std::setprecision(9) << event_time_s;
+  event.event_id = oss.str();
+  return event;
+}
+
+RuntimeEvent RuntimeEventQueue::checkpointDueEvent(
+    const std::string& checkpoint_id,
+    double event_time_s,
+    int public_iteration_index,
+    nlohmann::json payload) {
+  RuntimeEvent event;
+  event.event_kind = "checkpoint_due";
+  event.event_time_s = event_time_s;
+  event.priority = 90000;
+  event.iteration_index = public_iteration_index;
+  event.target_id = checkpoint_id;
+  event.payload = std::move(payload);
+
+  std::ostringstream oss;
+  oss << "evt.runtime.checkpoint_due." << checkpoint_id << "."
+      << std::fixed << std::setprecision(9) << event_time_s;
+  event.event_id = oss.str();
+  return event;
+}
+
+}  // namespace FlightEnvPlatformRuntime
