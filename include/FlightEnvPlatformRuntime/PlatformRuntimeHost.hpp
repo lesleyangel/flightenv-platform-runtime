@@ -20,6 +20,8 @@
 #include <thread>
 #include <vector>
 
+#include "FlightEnvPlatformRuntime/RuntimeEventLoop.hpp"
+
 namespace FlightEnvPlatformRuntime {
 
 class NativeWorkflowRunner;
@@ -158,6 +160,7 @@ class PlatformRuntimeHost {
   nlohmann::json checkpoint_refs_ = nlohmann::json::array();
   nlohmann::json prediction_runs_ = nlohmann::json::array();
   nlohmann::json runtime_events_ = nlohmann::json::array();
+  RuntimeEventLoop runtime_event_loop_;
   nlohmann::json series_by_id_ = nlohmann::json::object();
   std::vector<std::thread> branch_threads_;
   std::atomic<int> completed_prediction_runs_{0};
@@ -210,6 +213,7 @@ class PlatformRuntimeHost {
       int frame_index,
       double time_s,
       const nlohmann::json& payload);
+  RuntimeEvent dispatchRuntimeEventLocked(RuntimeEvent event);
   void appendRuntimeIndex(
       const std::filesystem::path& run_dir,
       const std::string& branch_id,
@@ -233,7 +237,9 @@ class PlatformRuntimeHost {
       const std::filesystem::path& seed_runtime_outputs,
       const std::filesystem::path& external_observation_stream,
       int max_iterations,
-      bool prepare_only);
+      bool prepare_only,
+      const std::string& branch_id = "",
+      const std::string& timeline_id = "");
 
   int invokePdkRun(
       const std::filesystem::path& compiled_workflow,

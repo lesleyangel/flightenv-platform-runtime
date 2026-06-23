@@ -21,12 +21,12 @@
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
-    <ProjectGuid>{3D8AC9B5-3D31-4DBE-9E36-2506D56CE5E4}</ProjectGuid>
-    <RootNamespace>FlightEnvPlatformRuntimeHost</RootNamespace>
+    <ProjectGuid>{C27F0B85-87BE-4B7A-BAB2-69728E6B5C32}</ProjectGuid>
+    <RootNamespace>ReadyQueueBehaviorAudit</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
-    <ProjectName>FlightEnvPlatformRuntimeHost</ProjectName>
-    <FlightEnvRepoRoot Condition="'$(FlightEnvRepoRoot)'==''">$(MSBuildThisFileDirectory)..\</FlightEnvRepoRoot>
-    <FlightEnvWorkspaceHome Condition="'$(FlightEnvWorkspaceHome)'==''">$(MSBuildThisFileDirectory)..\..\</FlightEnvWorkspaceHome>
+    <ProjectName>ReadyQueueBehaviorAudit</ProjectName>
+    <FlightEnvRepoRoot Condition="'$(FlightEnvRepoRoot)'==''">$(MSBuildThisFileDirectory)..\..\</FlightEnvRepoRoot>
+    <FlightEnvWorkspaceHome Condition="'$(FlightEnvWorkspaceHome)'==''">$(MSBuildThisFileDirectory)..\..\..\</FlightEnvWorkspaceHome>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
@@ -73,7 +73,7 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup>
-    <TargetName>FlightEnvPlatformRuntimeHost</TargetName>
+    <TargetName>ReadyQueueBehaviorAudit</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
@@ -84,7 +84,7 @@
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)..\include;$(FlightEnvWorkspaceHome)flightenv-platform-pdk\include;$(FlightEnvSharedDepsRoot)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(FlightEnvRepoRoot)include;$(FlightEnvWorkspaceHome)flightenv-platform-pdk\include;$(FlightEnvSharedDepsRoot)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -104,64 +104,11 @@
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="..\src\main.cpp" />
-    <ClCompile Include="..\src\NativeWorkflowRunner.cpp" />
-    <ClCompile Include="..\src\PlatformRuntimeHost.cpp" />
-    <ClCompile Include="..\src\RuntimeAdapterInvoker.cpp" />
-    <ClCompile Include="..\src\RuntimeBranchService.cpp" />
-    <ClCompile Include="..\src\RuntimeClock.cpp" />
-    <ClCompile Include="..\src\RuntimeEventLoop.cpp" />
-    <ClCompile Include="..\src\RuntimeEvidenceWriter.cpp" />
-    <ClCompile Include="..\src\RuntimeNodeEvidenceBuilder.cpp" />
-    <ClCompile Include="..\src\RuntimePortBindingResolver.cpp" />
-    <ClCompile Include="..\src\RuntimePortPacketWriter.cpp" />
-    <ClCompile Include="..\src\RuntimePortStoreView.cpp" />
-    <ClCompile Include="..\src\RuntimeProfileUtils.cpp" />
-    <ClCompile Include="..\src\RuntimePublicFrameBuilder.cpp" />
-    <ClCompile Include="..\src\RuntimePublicFramePolicy.cpp" />
-    <ClCompile Include="..\src\RuntimeReadyQueueExecutor.cpp" />
-    <ClCompile Include="..\src\RuntimeTimelineMaterializer.cpp" />
-    <ClCompile Include="..\src\RuntimeTypedBufferStore.cpp" />
-    <ClCompile Include="..\src\RuntimeTypedPayloadBridge.cpp" />
-    <ClCompile Include="..\src\RuntimeZeroCopyPolicy.cpp" />
-    <ClCompile Include="..\src\RuntimeTimeScheduler.cpp" />
-    <ClCompile Include="..\src\time\RuntimeEventQueue.cpp" />
-    <ClCompile Include="..\src\time\RuntimeInputAlignment.cpp" />
-    <ClCompile Include="..\src\time\RuntimeMaterialization.cpp" />
-    <ClCompile Include="..\src\time\RuntimePortSampleBuffer.cpp" />
-    <ClCompile Include="..\src\time\RuntimeTensorAlignment.cpp" />
-    <ClCompile Include="..\src\time\RuntimeTensorInterpolator.cpp" />
+    <ClCompile Include="ReadyQueueBehaviorAudit.cpp" />
+    <ClCompile Include="..\..\src\RuntimeReadyQueueExecutor.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\AdapterSession.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\NativeWorkflowRunner.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\PlatformRuntimeHost.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeAdapterInvoker.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeBranchService.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeClock.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeEventLoop.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeEvidenceWriter.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeNodeEvidenceBuilder.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimePortBindingResolver.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimePortPacketWriter.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimePortStoreView.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeProfileUtils.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimePublicFrameBuilder.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimePublicFramePolicy.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeReadyQueueExecutor.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeTimelineMaterializer.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeTypedBufferStore.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeTypedPayloadBridge.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeZeroCopyPolicy.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeTimeScheduler.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\time\RuntimeEventQueue.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\time\RuntimeInputAlignment.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\time\RuntimeMaterialization.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\time\RuntimeNodeClockState.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\time\RuntimePortSampleBuffer.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\time\RuntimeTensorAlignment.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\time\RuntimeTensorInterpolator.hpp" />
-    <ClInclude Include="..\include\FlightEnvPlatformRuntime\time\RuntimeTimeTypes.hpp" />
+    <ClInclude Include="..\..\include\FlightEnvPlatformRuntime\RuntimeReadyQueueExecutor.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

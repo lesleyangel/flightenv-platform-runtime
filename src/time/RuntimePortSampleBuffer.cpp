@@ -13,6 +13,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <utility>
 
 namespace FlightEnvPlatformRuntime {
@@ -33,6 +35,20 @@ double outputTimeS(const nlohmann::json& time_info) {
   return jsonDouble(time_info.value("output_time_point", nlohmann::json::object()), "run_time_s", 0.0);
 }
 
+RuntimeTimePoint sampleTimePoint(double time_s) {
+  return RuntimeTimePoint::fromSeconds(time_s);
+}
+
+std::int64_t durationNs(double seconds) {
+  return RuntimeDuration::fromSeconds(std::max(0.0, seconds)).nanoseconds;
+}
+
+void normalizeSampleTime(RuntimePortSample& sample) {
+  sample.time = sampleTimePoint(sample.time_s);
+  sample.time_ns = sample.time.nanoseconds;
+  sample.time_s = sample.time.seconds();
+}
+
 }  // namespace
 
 nlohmann::json RuntimePortSample::evidence() const {
@@ -41,6 +57,7 @@ nlohmann::json RuntimePortSample::evidence() const {
       {"source_node_id", source_node_id},
       {"source_port_id", source_port_id},
       {"time_s", time_s},
+      {"time_ns", time_ns},
       {"iteration_index", iteration_index},
       {"value_kind", value.type_name()},
   };
@@ -57,10 +74,11 @@ std::string RuntimePortSampleBuffer::portChannel(
 }
 
 void RuntimePortSampleBuffer::recordSample(RuntimePortSample sample) {
+  normalizeSampleTime(sample);
   auto& items = samples_by_channel_[sample.channel_id];
   items.push_back(std::move(sample));
   std::stable_sort(items.begin(), items.end(), [](const RuntimePortSample& lhs, const RuntimePortSample& rhs) {
-    return lhs.time_s < rhs.time_s;
+    return lhs.time.nanoseconds < rhs.time.nanoseconds;
   });
 }
 
@@ -111,9 +129,10 @@ std::optional<RuntimePortSample> RuntimePortSampleBuffer::latestBeforeOrAt(
   if (found == samples_by_channel_.end()) {
     return std::nullopt;
   }
+  const RuntimeTimePoint target_time = sampleTimePoint(target_time_s);
   std::optional<RuntimePortSample> candidate;
   for (const auto& sample : found->second) {
-    if (sample.time_s <= target_time_s + 1.0e-9) {
+    if (sample.time.nanoseconds <= target_time.nanoseconds) {
       candidate = sample;
     } else {
       break;
@@ -122,7 +141,8 @@ std::optional<RuntimePortSample> RuntimePortSampleBuffer::latestBeforeOrAt(
   if (!candidate.has_value()) {
     return std::nullopt;
   }
-  if (max_staleness_s >= 0.0 && target_time_s - candidate->time_s > max_staleness_s + 1.0e-9) {
+  if (max_staleness_s >= 0.0 &&
+      target_time.nanoseconds - candidate->time.nanoseconds > durationNs(max_staleness_s)) {
     return std::nullopt;
   }
   return candidate;
@@ -136,19 +156,20 @@ std::optional<RuntimePortSample> RuntimePortSampleBuffer::nearest(
   if (found == samples_by_channel_.end()) {
     return std::nullopt;
   }
+  const RuntimeTimePoint target_time = sampleTimePoint(target_time_s);
   std::optional<RuntimePortSample> candidate;
-  double best_gap = 0.0;
+  std::int64_t best_gap_ns = 0;
   for (const auto& sample : found->second) {
-    const double gap = std::abs(sample.time_s - target_time_s);
-    if (!candidate.has_value() || gap < best_gap) {
+    const std::int64_t gap_ns = std::llabs(sample.time.nanoseconds - target_time.nanoseconds);
+    if (!candidate.has_value() || gap_ns < best_gap_ns) {
       candidate = sample;
-      best_gap = gap;
+      best_gap_ns = gap_ns;
     }
   }
   if (!candidate.has_value()) {
     return std::nullopt;
   }
-  if (max_gap_s >= 0.0 && best_gap > max_gap_s + 1.0e-9) {
+  if (max_gap_s >= 0.0 && best_gap_ns > durationNs(max_gap_s)) {
     return std::nullopt;
   }
   return candidate;
@@ -162,13 +183,14 @@ RuntimePortSampleBuffer::bracketing(
   if (found == samples_by_channel_.end()) {
     return {std::nullopt, std::nullopt};
   }
+  const RuntimeTimePoint target_time = sampleTimePoint(target_time_s);
   std::optional<RuntimePortSample> before;
   std::optional<RuntimePortSample> after;
   for (const auto& sample : found->second) {
-    if (sample.time_s <= target_time_s + 1.0e-9) {
+    if (sample.time.nanoseconds <= target_time.nanoseconds) {
       before = sample;
     }
-    if (sample.time_s + 1.0e-9 >= target_time_s) {
+    if (sample.time.nanoseconds >= target_time.nanoseconds) {
       after = sample;
       break;
     }
@@ -184,9 +206,12 @@ std::vector<RuntimePortSample> RuntimePortSampleBuffer::window(
   if (found == samples_by_channel_.end()) {
     return {};
   }
+  const RuntimeTimePoint start_time = sampleTimePoint(start_time_s);
+  const RuntimeTimePoint end_time = sampleTimePoint(end_time_s);
   std::vector<RuntimePortSample> result;
   for (const auto& sample : found->second) {
-    if (sample.time_s + 1.0e-9 >= start_time_s && sample.time_s <= end_time_s + 1.0e-9) {
+    if (sample.time.nanoseconds >= start_time.nanoseconds &&
+        sample.time.nanoseconds <= end_time.nanoseconds) {
       result.push_back(sample);
     }
   }

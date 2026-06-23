@@ -48,25 +48,61 @@ native adapter-session execution backend:
 - Health ledger: the host writes `health_ledger.json` and
   `health_ledger_summary.json` to connect online posterior state, prediction
   branch health summaries, checkpoint refs, and next-run seed policy.
-- Event-driven multirate dispatch: `RuntimeTimeScheduler` seeds a single
-  `RuntimeEventQueue` with `node_due`, `public_tick`, `input_arrived`, and
-  `checkpoint_due` event kinds. Nodes execute on `node_due` events at their
-  declared cadence, while `public_tick` events materialize loop summaries and
-  carry forward held outputs for downstream consumers. The runner records
-  `runtime_event_kind`, `runtime_event_time_s`, `effective_delta_t_s`,
-  `output_period_s`, and held-output evidence in `scheduler_timeline.json` and
-  `runtime_loop_summary.json`.
+- Event-driven multirate dispatch: `RuntimeTimeScheduler` and the host runtime
+  drive work through a single event queue abstraction for `input_arrived`,
+  `node_due`, `public_tick`, `checkpoint_due`, `branch_triggered`, and
+  `stop_check_due` event kinds. Nodes become executable only after
+  `RuntimeReadyQueueExecutor` admits the due event by checking declared
+  dependencies, explicit edge-bound inputs, resource locks, parallel groups,
+  max parallelism, and deadline status. The runner records
+  `ready_queue_admission`, `runtime_event_kind`, `runtime_event_time_s`,
+  `effective_delta_t_s`, `output_period_s`, and held-output evidence in
+  `scheduler_timeline.json` and `runtime_loop_summary.json`.
 - Runtime time scheduler: node cadence, public output time, held/carry-forward
   decisions, and `runtime_time` evidence are centralized in
   `RuntimeTimeScheduler`. `NativeWorkflowRunner` consumes these dispatch
   decisions and owns adapter execution; `PlatformRuntimeHost` owns online
   mainline and prediction-branch evidence aggregation.
+- Runtime service split: the host is being decomposed into small platform
+  services so future scheduler, adapter and evidence changes do not keep
+  growing `NativeWorkflowRunner` and `PlatformRuntimeHost`. Current service
+  boundaries are:
+  `RuntimeClock` for wall/steady time helpers,
+  `RuntimeEventLoop` for generic event-loop bookkeeping,
+  `RuntimeReadyQueueExecutor` for compiled scheduler-plan loading, ready-queue
+  admission checks, edge-port readiness evidence, resource/parallel occupancy,
+  and admission evidence,
+  `RuntimeAdapterInvoker` for adapter execute plus typed-output/zero-copy
+  validation,
+  `RuntimePortPacketWriter` for turning each node output port into a
+  versioned `RuntimePacket` without copying large payloads,
+  `RuntimePortStoreView` for read-only packet-to-port-ref evidence views over
+  `ThreadSafePortStore`,
+  `RuntimePublicFrameBuilder` for public-tick frame assembly,
+  `RuntimePublicFramePolicy` for stop/held/public-frame evidence rules,
+  `RuntimeTimelineMaterializer` for branch-step, artifact-ref, and QoI-ref
+  timeline entries,
+  `RuntimeMaterialization` for public/data-plane frame entries,
+  `RuntimeEvidenceWriter` for run-package JSON evidence writes, and
+  `RuntimeBranchService` for branch records and runtime branch events.
+- Strict edge binding: compiled workflows now carry `edge_binding_plan.json`.
+  `NativeWorkflowRunner` consumes this plan directly and defaults to explicit
+  `source_node_id/source_port_id -> target_node_id/target_port_id` binding.
+  The old contract/name-based implicit input injection is disabled by default
+  and exists only behind `FLIGHTENV_ALLOW_IMPLICIT_CONTRACT_PORT_BINDING=1` for
+  migration diagnostics. This prevents values with the same DTO contract but
+  different roles or times from being guessed incorrectly.
 - Runtime time core: common loop-tick types, node clock state, and the event
   queue live under `FlightEnvPlatformRuntime/time`. The hot path is now driven
   by the queue rather than by polling all nodes on every public tick. Non-integer
-  node cadence is represented as exact `node_due` event times within the current
-  double-precision clock model; tensor alignment can select nearest refs or lazy
-  operation refs for later specialized interpolation backends.
+  node cadence is represented by `RuntimeTimePoint` / `RuntimeDuration` values
+  backed by integer nanoseconds inside the event queue and scheduler; JSON
+  evidence still emits `*_s` fields for readability and also records `*_ns`
+  fields where timing provenance matters. Branch creation is now represented by
+  a neutral `branch_triggered` event with a separate cause event, so future
+  branch handoff is auditable without encoding object semantics in the runtime.
+  Tensor alignment can select nearest refs or lazy operation refs for later
+  specialized interpolation backends.
 - Runtime input alignment skeleton: `RuntimePortSampleBuffer` records generic
   node and port samples, while `RuntimeInputAlignment` resolves declared
   `input_alignment` policies into hold-last, nearest, scalar linear, or scalar
@@ -78,7 +114,22 @@ native adapter-session execution backend:
   returns the closest existing tensor/artifact ref and records alignment
   evidence; `lazy_ref` remains available for later reducer/interpolator
   backends. Data-plane public entries are emitted through
-  `RuntimeMaterialization` instead of being assembled directly in the runner.
+  `RuntimeMaterialization`, while public tick loop frames and held outputs are
+  assembled through `RuntimePublicFrameBuilder` with shared
+  `RuntimePublicFramePolicy`. Held outputs now include port-level carried
+  value summaries that prefer typed-buffer, tensor, artifact, or typed-payload
+  refs instead of duplicating payloads. Node-level packets remain for
+  compatibility, while `RuntimePortPacketWriter` also writes per-output-port
+  packets into `ThreadSafePortStore`; `RuntimePortStoreView` prefers those
+  port packets and falls back to the legacy node packet when needed. UI/replay
+  timeline entries use `RuntimeTimelineMaterializer` so runtime evidence and
+  run indexes share the same basic public-time fields.
+- Branch/time scoped PortStore: port packets carry `branch_id` and
+  `timeline_id` tags and are indexed by
+  `branch_id + timeline_id + node_id + port_id + time`. The runtime can query
+  the latest scoped packet or the nearest packet at-or-before a target logical
+  timestamp. `runtime_packets.json`, `runtime_evidence.json`, and ready-queue
+  checked-port evidence expose the scoped packet path for audit.
 - Typed DTO hot-path gate: operator ports that declare
   `typed_io_contract.json_operator_io_forbidden` or
   `json_hot_path_forbidden` are not allowed to remain inline-only JSON on the
@@ -179,6 +230,109 @@ Round2 multirate dispatch audit:
   -Configuration Release `
   -Platform x64
 ```
+
+Runtime scheduler Gate A-G acceptance:
+
+```powershell
+.\flightenv-platform-runtime\tools\verify_runtime_scheduler_gates.ps1 `
+  -Configuration Release `
+  -Platform x64
+```
+
+From the workspace root, the same gate is available as:
+
+```powershell
+.\tools\verify_platform_runtime_scheduler_gates.ps1 `
+  -Configuration Release `
+  -Platform x64
+```
+
+Use `-StaticOnly` for a fast Gate A/G architecture and documentation check.
+Use `-SkipSlow` when only build, negative binding, and synthetic multirate
+checks are needed. Use `-RequireTypedZeroCopy` before release when typed ABI v2
+zero-copy behavior must be enforced by the same gate.
+
+Scheduler 100% staged acceptance from the workspace root:
+
+```powershell
+.\tools\verify_platform_scheduler_100_acceptance.ps1 `
+  -Configuration Release `
+  -Platform x64 `
+  -SkipBuild `
+  -SkipSlow
+```
+
+The staged acceptance wraps the existing scheduler gate, records the current
+clock/scheduler boundary audit, runs the ReadyQueue behavior matrix, optionally
+runs the Phase 4 checkpoint/replay determinism audit, optionally runs the Phase
+5 stress/fault/backpressure audit, and writes
+`_local_artifacts/platform-runtime/scheduler-acceptance/scheduler_100_acceptance_report.json`.
+Use `-StaticOnly -SkipBuild` for a text-only architecture/boundary scan. Use
+`-RunReplayDeterminism` when Phase 4 should be part of the current gate. Use
+`-RunStress` when Phase 5 should be part of the current gate. Use `-StrictFinal`
+only when closing the final 100% target; any deferred item then becomes a hard
+failure.
+
+Runtime time-boundary audit for Phase 2:
+
+```powershell
+.\flightenv-platform-runtime\tools\audit_runtime_time_boundary.ps1
+```
+
+This audit allows `*_s` fields at JSON/evidence/CLI boundaries, but blocks known
+hot-path regressions where scheduler, ReadyQueue, sample alignment, or tensor
+nearest logic compares logical time with floating-point seconds instead of
+runtime nanoseconds.
+
+ReadyQueue behavior audit for Phase 3:
+
+```powershell
+.\flightenv-platform-runtime\tools\audit_ready_queue_behavior.ps1 `
+  -Configuration Release `
+  -Platform x64
+```
+
+This audit builds `ReadyQueueBehaviorAudit.exe` and verifies blocked
+dependencies, missing explicit ports, scoped port-store readiness, resource
+locks, max parallelism, capacity-group saturation, exclusive dispatch, and
+deadline policy behavior using the production `RuntimeReadyQueueExecutor`.
+
+Checkpoint/replay determinism audit for Phase 4:
+
+```powershell
+.\flightenv-platform-runtime\tools\audit_checkpoint_replay_determinism.ps1 `
+  -Configuration Release `
+  -Platform x64 `
+  -RunIdPrefix gate_phase4_smoke `
+  -OnlineFrames 2 `
+  -PredictionEveryFrames 1 `
+  -FutureMaxIterations 1 `
+  -BranchChunkIterations 1 `
+  -SkipBuild
+```
+
+This audit runs the same RuntimeHost scenario twice and compares normalized
+semantic projections for public timeline, branch index, runtime packets,
+checkpoint refs, and key output refs. It proves repeated-run determinism for
+the scheduler evidence surface; executable adapter/session restore from a saved
+checkpoint remains a later production feature.
+
+Stress/fault/backpressure audit for Phase 5:
+
+```powershell
+.\flightenv-platform-runtime\tools\audit_scheduler_stress_fault_backpressure.ps1 `
+  -Configuration Release `
+  -Platform x64 `
+  -EventCount 10000 `
+  -BranchCount 64
+```
+
+This audit builds `SchedulerStressFaultAudit.exe` and checks mixed-event queue
+pressure, ReadyQueue max-parallelism and capacity-group backpressure, exclusive
+resource-lock storms, branch/time scoped port-store reads, deadline fail versus
+mark-stale policy, and typed zero-copy fail-fast behavior. Adapter lifecycle
+retry/cancel/restart and long-run memory thresholds are still deeper production
+gates, not replaced by this synthetic audit.
 
 Typed ABI v2 A/B comparison:
 

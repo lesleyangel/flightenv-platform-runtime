@@ -12,17 +12,99 @@
  */
 
 
+#include <cmath>
+#include <cstdint>
 #include <limits>
 #include <nlohmann/json.hpp>
 #include <string>
 
 namespace FlightEnvPlatformRuntime {
 
+inline constexpr std::int64_t kRuntimeNanosecondsPerSecond = 1000000000LL;
+
+/**
+ * @brief runtime 内部使用的稳定时长。
+ *
+ * 对外 evidence 仍保留秒制 double，内部排序和周期累加使用纳秒整数，避免反复用 double
+ * 比较 1/3s、5.5s 这类非整数周期导致边界漂移。
+ */
+struct RuntimeDuration {
+  std::int64_t nanoseconds = 0; ///< 内部统一纳秒时长。
+
+  static RuntimeDuration fromNanoseconds(std::int64_t value) {
+    RuntimeDuration duration;
+    duration.nanoseconds = value;
+    return duration;
+  }
+
+  static RuntimeDuration fromSeconds(double seconds) {
+    if (!std::isfinite(seconds)) {
+      return {};
+    }
+    return fromNanoseconds(static_cast<std::int64_t>(
+        std::llround(seconds * static_cast<double>(kRuntimeNanosecondsPerSecond))));
+  }
+
+  double seconds() const {
+    return static_cast<double>(nanoseconds) /
+           static_cast<double>(kRuntimeNanosecondsPerSecond);
+  }
+
+  RuntimeDuration operator*(int multiplier) const {
+    return fromNanoseconds(nanoseconds * static_cast<std::int64_t>(multiplier));
+  }
+
+  RuntimeDuration operator+(RuntimeDuration rhs) const {
+    return fromNanoseconds(nanoseconds + rhs.nanoseconds);
+  }
+
+  RuntimeDuration operator-(RuntimeDuration rhs) const {
+    return fromNanoseconds(nanoseconds - rhs.nanoseconds);
+  }
+};
+
+/**
+ * @brief runtime 内部使用的稳定时间点。
+ */
+struct RuntimeTimePoint {
+  std::int64_t nanoseconds = 0; ///< 距仿真/运行时钟零点的纳秒数。
+
+  static RuntimeTimePoint fromNanoseconds(std::int64_t value) {
+    RuntimeTimePoint point;
+    point.nanoseconds = value;
+    return point;
+  }
+
+  static RuntimeTimePoint fromSeconds(double seconds) {
+    return fromNanoseconds(RuntimeDuration::fromSeconds(seconds).nanoseconds);
+  }
+
+  double seconds() const {
+    return static_cast<double>(nanoseconds) /
+           static_cast<double>(kRuntimeNanosecondsPerSecond);
+  }
+
+  RuntimeTimePoint operator+(RuntimeDuration duration) const {
+    return fromNanoseconds(nanoseconds + duration.nanoseconds);
+  }
+
+  RuntimeDuration operator-(RuntimeTimePoint rhs) const {
+    return RuntimeDuration::fromNanoseconds(nanoseconds - rhs.nanoseconds);
+  }
+
+  bool operator<(RuntimeTimePoint rhs) const { return nanoseconds < rhs.nanoseconds; }
+  bool operator==(RuntimeTimePoint rhs) const { return nanoseconds == rhs.nanoseconds; }
+};
+
 /**
  * @brief 用于生成运行时 tick 事件的公开循环时间样本。
  */
 struct RuntimeLoopTick {
   int iteration_index = 0;              ///< 从零开始的公开循环迭代。
+  RuntimeDuration base_dt;              ///< 内部基础步长。
+  RuntimeDuration time_offset;          ///< 内部输入侧时间偏移。
+  RuntimeTimePoint public_output_time;  ///< 内部公开输出时间点。
+  RuntimeDuration output_period;        ///< 内部公开输出周期。
   double base_dt_s = 0.0;               ///< 基础积分步长或公开步长，单位为秒。
   double time_offset_s = 0.0;           ///< tick 开始处的输入侧时间偏移，单位为秒。
   double public_output_time_s = 0.0;    ///< 为此 tick 发出的公开输出时间戳，单位为秒。
@@ -36,9 +118,13 @@ struct RuntimeLoopTick {
     return {
         {"iteration_index", iteration_index},
         {"base_dt_s", base_dt_s},
+        {"base_dt_ns", base_dt.nanoseconds},
         {"time_offset_s", time_offset_s},
+        {"time_offset_ns", time_offset.nanoseconds},
         {"public_output_time_s", public_output_time_s},
+        {"public_output_time_ns", public_output_time.nanoseconds},
         {"output_period_s", output_period_s},
+        {"output_period_ns", output_period.nanoseconds},
     };
   }
 };
@@ -91,11 +177,17 @@ inline RuntimeLoopTick makeRuntimeLoopTick(
     double base_dt_s,
     double output_period_s) {
   const double public_period_s = runtimePublicPeriodS(base_dt_s, output_period_s);
+  const RuntimeDuration public_period = RuntimeDuration::fromSeconds(public_period_s);
   RuntimeLoopTick tick;
   tick.iteration_index = iteration_index;
+  tick.base_dt = RuntimeDuration::fromSeconds(base_dt_s);
+  tick.time_offset = public_period * iteration_index;
+  tick.public_output_time = RuntimeTimePoint::fromNanoseconds(
+      (public_period * (iteration_index + 1)).nanoseconds);
+  tick.output_period = public_period;
   tick.base_dt_s = base_dt_s;
-  tick.time_offset_s = static_cast<double>(iteration_index) * public_period_s;
-  tick.public_output_time_s = static_cast<double>(iteration_index + 1) * public_period_s;
+  tick.time_offset_s = tick.time_offset.seconds();
+  tick.public_output_time_s = tick.public_output_time.seconds();
   tick.output_period_s = public_period_s;
   return tick;
 }
@@ -109,12 +201,17 @@ inline RuntimeLoopTick makeRuntimeLoopTick(
 struct RuntimeNodeDispatch {
   bool execute = true;                                      ///< 为真时表示节点应立即派发。
   std::string reason = "every_tick";                        ///< 便于阅读的派发或保持原因。
+  RuntimeDuration output_period;                             ///< 内部输出节拍。
+  RuntimeTimePoint public_output_time;                       ///< 内部公开输出时间点。
+  RuntimeDuration effective_delta_t;                         ///< 内部有效 dt。
+  RuntimeTimePoint next_due_time;                            ///< 内部下一次到期时间。
   double output_period_s = 0.0;                              ///< 此节点的有效输出节拍，单位为秒。
   double public_output_time_s = 0.0;                         ///< 已生成或保持输出的公开时间戳。
   double effective_delta_t_s = 0.0;                          ///< 距该节点上一次执行的经过时间。
   double next_due_time_s = std::numeric_limits<double>::quiet_NaN(); ///< 已知时的下一次计划公开时间。
   std::string runtime_event_id;                              ///< 事件驱动时触发本次派发的事件 id。
   std::string runtime_event_kind;                            ///< 事件驱动时触发本次派发的事件类型。
+  RuntimeTimePoint runtime_event_time;                       ///< 触发事件内部时间点。
   double runtime_event_time_s = 0.0;                         ///< 触发事件时间，单位为秒。
   int held_from_iteration = -1;                              ///< 被保持输出所属的迭代；无保持时为 -1。
   nlohmann::json time_info = nlohmann::json::object();       ///< 传给适配器和证据的运行时 time_info 包。

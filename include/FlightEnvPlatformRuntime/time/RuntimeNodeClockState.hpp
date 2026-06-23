@@ -12,6 +12,8 @@
  */
 
 
+#include "FlightEnvPlatformRuntime/time/RuntimeTimeTypes.hpp"
+
 #include <limits>
 #include <nlohmann/json.hpp>
 
@@ -26,6 +28,8 @@ namespace FlightEnvPlatformRuntime {
 struct RuntimeNodeClockState {
   bool has_executed = false; ///< 调度器记录该节点首次完成派发后为真。
   int last_execution_iteration = -1; ///< 上一次完成派发的公开迭代索引。
+  RuntimeTimePoint last_execution_public_time; ///< 上一次派发的内部公开时间点。
+  RuntimeTimePoint next_due_public_time; ///< 已知时的下一次内部到期时间点。
   double last_execution_public_time_s = std::numeric_limits<double>::quiet_NaN(); ///< 上一次派发的公开时间。
   double next_due_public_time_s = std::numeric_limits<double>::quiet_NaN(); ///< 已知时的下一次公开到期时间。
   nlohmann::json last_execute_result = nlohmann::json::object(); ///< 为保持输出复用保留的上一次输出包。

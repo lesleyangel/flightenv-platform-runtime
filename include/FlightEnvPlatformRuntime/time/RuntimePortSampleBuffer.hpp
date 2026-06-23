@@ -12,7 +12,10 @@
  */
 
 
+#include "FlightEnvPlatformRuntime/time/RuntimeTimeTypes.hpp"
+
 #include <nlohmann/json.hpp>
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <string>
@@ -27,6 +30,8 @@ struct RuntimePortSample {
   std::string channel_id;       ///< 缓冲通道 id，可以是节点 id 或 `node/port`。
   std::string source_node_id;   ///< 产生该样本的节点。
   std::string source_port_id;   ///< 产生该样本的端口；节点级样本为空。
+  RuntimeTimePoint time;        ///< 样本内部时间点，运行时比较使用纳秒。
+  std::int64_t time_ns = 0;     ///< 样本内部时间戳纳秒，便于 evidence 和审计读取。
   double time_s = 0.0;          ///< 样本的公开输出时间，单位为秒。
   int iteration_index = -1;     ///< 产生该样本的公开迭代。
   nlohmann::json value = nlohmann::json::object();     ///< 输出值或引用包。

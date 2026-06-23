@@ -31,6 +31,7 @@ namespace FlightEnvPlatformRuntime {
 struct RuntimeEvent {
   std::string event_id;                         ///< 稳定事件 id；为空时在入队时生成。
   std::string event_kind;                       ///< 机器可读的事件类型。
+  RuntimeTimePoint event_time;                  ///< 内部排序使用的稳定事件时间点。
   double event_time_s = 0.0;                    ///< 公开运行时时钟上的事件时间，单位为秒。
   int priority = 0;                             ///< 同一时间上数值越小越先派发。
   int iteration_index = -1;                     ///< 与此事件关联的公开迭代；不适用时为 -1。
@@ -131,6 +132,41 @@ class RuntimeEventQueue {
       double event_time_s,
       int public_iteration_index,
       nlohmann::json payload = nlohmann::json::object());
+
+  /**
+   * @brief 创建停止条件检查事件。
+   * @param event_time_s 停止条件应检查的公开运行时刻，单位为秒。
+   * @param public_iteration_index 与检查关联的公开迭代。
+   * @param payload 可选停止策略元数据。
+   * @return 以 workflow 为目标的停止检查事件。
+   */
+  static RuntimeEvent stopCheckDueEvent(
+      double event_time_s,
+      int public_iteration_index,
+      nlohmann::json payload = nlohmann::json::object());
+
+  /**
+   * @brief 创建分支触发事件。
+   * @param branch_id 目标分支标识。
+   * @param event_time_s 分支被触发的公开运行时刻，单位为秒。
+   * @param public_iteration_index 与事件关联的公开迭代。
+   * @param cause_event_id 触发该分支事件的上游事件 id。
+   * @param payload 可选分支触发元数据。
+   * @return 以分支为目标的事件。
+   */
+  static RuntimeEvent branchTriggeredEvent(
+      const std::string& branch_id,
+      double event_time_s,
+      int public_iteration_index,
+      const std::string& cause_event_id = "",
+      nlohmann::json payload = nlohmann::json::object());
+
+  /**
+   * @brief 将 runtime 事件转换为通用 evidence JSON。
+   * @param event 已归一化的 runtime 事件。
+   * @return 包含秒制和纳秒制时间字段的事件证据。
+   */
+  static nlohmann::json eventEvidence(const RuntimeEvent& event);
 
  private:
   /**

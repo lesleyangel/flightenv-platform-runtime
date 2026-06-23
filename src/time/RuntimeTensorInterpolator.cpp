@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <memory>
 
 namespace FlightEnvPlatformRuntime {
@@ -39,26 +40,34 @@ nlohmann::json tensorEvidence(
     const std::string& status,
     double source_time_s,
     int sample_count) {
+  const RuntimeTimePoint target_time = RuntimeTimePoint::fromSeconds(request.target_time_s);
+  const RuntimeTimePoint source_time = RuntimeTimePoint::fromSeconds(source_time_s);
+  const RuntimeTimePoint window_start = RuntimeTimePoint::fromSeconds(request.window_start_s);
+  const RuntimeTimePoint window_end = RuntimeTimePoint::fromSeconds(request.window_end_s);
   return {
       {"method_id", method_id},
       {"operation", request.operation},
       {"channel_id", request.channel_id},
       {"status", status},
       {"target_time_s", request.target_time_s},
+      {"target_time_ns", target_time.nanoseconds},
       {"source_time_s", source_time_s},
+      {"source_time_ns", source_time.nanoseconds},
       {"window_start_s", request.window_start_s},
+      {"window_start_ns", window_start.nanoseconds},
       {"window_end_s", request.window_end_s},
+      {"window_end_ns", window_end.nanoseconds},
       {"sample_count", sample_count},
   };
 }
 
 const RuntimePortSample* nearestSample(
     const std::vector<RuntimePortSample>& samples,
-    double target_time_s) {
+    RuntimeTimePoint target_time) {
   const RuntimePortSample* best = nullptr;
-  double best_gap = 0.0;
+  std::int64_t best_gap = 0;
   for (const auto& sample : samples) {
-    const double gap = std::abs(sample.time_s - target_time_s);
+    const std::int64_t gap = std::llabs(sample.time.nanoseconds - target_time.nanoseconds);
     if (best == nullptr || gap < best_gap) {
       best = &sample;
       best_gap = gap;
@@ -76,7 +85,8 @@ class NearestTensorInterpolator final : public RuntimeTensorInterpolator {
     RuntimeTensorInterpolationResult result;
     result.method_id = methodId();
     result.sample_count = static_cast<int>(request.samples.size());
-    const RuntimePortSample* selected = nearestSample(request.samples, request.target_time_s);
+    const RuntimePortSample* selected =
+        nearestSample(request.samples, RuntimeTimePoint::fromSeconds(request.target_time_s));
     if (selected == nullptr) {
       result.status = "no_tensor_samples";
       result.evidence = tensorEvidence(request, result.method_id, result.status, 0.0, result.sample_count);
@@ -104,9 +114,13 @@ class NearestTensorInterpolator final : public RuntimeTensorInterpolator {
           {"operation", request.operation},
           {"channel_id", request.channel_id},
           {"target_time_s", request.target_time_s},
+          {"target_time_ns", RuntimeTimePoint::fromSeconds(request.target_time_s).nanoseconds},
           {"source_time_s", result.source_time_s},
+          {"source_time_ns", selected->time.nanoseconds},
           {"window_start_s", request.window_start_s},
+          {"window_start_ns", RuntimeTimePoint::fromSeconds(request.window_start_s).nanoseconds},
           {"window_end_s", request.window_end_s},
+          {"window_end_ns", RuntimeTimePoint::fromSeconds(request.window_end_s).nanoseconds},
           {"selected_source_node_id", selected->source_node_id},
           {"selected_source_port_id", selected->source_port_id},
           {"selected_iteration_index", selected->iteration_index},

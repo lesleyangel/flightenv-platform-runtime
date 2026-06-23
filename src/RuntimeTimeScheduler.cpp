@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <utility>
 
 namespace FlightEnvPlatformRuntime {
@@ -98,6 +99,9 @@ double publicOutputTimeS(const json& time_info, int iteration_index, double base
 }
 
 json withDispatchTime(json time_info,
+                      RuntimeDuration effective_delta_t,
+                      RuntimeDuration output_period,
+                      RuntimeTimePoint public_output_time,
                       double effective_delta_t_s,
                       double output_period_s,
                       double public_output_time_s,
@@ -105,8 +109,11 @@ json withDispatchTime(json time_info,
                       double next_due_time_s,
                       const std::string& dispatch_reason) {
   time_info["effective_delta_t_s"] = effective_delta_t_s;
+  time_info["effective_delta_t_ns"] = effective_delta_t.nanoseconds;
   time_info["output_period_s"] = output_period_s;
+  time_info["output_period_ns"] = output_period.nanoseconds;
   time_info["public_output_time_s"] = public_output_time_s;
+  time_info["public_output_time_ns"] = public_output_time.nanoseconds;
   time_info["held"] = held;
   time_info["dispatch_reason"] = dispatch_reason;
   if (std::isfinite(next_due_time_s)) {
@@ -114,11 +121,24 @@ json withDispatchTime(json time_info,
   }
   time_info["public_tick"] = {
       {"output_time_s", public_output_time_s},
+      {"output_time_ns", public_output_time.nanoseconds},
       {"effective_delta_t_s", effective_delta_t_s},
+      {"effective_delta_t_ns", effective_delta_t.nanoseconds},
       {"output_period_s", output_period_s},
+      {"output_period_ns", output_period.nanoseconds},
       {"held", held},
   };
   return time_info;
+}
+
+int publicIterationForTimePoint(RuntimeTimePoint event_time, RuntimeDuration public_period) {
+  if (public_period.nanoseconds <= 0) {
+    return 0;
+  }
+  const std::int64_t clamped_time = std::max<std::int64_t>(0, event_time.nanoseconds);
+  const std::int64_t scaled =
+      (clamped_time + public_period.nanoseconds - 1) / public_period.nanoseconds;
+  return std::max(0, static_cast<int>(scaled) - 1);
 }
 
 }  // namespace
@@ -168,15 +188,15 @@ RuntimeNodeDispatch RuntimeTimeScheduler::planDispatch(
     int iteration_index,
     double base_dt_s,
     double time_offset_s) {
-  constexpr double kEpsilon = 1.0e-9;
-
   const std::string node_id = jsonString(node, "node_id");
   const json base_time_info = baseTimeInfo(node, iteration_index, time_offset_s);
   RuntimeNodeClockState& state = state_by_node_[node_id];
 
   RuntimeNodeDispatch dispatch;
   dispatch.output_period_s = nodeOutputPeriodS(base_time_info, node, base_dt_s);
+  dispatch.output_period = RuntimeDuration::fromSeconds(dispatch.output_period_s);
   dispatch.public_output_time_s = publicOutputTimeS(base_time_info, iteration_index, base_dt_s, time_offset_s);
+  dispatch.public_output_time = RuntimeTimePoint::fromSeconds(dispatch.public_output_time_s);
   dispatch.held_from_iteration = state.last_execution_iteration;
   dispatch.last_execute_result = state.last_execute_result;
   dispatch.last_time_info = state.last_time_info;
@@ -188,9 +208,14 @@ RuntimeNodeDispatch RuntimeTimeScheduler::planDispatch(
     dispatch.execute = true;
     dispatch.reason = "initial_sample";
     dispatch.effective_delta_t_s = fallback_delta;
+    dispatch.effective_delta_t = RuntimeDuration::fromSeconds(dispatch.effective_delta_t_s);
     dispatch.next_due_time_s = dispatch.public_output_time_s;
+    dispatch.next_due_time = dispatch.public_output_time;
     dispatch.time_info = withDispatchTime(
         base_time_info,
+        dispatch.effective_delta_t,
+        dispatch.output_period,
+        dispatch.public_output_time,
         dispatch.effective_delta_t_s,
         dispatch.output_period_s,
         dispatch.public_output_time_s,
@@ -202,16 +227,21 @@ RuntimeNodeDispatch RuntimeTimeScheduler::planDispatch(
 
   const json policy = base_time_info.value("time_policy", node.value("time_policy", json::object()));
   const std::string kind = jsonString(policy, "kind");
+  const RuntimeDuration base_dt = RuntimeDuration::fromSeconds(base_dt_s);
   const bool coarse_sample =
-      (kind == "sampled" || kind == "fixed_step") && dispatch.output_period_s > 0.0 &&
-      base_dt_s > 0.0 && dispatch.output_period_s > base_dt_s + kEpsilon;
-  dispatch.next_due_time_s = std::isfinite(state.next_due_public_time_s)
-                                 ? state.next_due_public_time_s
-                                 : state.last_execution_public_time_s + dispatch.output_period_s;
+      (kind == "sampled" || kind == "fixed_step") &&
+      dispatch.output_period.nanoseconds > 0 &&
+      base_dt.nanoseconds > 0 &&
+      dispatch.output_period.nanoseconds > base_dt.nanoseconds;
+  dispatch.next_due_time =
+      state.next_due_public_time.nanoseconds > 0
+          ? state.next_due_public_time
+          : state.last_execution_public_time + dispatch.output_period;
+  dispatch.next_due_time_s = dispatch.next_due_time.seconds();
   if (!coarse_sample) {
     dispatch.execute = true;
     dispatch.reason = "every_public_tick";
-  } else if (dispatch.public_output_time_s + kEpsilon >= dispatch.next_due_time_s) {
+  } else if (dispatch.public_output_time.nanoseconds >= dispatch.next_due_time.nanoseconds) {
     dispatch.execute = true;
     dispatch.reason = "sample_period_due";
   } else {
@@ -220,13 +250,20 @@ RuntimeNodeDispatch RuntimeTimeScheduler::planDispatch(
   }
 
   if (std::isfinite(state.last_execution_public_time_s)) {
-    dispatch.effective_delta_t_s =
-        std::max(0.0, dispatch.public_output_time_s - state.last_execution_public_time_s);
+    dispatch.effective_delta_t = dispatch.public_output_time - state.last_execution_public_time;
+    if (dispatch.effective_delta_t.nanoseconds < 0) {
+      dispatch.effective_delta_t = RuntimeDuration::fromNanoseconds(0);
+    }
+    dispatch.effective_delta_t_s = dispatch.effective_delta_t.seconds();
   } else {
     dispatch.effective_delta_t_s = fallback_delta;
+    dispatch.effective_delta_t = RuntimeDuration::fromSeconds(dispatch.effective_delta_t_s);
   }
   dispatch.time_info = withDispatchTime(
       base_time_info,
+      dispatch.effective_delta_t,
+      dispatch.output_period,
+      dispatch.public_output_time,
       dispatch.effective_delta_t_s,
       dispatch.output_period_s,
       dispatch.public_output_time_s,
@@ -250,44 +287,58 @@ RuntimeNodeDispatch RuntimeTimeScheduler::planEventDispatch(
   RuntimeNodeDispatch dispatch;
   dispatch.execute = true;
   dispatch.reason = state.has_executed ? "node_due" : "initial_node_due";
+  dispatch.output_period = RuntimeDuration::fromSeconds(node_period_s);
+  dispatch.public_output_time = event.event_time;
+  dispatch.next_due_time = event.event_time + dispatch.output_period;
   dispatch.output_period_s = node_period_s;
-  dispatch.public_output_time_s = event.event_time_s;
-  dispatch.next_due_time_s = event.event_time_s + node_period_s;
+  dispatch.public_output_time_s = dispatch.public_output_time.seconds();
+  dispatch.next_due_time_s = dispatch.next_due_time.seconds();
   dispatch.held_from_iteration = state.last_execution_iteration;
   dispatch.last_execute_result = state.last_execute_result;
   dispatch.last_time_info = state.last_time_info;
   dispatch.runtime_event_id = event.event_id;
   dispatch.runtime_event_kind = event.event_kind;
+  dispatch.runtime_event_time = event.event_time;
   dispatch.runtime_event_time_s = event.event_time_s;
-  dispatch.effective_delta_t_s =
-      state.has_executed && std::isfinite(state.last_execution_public_time_s)
-          ? std::max(0.0, event.event_time_s - state.last_execution_public_time_s)
-          : std::max(0.0, event.event_time_s);
+  dispatch.effective_delta_t =
+      state.has_executed
+          ? event.event_time - state.last_execution_public_time
+          : RuntimeDuration::fromNanoseconds(std::max<std::int64_t>(0, event.event_time.nanoseconds));
+  if (dispatch.effective_delta_t.nanoseconds < 0) {
+    dispatch.effective_delta_t = RuntimeDuration::fromNanoseconds(0);
+  }
+  dispatch.effective_delta_t_s = dispatch.effective_delta_t.seconds();
 
   dispatch.time_info = withDispatchTime(
       base_time_info,
+      dispatch.effective_delta_t,
+      dispatch.output_period,
+      dispatch.public_output_time,
       dispatch.effective_delta_t_s,
       dispatch.output_period_s,
       dispatch.public_output_time_s,
       false,
       dispatch.next_due_time_s,
       dispatch.reason);
-  const double input_time_s = std::max(0.0, event.event_time_s - dispatch.effective_delta_t_s);
+  const RuntimeTimePoint input_time = RuntimeTimePoint::fromNanoseconds(
+      std::max<std::int64_t>(0, event.event_time.nanoseconds - dispatch.effective_delta_t.nanoseconds));
+  const double input_time_s = input_time.seconds();
   if (dispatch.time_info.contains("time_point") && dispatch.time_info.at("time_point").is_object()) {
     dispatch.time_info["time_point"]["run_time_s"] = input_time_s;
     dispatch.time_info["time_point"]["source_time_s"] = input_time_s;
-    dispatch.time_info["time_point"]["stamp_ns"] = static_cast<long long>(input_time_s * 1.0e9);
+    dispatch.time_info["time_point"]["stamp_ns"] = input_time.nanoseconds;
   }
   if (dispatch.time_info.contains("output_time_point") &&
       dispatch.time_info.at("output_time_point").is_object()) {
-    dispatch.time_info["output_time_point"]["run_time_s"] = event.event_time_s;
-    dispatch.time_info["output_time_point"]["source_time_s"] = event.event_time_s;
-    dispatch.time_info["output_time_point"]["stamp_ns"] = static_cast<long long>(event.event_time_s * 1.0e9);
+    dispatch.time_info["output_time_point"]["run_time_s"] = dispatch.public_output_time_s;
+    dispatch.time_info["output_time_point"]["source_time_s"] = dispatch.public_output_time_s;
+    dispatch.time_info["output_time_point"]["stamp_ns"] = dispatch.public_output_time.nanoseconds;
   }
   dispatch.time_info["runtime_event"] = {
       {"event_id", event.event_id},
       {"event_kind", event.event_kind},
       {"event_time_s", event.event_time_s},
+      {"event_time_ns", event.event_time.nanoseconds},
       {"target_id", event.target_id},
       {"cause_event_id", event.cause_event_id},
       {"payload", event.payload},
@@ -303,10 +354,39 @@ void RuntimeTimeScheduler::seedWorkflowEvents(
     double output_period_s) const {
   const int bounded_iterations = std::max(1, max_iterations);
   const double public_period_s = runtimePublicPeriodS(base_dt_s, output_period_s);
-  const double horizon_s = static_cast<double>(bounded_iterations) * public_period_s;
+  const RuntimeDuration public_period = RuntimeDuration::fromSeconds(public_period_s);
+  const RuntimeTimePoint horizon =
+      RuntimeTimePoint::fromNanoseconds((public_period * bounded_iterations).nanoseconds);
+  const double horizon_s = horizon.seconds();
   constexpr double kEpsilon = 1.0e-9;
 
   events.pushFixedPublicTicks(bounded_iterations, base_dt_s, public_period_s);
+  for (int iteration = 0; iteration < bounded_iterations; ++iteration) {
+    const RuntimeTimePoint public_time =
+        RuntimeTimePoint::fromNanoseconds((public_period * iteration).nanoseconds);
+    const double public_time_s = public_time.seconds();
+    events.push(RuntimeEventQueue::checkpointDueEvent(
+        "workflow_public_checkpoint",
+        public_time_s,
+        iteration,
+        {
+            {"checkpoint_scope", "workflow_public_tick"},
+            {"public_iteration_index", iteration},
+            {"public_period_s", public_period_s},
+            {"public_period_ns", public_period.nanoseconds},
+            {"event_time_ns", public_time.nanoseconds},
+        }));
+    events.push(RuntimeEventQueue::stopCheckDueEvent(
+        public_time_s,
+        iteration,
+        {
+            {"stop_scope", "workflow_public_tick"},
+            {"public_iteration_index", iteration},
+            {"public_period_s", public_period_s},
+            {"public_period_ns", public_period.nanoseconds},
+            {"event_time_ns", public_time.nanoseconds},
+        }));
+  }
   for (std::size_t node_index = 0; node_index < nodes.size(); ++node_index) {
     const json& node = nodes[node_index];
     const std::string node_id = jsonString(node, "node_id");
@@ -317,15 +397,22 @@ void RuntimeTimeScheduler::seedWorkflowEvents(
     if (!(period_s > kEpsilon) || !std::isfinite(period_s)) {
       continue;
     }
+    const RuntimeDuration period = RuntimeDuration::fromSeconds(period_s);
+    if (period.nanoseconds <= 0) {
+      continue;
+    }
 
-    const double first_due_time_s =
-        period_s > public_period_s + kEpsilon ? public_period_s : period_s;
+    const RuntimeTimePoint first_due_time =
+        period.nanoseconds > public_period.nanoseconds
+            ? RuntimeTimePoint::fromNanoseconds(public_period.nanoseconds)
+            : RuntimeTimePoint::fromNanoseconds(period.nanoseconds);
     for (int due_index = 0; ; ++due_index) {
-      const double due_time_s = first_due_time_s + period_s * static_cast<double>(due_index);
-      if (due_time_s > horizon_s + kEpsilon) {
+      const RuntimeTimePoint due_time = first_due_time + (period * due_index);
+      if (due_time.nanoseconds > horizon.nanoseconds) {
         break;
       }
-      const int public_iteration = publicIterationForTime(due_time_s, public_period_s);
+      const double due_time_s = due_time.seconds();
+      const int public_iteration = publicIterationForTimePoint(due_time, public_period);
       events.push(RuntimeEventQueue::nodeDueEvent(
           node_id,
           due_time_s,
@@ -335,8 +422,13 @@ void RuntimeTimeScheduler::seedWorkflowEvents(
               {"node_id", node_id},
               {"topological_index", static_cast<int>(node_index)},
               {"sample_period_s", period_s},
+              {"sample_period_ns", period.nanoseconds},
+              {"scheduled_event_time_s", due_time_s},
+              {"scheduled_event_time_ns", due_time.nanoseconds},
               {"public_period_s", public_period_s},
+              {"public_period_ns", public_period.nanoseconds},
               {"horizon_s", horizon_s},
+              {"horizon_ns", horizon.nanoseconds},
               {"due_index", due_index},
           }));
     }
@@ -351,11 +443,13 @@ void RuntimeTimeScheduler::markExecuted(
   RuntimeNodeClockState& state = state_by_node_[node_id];
   state.has_executed = true;
   state.last_execution_iteration = iteration_index;
+  state.last_execution_public_time = dispatch.public_output_time;
+  state.next_due_public_time =
+      dispatch.output_period.nanoseconds > 0
+          ? dispatch.public_output_time + dispatch.output_period
+          : dispatch.public_output_time + RuntimeDuration::fromSeconds(1.0);
   state.last_execution_public_time_s = dispatch.public_output_time_s;
-  state.next_due_public_time_s =
-      dispatch.output_period_s > 0.0
-          ? dispatch.public_output_time_s + dispatch.output_period_s
-          : dispatch.public_output_time_s + 1.0;
+  state.next_due_public_time_s = state.next_due_public_time.seconds();
   state.last_execute_result = execute_result;
   state.last_time_info = dispatch.time_info;
 }
@@ -387,9 +481,9 @@ int RuntimeTimeScheduler::publicIterationForTime(double event_time_s, double pub
   if (!(public_period_s > 0.0) || !std::isfinite(event_time_s)) {
     return 0;
   }
-  constexpr double kEpsilon = 1.0e-9;
-  const double scaled = std::ceil(std::max(0.0, event_time_s - kEpsilon) / public_period_s);
-  return std::max(0, static_cast<int>(scaled) - 1);
+  return publicIterationForTimePoint(
+      RuntimeTimePoint::fromSeconds(event_time_s),
+      RuntimeDuration::fromSeconds(public_period_s));
 }
 
 double RuntimeTimeScheduler::loopTimeOffsetS(int iteration_index, double base_dt_s) {

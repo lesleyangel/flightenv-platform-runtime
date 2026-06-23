@@ -11,7 +11,6 @@
 
 #include "FlightEnvPlatformRuntime/time/RuntimeEventQueue.hpp"
 
-#include <cmath>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -20,10 +19,6 @@
 namespace FlightEnvPlatformRuntime {
 namespace {
 
-double comparableTime(double value) {
-  return std::isfinite(value) ? value : 0.0;
-}
-
 std::string generatedEventId(const std::string& kind, std::uint64_t sequence) {
   std::ostringstream oss;
   oss << "evt.runtime." << (kind.empty() ? "event" : kind) << "."
@@ -31,15 +26,20 @@ std::string generatedEventId(const std::string& kind, std::uint64_t sequence) {
   return oss.str();
 }
 
+void normalizeEventTime(RuntimeEvent& event) {
+  if (event.event_time.nanoseconds == 0 && event.event_time_s != 0.0) {
+    event.event_time = RuntimeTimePoint::fromSeconds(event.event_time_s);
+  }
+  event.event_time_s = event.event_time.seconds();
+}
+
 }  // namespace
 
 bool RuntimeEventQueue::EventOrder::operator()(
     const QueuedEvent& lhs,
     const QueuedEvent& rhs) const {
-  const double lhs_time = comparableTime(lhs.event.event_time_s);
-  const double rhs_time = comparableTime(rhs.event.event_time_s);
-  if (lhs_time != rhs_time) {
-    return lhs_time > rhs_time;
+  if (!(lhs.event.event_time == rhs.event.event_time)) {
+    return rhs.event.event_time < lhs.event.event_time;
   }
   if (lhs.event.priority != rhs.event.priority) {
     return lhs.event.priority > rhs.event.priority;
@@ -49,6 +49,7 @@ bool RuntimeEventQueue::EventOrder::operator()(
 
 void RuntimeEventQueue::push(RuntimeEvent event) {
   const std::uint64_t sequence = next_sequence_++;
+  normalizeEventTime(event);
   if (event.event_id.empty()) {
     event.event_id = generatedEventId(event.event_kind, sequence);
   }
@@ -84,6 +85,7 @@ RuntimeEvent RuntimeEventQueue::pop() {
 RuntimeEvent RuntimeEventQueue::publicTickEvent(const RuntimeLoopTick& tick) {
   RuntimeEvent event;
   event.event_kind = "public_tick";
+  event.event_time = tick.public_output_time;
   event.event_time_s = tick.public_output_time_s;
   event.priority = 100000;
   event.iteration_index = tick.iteration_index;
@@ -106,7 +108,8 @@ RuntimeEvent RuntimeEventQueue::nodeDueEvent(
     nlohmann::json payload) {
   RuntimeEvent event;
   event.event_kind = "node_due";
-  event.event_time_s = event_time_s;
+  event.event_time = RuntimeTimePoint::fromSeconds(event_time_s);
+  event.event_time_s = event.event_time.seconds();
   event.priority = priority;
   event.iteration_index = public_iteration_index;
   event.target_id = node_id;
@@ -114,7 +117,7 @@ RuntimeEvent RuntimeEventQueue::nodeDueEvent(
 
   std::ostringstream oss;
   oss << "evt.runtime.node_due." << node_id << "."
-      << std::fixed << std::setprecision(9) << event_time_s;
+      << event.event_time.nanoseconds;
   event.event_id = oss.str();
   return event;
 }
@@ -126,7 +129,8 @@ RuntimeEvent RuntimeEventQueue::inputArrivedEvent(
     nlohmann::json payload) {
   RuntimeEvent event;
   event.event_kind = "input_arrived";
-  event.event_time_s = event_time_s;
+  event.event_time = RuntimeTimePoint::fromSeconds(event_time_s);
+  event.event_time_s = event.event_time.seconds();
   event.priority = 0;
   event.iteration_index = public_iteration_index;
   event.target_id = input_id;
@@ -134,7 +138,7 @@ RuntimeEvent RuntimeEventQueue::inputArrivedEvent(
 
   std::ostringstream oss;
   oss << "evt.runtime.input_arrived." << input_id << "."
-      << std::fixed << std::setprecision(9) << event_time_s;
+      << event.event_time.nanoseconds;
   event.event_id = oss.str();
   return event;
 }
@@ -146,7 +150,8 @@ RuntimeEvent RuntimeEventQueue::checkpointDueEvent(
     nlohmann::json payload) {
   RuntimeEvent event;
   event.event_kind = "checkpoint_due";
-  event.event_time_s = event_time_s;
+  event.event_time = RuntimeTimePoint::fromSeconds(event_time_s);
+  event.event_time_s = event.event_time.seconds();
   event.priority = 90000;
   event.iteration_index = public_iteration_index;
   event.target_id = checkpoint_id;
@@ -154,9 +159,67 @@ RuntimeEvent RuntimeEventQueue::checkpointDueEvent(
 
   std::ostringstream oss;
   oss << "evt.runtime.checkpoint_due." << checkpoint_id << "."
-      << std::fixed << std::setprecision(9) << event_time_s;
+      << event.event_time.nanoseconds;
   event.event_id = oss.str();
   return event;
+}
+
+RuntimeEvent RuntimeEventQueue::stopCheckDueEvent(
+    double event_time_s,
+    int public_iteration_index,
+    nlohmann::json payload) {
+  RuntimeEvent event;
+  event.event_kind = "stop_check_due";
+  event.event_time = RuntimeTimePoint::fromSeconds(event_time_s);
+  event.event_time_s = event.event_time.seconds();
+  event.priority = 110000;
+  event.iteration_index = public_iteration_index;
+  event.target_id = "workflow";
+  event.payload = std::move(payload);
+
+  std::ostringstream oss;
+  oss << "evt.runtime.stop_check_due."
+      << event.event_time.nanoseconds << "."
+      << std::setw(6) << std::setfill('0') << public_iteration_index;
+  event.event_id = oss.str();
+  return event;
+}
+
+RuntimeEvent RuntimeEventQueue::branchTriggeredEvent(
+    const std::string& branch_id,
+    double event_time_s,
+    int public_iteration_index,
+    const std::string& cause_event_id,
+    nlohmann::json payload) {
+  RuntimeEvent event;
+  event.event_kind = "branch_triggered";
+  event.event_time = RuntimeTimePoint::fromSeconds(event_time_s);
+  event.event_time_s = event.event_time.seconds();
+  event.priority = 50000;
+  event.iteration_index = public_iteration_index;
+  event.target_id = branch_id;
+  event.cause_event_id = cause_event_id;
+  event.payload = std::move(payload);
+
+  std::ostringstream oss;
+  oss << "evt.runtime.branch_triggered." << branch_id << "."
+      << event.event_time.nanoseconds;
+  event.event_id = oss.str();
+  return event;
+}
+
+nlohmann::json RuntimeEventQueue::eventEvidence(const RuntimeEvent& event) {
+  return {
+      {"event_id", event.event_id},
+      {"event_kind", event.event_kind},
+      {"target_id", event.target_id},
+      {"cause_event_id", event.cause_event_id},
+      {"event_time_s", event.event_time_s},
+      {"event_time_ns", event.event_time.nanoseconds},
+      {"priority", event.priority},
+      {"loop_iteration_index", event.iteration_index},
+      {"payload", event.payload.is_null() ? nlohmann::json::object() : event.payload},
+  };
 }
 
 }  // namespace FlightEnvPlatformRuntime

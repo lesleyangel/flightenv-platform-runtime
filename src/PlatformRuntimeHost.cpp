@@ -12,9 +12,12 @@
 #include "FlightEnvPlatformRuntime/PlatformRuntimeHost.hpp"
 
 #include "FlightEnvPlatformRuntime/NativeWorkflowRunner.hpp"
+#include "FlightEnvPlatformRuntime/RuntimeBranchService.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeProfileUtils.hpp"
+#include "FlightEnvPlatformRuntime/RuntimeTimelineMaterializer.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeTypedBufferStore.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeZeroCopyPolicy.hpp"
+#include "FlightEnvPlatformRuntime/time/RuntimeEventQueue.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -32,6 +35,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -1607,7 +1611,9 @@ void PlatformRuntimeHost::runCompiledWorkflow(
     const fs::path& seed_runtime_outputs,
     const fs::path& external_observation_stream,
     int max_iterations,
-    bool prepare_only) {
+    bool prepare_only,
+    const std::string& branch_id,
+    const std::string& timeline_id) {
   if (!useNativeBackend()) {
     const int rc = invokePdkRun(
         compiled_workflow,
@@ -1642,6 +1648,8 @@ void PlatformRuntimeHost::runCompiledWorkflow(
   NativeWorkflowRequest request;
   request.run_dir = run_dir;
   request.run_id = run_id;
+  request.branch_id = branch_id;
+  request.timeline_id = timeline_id;
   request.seed_runtime_outputs = seed_runtime_outputs;
   request.external_observation_stream = external_observation_stream;
   request.max_iterations = max_iterations;
@@ -1673,9 +1681,11 @@ void PlatformRuntimeHost::prepareRuntime() {
     std::cout << "[C++ RuntimeHost] 执行 adapter preflight..." << std::endl;
     NativeWorkflowRunner* online_runner = useNativeBackend() ? &onlineNativeRunner() : nullptr;
     runCompiledWorkflow(
-        options_.compiled_online_workflow, online_runner, online_prepare, online_prepare_id, {}, {}, 0, true);
+        options_.compiled_online_workflow, online_runner, online_prepare, online_prepare_id, {}, {}, 0, true,
+        kOnlineFilterBranchId, "preflight.online");
     runCompiledWorkflow(
-        options_.compiled_future_workflow, nullptr, future_prepare, future_prepare_id, {}, {}, 0, true);
+        options_.compiled_future_workflow, nullptr, future_prepare, future_prepare_id, {}, {}, 0, true,
+        "preflight.future", "preflight.future");
     preflight_runs = json::array({
         {
             {"workflow_role", "online_filtering"},
@@ -1879,7 +1889,9 @@ fs::path PlatformRuntimeHost::runOneOnlineFrame(
       previous_seed,
       frame_stream,
       1,
-      false);
+      false,
+      kOnlineFilterBranchId,
+      "online.mainline");
   writeRuntimeBranchIndex(run_dir);
   return run_dir;
 }
@@ -1934,26 +1946,9 @@ void PlatformRuntimeHost::writeRuntimeBranchIndex(const fs::path& run_dir) const
       if (!iteration.is_object()) {
         continue;
       }
-      const int step_index = jsonInt(iteration, "iteration_index", jsonInt(iteration, "loop_iteration_index", static_cast<int>(steps.size())));
-      const double time_s = jsonDouble(iteration, "run_time_s", static_cast<double>(step_index));
-      const double public_time_s = jsonDouble(iteration, "public_output_time_s", time_s);
-      iteration["branch_id"] = branch_id;
-      iteration["step_index"] = step_index;
-      iteration["public_time_s"] = public_time_s;
-      if (!iteration.contains("time_point") || !iteration["time_point"].is_object()) {
-        iteration["time_point"] = {
-            {"run_time_s", public_time_s},
-            {"tick_index", step_index + 1},
-            {"source_time_s", public_time_s},
-        };
-      }
-      iteration["time_summary"] = {
-          {"base_dt_s", jsonDouble(iteration, "base_dt_s", 0.0)},
-          {"output_period_s", jsonDouble(iteration, "output_period_s", 0.0)},
-          {"effective_delta_t_s_by_node", iteration.value("effective_delta_t_s_by_node", json::object())},
-          {"held_output_count", jsonInt(iteration, "held_output_count", 0)},
-          {"held_outputs", iteration.value("held_outputs", json::array())},
-      };
+      iteration = RuntimeTimelineMaterializer::makeBranchStep(iteration, branch_id, static_cast<int>(steps.size()));
+      const int step_index = jsonInt(iteration, "step_index", static_cast<int>(steps.size()));
+      const double time_s = jsonDouble(iteration, "public_time_s", static_cast<double>(step_index));
       auto label_it = future_labels.find(step_index);
       if (label_it != future_labels.end()) {
         applyStateLabel(iteration, label_it->second);
@@ -1988,25 +1983,24 @@ void PlatformRuntimeHost::writeRuntimeBranchIndex(const fs::path& run_dir) const
       if (!entry.is_object() || jsonString(entry, "direction", "output") != "output") {
         continue;
       }
-      const int step_index = jsonInt(entry, "loop_iteration_index", -1);
-      entry["branch_id"] = branch_id;
+      entry = RuntimeTimelineMaterializer::makeArtifactRef(entry, branch_id);
+      const int step_index = jsonInt(entry, "step_index", jsonInt(entry, "loop_iteration_index", -1));
       if (step_index >= 0) {
-        entry["step_index"] = step_index;
         auto label_it = future_labels.find(step_index);
         if (label_it != future_labels.end()) {
           applyStateLabel(entry, label_it->second);
         }
       }
-      const json entry_time_point = entry.value("time_point", json::object());
-      entry["public_time_s"] = jsonDouble(entry, "public_time_s",
-                                          jsonDouble(entry_time_point, "run_time_s",
-                                                     step_index >= 0 ? static_cast<double>(step_index) : 0.0));
       artifact_refs.push_back(entry);
-      if (startsWith(jsonString(entry, "port_id"), "qoi.")) {
+      if (RuntimeTimelineMaterializer::isQoiRef(entry)) {
         qoi_refs.push_back(entry);
       }
       const json time_point = entry.value("time_point", json::object());
-      const double time_s = jsonDouble(time_point, "run_time_s", step_index >= 0 ? static_cast<double>(step_index) : 0.0);
+      const double time_s = jsonDouble(entry,
+                                       "public_time_s",
+                                       jsonDouble(time_point,
+                                                  "run_time_s",
+                                                  step_index >= 0 ? static_cast<double>(step_index) : 0.0));
       const json stats = entry.value("statistics", json::object());
       if (stats.is_object()) {
         for (auto it = stats.begin(); it != stats.end(); ++it) {
@@ -2322,14 +2316,7 @@ void PlatformRuntimeHost::appendRuntimeIndex(
 }
 
 void PlatformRuntimeHost::upsertBranchRecord(const json& record) {
-  const std::string branch_id = jsonString(record, "branch_id", "");
-  for (auto& item : branch_records_) {
-    if (jsonString(item, "branch_id", "") == branch_id) {
-      item = record;
-      return;
-    }
-  }
-  branch_records_.push_back(record);
+  RuntimeBranchService::upsertRecord(branch_records_, record);
 }
 
 void PlatformRuntimeHost::updateBranchStatus(
@@ -2337,16 +2324,7 @@ void PlatformRuntimeHost::updateBranchStatus(
     const std::string& status,
     const json& summary) {
   StateLock lock(*this);
-  for (auto& item : branch_records_) {
-    if (jsonString(item, "branch_id", "") == branch_id) {
-      item["status"] = status;
-      item["updated_at_utc"] = nowUtcIso();
-      if (!summary.is_null()) {
-        item["summary"] = summary;
-      }
-      break;
-    }
-  }
+  RuntimeBranchService::updateRecordStatus(branch_records_, branch_id, status, summary);
   appendRuntimeEventLocked(
       "prediction_branch_status_changed",
       branch_id,
@@ -2363,23 +2341,19 @@ std::string PlatformRuntimeHost::appendRuntimeEventLocked(
     int frame_index,
     double time_s,
     const json& payload) {
-  std::ostringstream id;
-  id << "evt." << options_.run_id_prefix << "." << event_kind;
-  if (frame_index >= 0) {
-    id << ".frame_" << std::setw(4) << std::setfill('0') << frame_index;
-  }
-  id << "." << std::setw(5) << std::setfill('0') << runtime_events_.size();
-  const std::string event_id = id.str();
-  runtime_events_.push_back({
-      {"event_id", event_id},
-      {"event_kind", event_kind},
-      {"branch_id", branch_id},
-      {"frame_index", frame_index},
-      {"time_s", time_s},
-      {"generated_at_utc", nowUtcIso()},
-      {"payload", payload.is_null() ? json::object() : payload},
-  });
-  return event_id;
+  return RuntimeBranchService::appendEvent(
+      runtime_events_,
+      options_.run_id_prefix,
+      event_kind,
+      branch_id,
+      frame_index,
+      time_s,
+      payload);
+}
+
+RuntimeEvent PlatformRuntimeHost::dispatchRuntimeEventLocked(RuntimeEvent event) {
+  runtime_event_loop_.push(std::move(event));
+  return runtime_event_loop_.next();
 }
 
 void PlatformRuntimeHost::maybeForkPredictionBranch(
@@ -2453,6 +2427,20 @@ void PlatformRuntimeHost::maybeForkPredictionBranch(
   const std::string run_id = options_.run_id_prefix + ".predict_frame_" + frame_tag.str();
   const fs::path run_dir = options_.run_root / future_workflow_id_ / run_id;
   const double trigger_time = jsonDouble(frame, "sample_time_s", jsonDouble(frame, "time_s", local_index));
+  const RuntimeEvent branch_trigger_event = RuntimeEventQueue::branchTriggeredEvent(
+      branch_id,
+      trigger_time,
+      local_index,
+      posterior_event_id,
+      {
+          {"source_event_id", posterior_event_id},
+          {"source_event_kind", "posterior_frame_committed"},
+          {"parent_branch_id", kRealtimePredictionBranchId},
+          {"workflow_id", future_workflow_id_},
+          {"run_id", run_id},
+          {"run_dir", pathString(run_dir)},
+          {"seed_runtime_outputs_ref", pathString(online_runtime_outputs)},
+      });
 
   PredictionTask task;
   task.branch_id = branch_id;
@@ -2461,10 +2449,11 @@ void PlatformRuntimeHost::maybeForkPredictionBranch(
   task.seed_runtime_outputs = online_runtime_outputs;
   task.trigger_frame_index = local_index;
   task.trigger_time_s = trigger_time;
-  task.trigger_event_id = posterior_event_id;
+  task.trigger_event_id = branch_trigger_event.event_id;
 
   {
     StateLock lock(*this);
+    const RuntimeEvent dispatched_branch_event = dispatchRuntimeEventLocked(branch_trigger_event);
     ++requested_prediction_runs_;
     latest_prediction_branch_id_ = branch_id;
     for (auto& item : branch_records_) {
@@ -2497,8 +2486,9 @@ void PlatformRuntimeHost::maybeForkPredictionBranch(
         {"updated_at_utc", nowUtcIso()},
         {"trigger_frame_index", local_index},
         {"trigger_time_s", trigger_time},
-        {"trigger_event_id", posterior_event_id},
-        {"trigger_event_kind", "posterior_frame_committed"},
+        {"trigger_event_id", dispatched_branch_event.event_id},
+        {"trigger_event_kind", dispatched_branch_event.event_kind},
+        {"trigger_cause_event_id", posterior_event_id},
         {"seed_runtime_outputs_ref", pathString(online_runtime_outputs)},
         {"refs",
          {
@@ -2523,6 +2513,12 @@ void PlatformRuntimeHost::maybeForkPredictionBranch(
                    "source frame");
     branch_record["display_name"] = base_display + " · " + source_frame_label + " " + std::to_string(local_index);
     upsertBranchRecord(branch_record);
+    appendRuntimeEventLocked(
+        dispatched_branch_event.event_kind,
+        branch_id,
+        local_index,
+        trigger_time,
+        RuntimeEventQueue::eventEvidence(dispatched_branch_event));
     current_message_ = "已从在线帧 " + std::to_string(local_index) + " 分叉预测分支";
     appendRuntimeEventLocked(
         "prediction_branch_queued",
@@ -2530,8 +2526,9 @@ void PlatformRuntimeHost::maybeForkPredictionBranch(
         local_index,
         trigger_time,
         {
-            {"trigger_event_id", posterior_event_id},
-            {"trigger_event_kind", "posterior_frame_committed"},
+            {"trigger_event_id", dispatched_branch_event.event_id},
+            {"trigger_event_kind", dispatched_branch_event.event_kind},
+            {"trigger_cause_event_id", posterior_event_id},
             {"run_id", run_id},
             {"run_dir", pathString(run_dir)},
             {"seed_runtime_outputs_ref", pathString(online_runtime_outputs)},
@@ -2612,6 +2609,9 @@ void PlatformRuntimeHost::launchPredictionBranchWorker(const PredictionTask& tas
                 {"completed_iterations", 0},
                 {"next_chunk_index", 0},
                 {"latest_seed_runtime_outputs", pathString(task.seed_runtime_outputs)},
+                {"trigger_frame_index", task.trigger_frame_index},
+                {"trigger_time_s", task.trigger_time_s},
+                {"trigger_event_id", task.trigger_event_id},
                 {"control_ref", pathString(control_path)},
                 {"worker_log_ref", pathString(log_path)},
                 {"created_at_utc", nowUtcIso()},
@@ -2653,7 +2653,9 @@ void PlatformRuntimeHost::runPredictionBranch(PredictionTask task) {
         task.seed_runtime_outputs,
         {},
         options_.future_max_iterations,
-        false);
+        false,
+        task.branch_id,
+        "future.prediction");
     std::cout << "[C++ RuntimeHost] 预测分支 workflow 完成 " << task.branch_id << std::endl;
     writeRuntimeBranchIndex(task.run_dir);
     std::cout << "[C++ RuntimeHost] 预测分支索引完成 " << task.branch_id << std::endl;
@@ -2805,7 +2807,10 @@ int PlatformRuntimeHost::runBranchWorker() {
     const fs::path chunks_root = options_.branch_run_dir / "_branch_chunks";
     fs::create_directories(chunks_root);
 
-    json preserved_worker_args = state.value("worker_args", json::array());
+    json preserved_worker_args = json::array();
+    if (state.is_object() && state.contains("worker_args") && state.at("worker_args").is_array()) {
+      preserved_worker_args = state.at("worker_args");
+    }
     int completed_iterations = options_.resume_existing_branch ? jsonInt(state, "completed_iterations", 0) : 0;
     int chunk_index = options_.resume_existing_branch ? jsonInt(state, "next_chunk_index", 0) : 0;
     fs::path latest_seed = options_.resume_existing_branch
@@ -2820,7 +2825,8 @@ int PlatformRuntimeHost::runBranchWorker() {
 
     const int target_iterations =
         options_.resume_existing_branch
-            ? std::max(1, jsonInt(state, "target_iterations", options_.future_max_iterations))
+            ? std::max(std::max(1, jsonInt(state, "target_iterations", options_.future_max_iterations)),
+                       std::max(1, options_.future_max_iterations))
             : std::max(1, options_.future_max_iterations);
     const int chunk_iterations =
         options_.resume_existing_branch
@@ -3055,7 +3061,7 @@ int PlatformRuntimeHost::runBranchWorker() {
       bool replaced = false;
       auto preserve_branch_presentation = [&](const json& existing) {
         for (const std::string key : {"display_name", "kind_label", "branch_roles",
-                                      "is_realtime_prediction"}) {
+                                      "is_realtime_prediction", "trigger_cause_event_id"}) {
           if (existing.contains(key)) {
             branch_record[key] = existing.at(key);
           }
@@ -3205,8 +3211,12 @@ int PlatformRuntimeHost::runBranchWorker() {
       json summary = readJsonIfExists(options_.chain_dir / "mainline_summary.json");
       if (summary.is_object()) {
         summary["status"] = running_count > 0 ? "mainline_completed_branch_running" : "completed";
+        if (!summary.contains("prediction") || !summary.at("prediction").is_object()) {
+          summary["prediction"] = json::object();
+        }
+        const json summary_prediction = summary.at("prediction");
         summary["prediction"]["requested_branch_count"] =
-            std::max(jsonInt(summary.value("prediction", json::object()), "requested_branch_count", 0),
+            std::max(jsonInt(summary_prediction, "requested_branch_count", 0),
                      completed_count + failed_count + running_count);
         summary["prediction"]["run_count"] = completed_count + failed_count + running_count;
         summary["prediction"]["completed_branch_count"] = completed_count;
@@ -3310,7 +3320,9 @@ int PlatformRuntimeHost::runBranchWorker() {
           latest_seed,
           {},
           this_chunk_iterations,
-          false);
+          false,
+          options_.branch_id,
+          "future.prediction");
       writeRuntimeBranchIndex(chunk_dir);
 
       const json chunk_loop = readJson(chunk_dir / "runtime_loop_summary.json");
@@ -3638,7 +3650,10 @@ void PlatformRuntimeHost::waitForPredictionBranches() {
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(30);
   while (std::chrono::steady_clock::now() < deadline) {
     json registry = readJsonIfExists(options_.chain_dir / "branch_registry.json");
-    json branches = registry.value("branches", json::array());
+    json branches = json::array();
+    if (registry.is_object() && registry.contains("branches") && registry.at("branches").is_array()) {
+      branches = registry.at("branches");
+    }
     if (!branches.is_array() || branches.empty()) {
       branches = branch_records_;
     }
@@ -3660,14 +3675,14 @@ void PlatformRuntimeHost::waitForPredictionBranches() {
 
       const fs::path state_path = branchManagerStatePath(options_.chain_dir, branch_id);
       json state = readJsonIfExists(state_path);
+      const json branch_summary =
+          branch.contains("summary") && branch.at("summary").is_object() ? branch.at("summary") : json::object();
       const std::string status = jsonString(state, "status", jsonString(branch, "status", ""));
       const int target_iterations =
           std::max(1, jsonInt(state, "target_iterations",
-                              jsonInt(branch.value("summary", json::object()), "target_iterations",
-                                      options_.future_max_iterations)));
+                              jsonInt(branch_summary, "target_iterations", options_.future_max_iterations)));
       const int completed_iterations =
-          jsonInt(state, "completed_iterations",
-                  jsonInt(branch.value("summary", json::object()), "iteration_count", 0));
+          jsonInt(state, "completed_iterations", jsonInt(branch_summary, "iteration_count", 0));
 
       if (status == "completed" || completed_iterations >= target_iterations) {
         ++completed_count;
@@ -3685,8 +3700,7 @@ void PlatformRuntimeHost::waitForPredictionBranches() {
       has_pending_branch = true;
       ++running_count;
       const unsigned long process_id = static_cast<unsigned long>(
-          std::max(jsonInt(branch.value("summary", json::object()), "process_id", 0),
-                   jsonInt(state, "resume_process_id", 0)));
+          std::max(jsonInt(branch_summary, "process_id", 0), jsonInt(state, "resume_process_id", 0)));
       if (processStillRunning(process_id)) {
         has_live_worker = true;
         continue;
@@ -3979,10 +3993,150 @@ void PlatformRuntimeHost::writeRuntimeIndexesLocked(const std::string& cursor_mo
   }
   prediction_runs_ = merged_prediction_runs;
 
+  // Branch workers update their own manager state and timeline entry after the
+  // mainline process has already registered a branch as queued/running. Before
+  // writing the platform-visible registry, reconcile those durable records so
+  // the UI does not keep showing a stale queued branch after the worker exits.
+  for (auto& branch : branch_records_) {
+    if (!branch.is_object() || jsonString(branch, "branch_kind", "") != "future_prediction") {
+      continue;
+    }
+    const std::string branch_id = jsonString(branch, "branch_id", "");
+    if (branch_id.empty()) {
+      continue;
+    }
+
+    json state = readJsonIfExists(branchManagerStatePath(options_.chain_dir, branch_id));
+    bool state_has_terminal_status = false;
+    if (state.is_object()) {
+      const std::string state_status = jsonString(state, "status", "");
+      if (!state_status.empty()) {
+        branch["status"] = state_status;
+        state_has_terminal_status =
+            state_status == "completed" || state_status == "failed" || state_status == "stopped";
+      }
+      branch["updated_at_utc"] = jsonString(state, "updated_at_utc", nowUtcIso());
+      json summary =
+          branch.contains("summary") && branch.at("summary").is_object() ? branch.at("summary") : json::object();
+      summary["completed_iterations"] = jsonInt(state, "completed_iterations", 0);
+      summary["iteration_count"] = jsonInt(state, "completed_iterations", jsonInt(summary, "iteration_count", 0));
+      summary["target_iterations"] = jsonInt(state, "target_iterations", jsonInt(summary, "target_iterations", 0));
+      summary["chunk_iterations"] = jsonInt(state, "chunk_iterations", jsonInt(summary, "chunk_iterations", 0));
+      const std::string stop_reason = jsonString(state, "stop_reason", "");
+      if (!stop_reason.empty()) {
+        summary["stop_reason"] = stop_reason;
+      }
+      branch["summary"] = summary;
+    }
+
+    for (const auto& prediction : prediction_runs_) {
+      if (!prediction.is_object() || jsonString(prediction, "branch_id", "") != branch_id) {
+        continue;
+      }
+      const std::string prediction_status = jsonString(prediction, "status", "");
+      if (!prediction_status.empty() && !state_has_terminal_status) {
+        branch["status"] = prediction_status;
+      }
+      json summary =
+          branch.contains("summary") && branch.at("summary").is_object() ? branch.at("summary") : json::object();
+      for (const std::string key : {"base_dt_s", "chunk_iterations", "field_artifact_count",
+                                    "iteration_count", "output_period_s", "stop_reason",
+                                    "target_iterations"}) {
+        if (prediction.contains(key)) {
+          summary[key] = prediction.at(key);
+        }
+      }
+      branch["summary"] = summary;
+      break;
+    }
+  }
+
   json merged_branch_steps = merge_branch_scoped_array("branch_steps", branch_steps_);
   json merged_artifact_refs = merge_branch_scoped_array("artifact_refs", artifact_refs_);
   json merged_qoi_refs = merge_branch_scoped_array("qoi_refs", qoi_refs_);
   json merged_checkpoint_refs = merge_branch_scoped_array("checkpoint_refs", checkpoint_refs_);
+
+  auto remove_branch_items = [](json& target, const std::string& branch_id) {
+    if (!target.is_array() || branch_id.empty()) {
+      return;
+    }
+    json kept = json::array();
+    for (const auto& item : target) {
+      if (!item.is_object() || jsonString(item, "branch_id", "") != branch_id) {
+        kept.push_back(item);
+      }
+    }
+    target = kept;
+  };
+  auto append_branch_timeline_items = [&](json& target,
+                                          const json& branch_timeline,
+                                          const char* key,
+                                          const json& branch,
+                                          const fs::path& branch_run_dir) {
+    if (!branch_timeline.is_object() || !branch_timeline.contains(key) ||
+        !branch_timeline.at(key).is_array()) {
+      return;
+    }
+    const std::string branch_id = jsonString(branch, "branch_id", "");
+    const double trigger_time = jsonDouble(branch, "trigger_time_s", 0.0);
+    const int trigger_frame = jsonInt(branch, "trigger_frame_index", -1);
+    remove_branch_items(target, branch_id);
+    for (auto item : branch_timeline.at(key)) {
+      if (!item.is_object()) {
+        continue;
+      }
+      const double branch_relative_time_s = publicTimeFromItem(item, 0.0);
+      item["branch_relative_time_s"] = branch_relative_time_s;
+      item["trigger_time_s"] = trigger_time;
+      item["mainline_time_origin_s"] = trigger_time;
+      offsetNestedTime(item, trigger_time, trigger_frame);
+      item["branch_id"] = branch_id;
+      item["source_run_dir"] = pathString(branch_run_dir);
+      item["mainline_frame_index"] = trigger_frame;
+      target.push_back(item);
+    }
+  };
+  for (const auto& branch : branch_records_) {
+    if (!branch.is_object() || jsonString(branch, "branch_kind", "") != "future_prediction") {
+      continue;
+    }
+    const std::string branch_id = jsonString(branch, "branch_id", "");
+    const std::string branch_run_dir_text = jsonString(branch, "run_dir", "");
+    if (branch_id.empty() || branch_run_dir_text.empty()) {
+      continue;
+    }
+    const fs::path branch_run_dir(branch_run_dir_text);
+    const json branch_timeline = readJsonIfExists(branch_run_dir / "run_timeline_index.json");
+    append_branch_timeline_items(merged_branch_steps, branch_timeline, "branch_steps", branch, branch_run_dir);
+    append_branch_timeline_items(merged_artifact_refs, branch_timeline, "artifact_refs", branch, branch_run_dir);
+    append_branch_timeline_items(merged_qoi_refs, branch_timeline, "qoi_refs", branch, branch_run_dir);
+    append_branch_timeline_items(merged_checkpoint_refs, branch_timeline, "checkpoint_refs", branch, branch_run_dir);
+
+    const json summary =
+        branch.contains("summary") && branch.at("summary").is_object() ? branch.at("summary") : json::object();
+    json prediction = {
+        {"branch_id", branch_id},
+        {"run_id", jsonString(branch, "run_id", branch_run_dir.filename().string())},
+        {"run_dir", branch_run_dir_text},
+        {"status", jsonString(branch, "status", "")},
+        {"trigger_frame_index", jsonInt(branch, "trigger_frame_index", -1)},
+        {"trigger_time_s", jsonDouble(branch, "trigger_time_s", 0.0)},
+        {"trigger_event_id", jsonString(branch, "trigger_event_id", "")},
+        {"seed_runtime_outputs", jsonString(branch, "seed_runtime_outputs_ref", "")},
+        {"iteration_count", jsonInt(summary, "iteration_count", jsonInt(summary, "completed_iterations", 0))},
+        {"target_iterations", jsonInt(summary, "target_iterations", 0)},
+        {"chunk_iterations", jsonInt(summary, "chunk_iterations", 0)},
+        {"field_artifact_count", jsonInt(summary, "field_artifact_count", 0)},
+        {"stop_reason", jsonString(summary, "stop_reason", "")},
+    };
+    if (summary.contains("base_dt_s")) {
+      prediction["base_dt_s"] = summary.at("base_dt_s");
+    }
+    if (summary.contains("output_period_s")) {
+      prediction["output_period_s"] = summary.at("output_period_s");
+    }
+    upsert_by_branch_id(prediction_runs_, prediction);
+  }
 
   int prediction_count = 0;
   int completed_prediction_count = 0;
@@ -4121,6 +4275,7 @@ void PlatformRuntimeHost::writeRuntimeIndexesLocked(const std::string& cursor_mo
            {"prediction_run_count", prediction_runs_.size()},
            {"series_count", series.size()},
            {"runtime_event_count", runtime_events_.size()},
+           {"runtime_event_loop", runtime_event_loop_.summary()},
        }},
   };
   writeJson(options_.chain_dir / "run_timeline_index.json", timeline);
@@ -4132,7 +4287,8 @@ void PlatformRuntimeHost::writeRuntimeIndexesLocked(const std::string& cursor_mo
       {"object_id", object_id_},
       {"generated_at_utc", generated},
       {"events", runtime_events_},
-      {"summary", {{"event_count", runtime_events_.size()}}},
+      {"summary", {{"event_count", runtime_events_.size()},
+                   {"runtime_event_loop", runtime_event_loop_.summary()}}},
   };
   writeJson(options_.chain_dir / "runtime_events.json", runtime_events);
 
@@ -4334,6 +4490,7 @@ void PlatformRuntimeHost::writeFinalSummary(const std::string& status) {
     return count;
   };
   const int posterior_event_count = count_event_kind("posterior_frame_committed");
+  const int branch_triggered_event_count = count_event_kind("branch_triggered");
   const int queued_event_count = count_event_kind("prediction_branch_queued");
   const int finished_event_count = count_event_kind("prediction_branch_completed") +
                                    count_event_kind("prediction_branch_failed");
@@ -4362,6 +4519,26 @@ void PlatformRuntimeHost::writeFinalSummary(const std::string& status) {
       }
     }
   }
+  int summary_completed_prediction_runs = 0;
+  int summary_failed_prediction_runs = 0;
+  for (const auto& prediction : summary_prediction_runs) {
+    if (!prediction.is_object()) {
+      continue;
+    }
+    const std::string prediction_status = jsonString(prediction, "status", "");
+    if (prediction_status == "completed" || prediction_status == "stopped") {
+      ++summary_completed_prediction_runs;
+    } else if (prediction_status == "failed") {
+      ++summary_failed_prediction_runs;
+    }
+  }
+  const int summary_finished_prediction_runs =
+      summary_completed_prediction_runs + summary_failed_prediction_runs;
+
+  completed_prediction_runs_.store(summary_completed_prediction_runs);
+  failed_prediction_runs_.store(summary_failed_prediction_runs);
+  requested_prediction_runs_ =
+      std::max(requested_prediction_runs_, static_cast<int>(summary_prediction_runs.size()));
 
   const json summary = {
       {"schema_version", "flightenv.platform.cpp_runtime_host_mainline.v1"},
@@ -4400,8 +4577,9 @@ void PlatformRuntimeHost::writeFinalSummary(const std::string& status) {
        {
            {"event_count", runtime_events_.size()},
            {"posterior_frame_committed_count", posterior_event_count},
+           {"branch_triggered_count", branch_triggered_event_count},
            {"prediction_branch_queued_count", queued_event_count},
-           {"prediction_branch_finished_count", finished_event_count},
+           {"prediction_branch_finished_count", std::max(finished_event_count, summary_finished_prediction_runs)},
            {"runtime_events_ref", "runtime_events.json"},
        }},
       {"health_ledger",
@@ -4416,8 +4594,10 @@ void PlatformRuntimeHost::writeFinalSummary(const std::string& status) {
            {"prediction_branch_b4_ok", requested_prediction_runs_ > 0},
            {"posterior_event_branch_handoff_ok",
             posterior_event_count >= completed_online_frames_ &&
+                branch_triggered_event_count >= requested_prediction_runs_ &&
                 queued_event_count >= requested_prediction_runs_ &&
-                finished_event_count >= completed_prediction_runs_.load() + failed_prediction_runs_.load()},
+                std::max(finished_event_count, summary_finished_prediction_runs) >=
+                    completed_prediction_runs_.load() + failed_prediction_runs_.load()},
            {"mainline_not_aborted_by_branch_failure", true},
            {"all_completed_branches_have_indexes", true},
        }},
@@ -4466,6 +4646,32 @@ int PlatformRuntimeHost::run() {
       return 0;
     }
     waitForPredictionBranches();
+    {
+      const json registry = readJsonIfExists(options_.chain_dir / "branch_registry.json");
+      if (registry.is_object() && registry.contains("branches") && registry.at("branches").is_array()) {
+        int completed_count = 0;
+        int failed_count = 0;
+        int running_count = 0;
+        for (const auto& branch : registry.at("branches")) {
+          if (!branch.is_object() || jsonString(branch, "branch_kind", "") != "future_prediction") {
+            continue;
+          }
+          const std::string branch_status = jsonString(branch, "status", "");
+          if (branch_status == "completed" || branch_status == "stopped") {
+            ++completed_count;
+          } else if (branch_status == "failed") {
+            ++failed_count;
+          } else if (branch_status == "running" || branch_status == "queued" ||
+                     branch_status == "stop_requested") {
+            ++running_count;
+          }
+        }
+        completed_prediction_runs_.store(completed_count);
+        failed_prediction_runs_.store(failed_count);
+        requested_prediction_runs_ =
+            std::max(requested_prediction_runs_, completed_count + failed_count + running_count);
+      }
+    }
     writeFinalSummary(failed_prediction_runs_.load() > 0 ? "completed_with_branch_failures" : "completed");
     std::cout << "[OK] C++ RuntimeHost online mainline completed." << std::endl;
     std::cout << "  evidence = " << pathString(options_.chain_dir) << std::endl;

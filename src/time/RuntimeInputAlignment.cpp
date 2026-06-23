@@ -90,6 +90,13 @@ double effectiveDeltaS(const nlohmann::json& time_info) {
   return jsonDouble(time_info, "effective_delta_t_s", jsonDouble(time_info, "delta_t_s", 0.0));
 }
 
+double durationSecondsNonNegative(RuntimeDuration duration) {
+  if (duration.nanoseconds <= 0) {
+    return 0.0;
+  }
+  return duration.seconds();
+}
+
 RuntimeInputAlignmentPolicy parsePolicy(const nlohmann::json& raw) {
   RuntimeInputAlignmentPolicy policy;
   policy.upstream_node_id = jsonString(raw, "upstream_node_id", jsonString(raw, "source_node_id"));
@@ -213,8 +220,12 @@ RuntimeAlignedInput alignOne(
       result.sample_count = 2;
       return result;
     }
-    const double span = bracket.second->time_s - bracket.first->time_s;
-    const double alpha = std::abs(span) <= 1.0e-12 ? 0.0 : (target_time_s - bracket.first->time_s) / span;
+    const RuntimeDuration span = bracket.second->time - bracket.first->time;
+    const RuntimeDuration offset = RuntimeTimePoint::fromSeconds(target_time_s) - bracket.first->time;
+    const double alpha = span.nanoseconds == 0
+                             ? 0.0
+                             : static_cast<double>(offset.nanoseconds) /
+                                   static_cast<double>(span.nanoseconds);
     result.available = true;
     result.status = "linear";
     result.source_time_s = target_time_s;
@@ -262,12 +273,14 @@ RuntimeAlignedInput alignOne(
       return result;
     }
     if (samples.size() == 1) {
-      integral = scalar_values.front().value_or(0.0) * std::max(0.0, target_time_s - window_start_s);
+      const RuntimeDuration window_duration =
+          RuntimeTimePoint::fromSeconds(target_time_s) - RuntimeTimePoint::fromSeconds(window_start_s);
+      integral = scalar_values.front().value_or(0.0) * durationSecondsNonNegative(window_duration);
     } else {
       for (std::size_t i = 1; i < samples.size(); ++i) {
         const double previous = scalar_values[i - 1].value_or(0.0);
         const double current = scalar_values[i].value_or(0.0);
-        const double dt = std::max(0.0, samples[i].time_s - samples[i - 1].time_s);
+        const double dt = durationSecondsNonNegative(samples[i].time - samples[i - 1].time);
         integral += 0.5 * (previous + current) * dt;
       }
     }
@@ -325,8 +338,13 @@ RuntimeInputAlignmentResult RuntimeInputAlignment::alignNodeInputs(
   if (!alignments.is_array()) {
     return result;
   }
-  const double target_time = targetTimeS(time_info);
-  const double window_start = target_time - std::max(0.0, effectiveDeltaS(time_info));
+  const RuntimeTimePoint target_time_point = RuntimeTimePoint::fromSeconds(targetTimeS(time_info));
+  const RuntimeDuration effective_delta =
+      RuntimeDuration::fromSeconds(std::max(0.0, effectiveDeltaS(time_info)));
+  const RuntimeTimePoint window_start_point =
+      RuntimeTimePoint::fromNanoseconds(target_time_point.nanoseconds - effective_delta.nanoseconds);
+  const double target_time = target_time_point.seconds();
+  const double window_start = window_start_point.seconds();
   for (const auto& raw : alignments) {
     if (!raw.is_object()) {
       continue;

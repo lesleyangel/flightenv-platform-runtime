@@ -17,9 +17,16 @@
 #include "FlightEnvPlatform/Runtime/ThreadPoolExecutor.hpp"
 #include "FlightEnvPlatform/Runtime/ThreadSafePortStore.hpp"
 #include "FlightEnvPlatformRuntime/AdapterSession.hpp"
+#include "FlightEnvPlatformRuntime/RuntimeAdapterInvoker.hpp"
+#include "FlightEnvPlatformRuntime/RuntimeEventLoop.hpp"
+#include "FlightEnvPlatformRuntime/RuntimeEvidenceWriter.hpp"
+#include "FlightEnvPlatformRuntime/RuntimeNodeEvidenceBuilder.hpp"
+#include "FlightEnvPlatformRuntime/RuntimePortBindingResolver.hpp"
+#include "FlightEnvPlatformRuntime/RuntimePortPacketWriter.hpp"
+#include "FlightEnvPlatformRuntime/RuntimeReadyQueueExecutor.hpp"
+#include "FlightEnvPlatformRuntime/RuntimePublicFrameBuilder.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeTimeScheduler.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeTypedBufferStore.hpp"
-#include "FlightEnvPlatformRuntime/RuntimeTypedPayloadBridge.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeZeroCopyPolicy.hpp"
 #include "FlightEnvPlatformRuntime/time/RuntimeEventQueue.hpp"
 #include "FlightEnvPlatformRuntime/time/RuntimeInputAlignment.hpp"
@@ -185,6 +192,18 @@ bool jsonBool(const json& value, const std::string& key, bool fallback = false) 
     return fallback;
   }
   return value.at(key).get<bool>();
+}
+
+bool envFlagEnabled(const char* name) {
+  const char* value = std::getenv(name);
+  if (value == nullptr) {
+    return false;
+  }
+  std::string text(value);
+  std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return text == "1" || text == "true" || text == "on" || text == "yes";
 }
 
 std::uint64_t fnv64(const std::string& text) {
@@ -513,43 +532,6 @@ flightenv::platform::SimulationTimePoint simulationTimePointFromJson(const json&
   return point;
 }
 
-flightenv::platform::ReadyQueueScheduler buildReadyQueueSchedulerFromPlan(const json& scheduler_plan) {
-  flightenv::platform::ReadyQueueScheduler scheduler;
-  const json policy = scheduler_plan.value("scheduler_policy", json::object());
-  scheduler.policy.max_parallelism = jsonInt(policy, "max_parallelism", 1);
-  scheduler.policy.ready_queue_policy = jsonString(policy, "ready_queue_policy", "time_then_dependency");
-  scheduler.policy.resource_conflict_policy = jsonString(policy, "resource_conflict_policy", "respect_locks");
-  scheduler.policy.deadline_policy = jsonString(policy, "deadline_policy", "mark_stale");
-  scheduler.policy.default_deadline_s = jsonDouble(policy, "default_deadline_s", 0.0);
-  scheduler.policy.record_timeline = policy.value("record_timeline", true);
-
-  const json nodes = scheduler_plan.value("nodes", json::array());
-  if (nodes.is_array()) {
-    for (const auto& node : nodes) {
-      flightenv::platform::SchedulerPlanNode plan_node;
-      plan_node.node_id = jsonString(node, "node_id");
-      plan_node.operator_id = jsonString(node, "operator_id");
-      if (node.contains("depends_on") && node.at("depends_on").is_array()) {
-        for (const auto& dep : node.at("depends_on")) {
-          if (dep.is_string()) {
-            plan_node.depends_on.push_back(dep.get<std::string>());
-          }
-        }
-      }
-      plan_node.scheduling_level = jsonInt(node, "scheduling_level", 0);
-      plan_node.parallel_group_id = jsonString(node, "parallel_group_id");
-      plan_node.ready_time = simulationTimePointFromJson(node.value("ready_time", json::object()));
-      plan_node.deadline_time_s = jsonDouble(node, "deadline_time_s", 0.0);
-      plan_node.timeout_s = jsonDouble(node, "timeout_s", 0.0);
-      plan_node.capacity_group = jsonString(node, "capacity_group");
-      plan_node.resource_lock_mode = jsonString(node, "resource_lock_mode");
-      plan_node.can_run_parallel = node.value("can_run_parallel", true);
-      scheduler.plan_nodes.push_back(std::move(plan_node));
-    }
-  }
-  return scheduler;
-}
-
 json readyQueueSchedulerEvidence(const flightenv::platform::ReadyQueueScheduler& scheduler) {
   return {
       {"type", "FlightEnvPlatform::ReadyQueueScheduler"},
@@ -592,6 +574,8 @@ json portStoreEvidence(const flightenv::platform::ThreadSafePortStore& port_stor
   const std::vector<flightenv::platform::RuntimePacket> packets = port_store.snapshot_packets();
   std::set<std::string> output_nodes;
   std::set<std::string> ports;
+  std::set<std::string> logical_node_ports;
+  std::set<std::string> scoped_logical_node_ports;
   for (const auto& packet : packets) {
     if (!packet.node_id.empty()) {
       output_nodes.insert(packet.node_id);
@@ -599,12 +583,24 @@ json portStoreEvidence(const flightenv::platform::ThreadSafePortStore& port_stor
     if (!packet.port_name.empty()) {
       ports.insert(packet.port_name);
     }
+    const auto port_id = packet.tags.find("port_id");
+    if (!packet.node_id.empty() && port_id != packet.tags.end() && !port_id->second.empty()) {
+      logical_node_ports.insert(packet.node_id + "." + port_id->second);
+      const auto branch_id = packet.tags.find("branch_id");
+      const auto timeline_id = packet.tags.find("timeline_id");
+      scoped_logical_node_ports.insert(
+          (branch_id == packet.tags.end() ? std::string() : branch_id->second) + "|" +
+          (timeline_id == packet.tags.end() ? std::string() : timeline_id->second) + "|" +
+          packet.node_id + "." + port_id->second);
+    }
   }
   return {
       {"type", "FlightEnvPlatform::ThreadSafePortStore"},
       {"packet_count", packets.size()},
       {"port_count", ports.size()},
       {"node_output_count", output_nodes.size()},
+      {"port_packet_count", logical_node_ports.size()},
+      {"scoped_port_packet_count", scoped_logical_node_ports.size()},
   };
 }
 
@@ -624,34 +620,6 @@ json resourcePayload(const std::map<std::string, json>& resource_locks_by_id, co
     }
   }
   return payload;
-}
-
-double findNumberRecursive(const json& value, const std::vector<std::string>& keys, int depth = 0) {
-  if (depth > 24) {
-    return std::numeric_limits<double>::quiet_NaN();
-  }
-  if (value.is_object()) {
-    for (const auto& key : keys) {
-      auto it = value.find(key);
-      if (it != value.end() && it->is_number()) {
-        return it->get<double>();
-      }
-    }
-    for (auto it = value.begin(); it != value.end(); ++it) {
-      const double found = findNumberRecursive(it.value(), keys, depth + 1);
-      if (std::isfinite(found)) {
-        return found;
-      }
-    }
-  } else if (value.is_array()) {
-    for (const auto& item : value) {
-      const double found = findNumberRecursive(item, keys, depth + 1);
-      if (std::isfinite(found)) {
-        return found;
-      }
-    }
-  }
-  return std::numeric_limits<double>::quiet_NaN();
 }
 
 json loadExternalObservations(const fs::path& path) {
@@ -745,6 +713,59 @@ json externalObservationSeed(const json& observations, int iteration_index, cons
   return seed;
 }
 
+json recordExternalObservationSample(
+    RuntimePortSampleBuffer& sample_buffer,
+    const RuntimeEvent& event,
+    const fs::path& source_path) {
+  const int frame_index = event.payload.value("frame_index", event.iteration_index);
+  const json frame = event.payload.value("frame", json::object());
+  const json actual_snapshot = externalObservationSnapshot(frame, frame_index, source_path);
+  const json value = actual_snapshot.empty() ? frame : actual_snapshot;
+  const double sample_time_s = event.payload.value("sample_time_s", event.event_time_s);
+  const json time_info = {
+      {"public_output_time_s", sample_time_s},
+      {"public_output_time_ns", event.event_time.nanoseconds},
+      {"runtime_event_time_s", event.event_time_s},
+      {"runtime_event_time_ns", event.event_time.nanoseconds},
+      {"input_event_id", event.event_id},
+      {"source", event.payload.value("source", std::string("external_observation_stream"))},
+      {"source_stream_path", pathString(source_path)},
+      {"frame_index", frame_index},
+  };
+
+  RuntimePortSample node_sample;
+  node_sample.channel_id = RuntimePortSampleBuffer::nodeChannel("external_observation");
+  node_sample.source_node_id = "external_observation";
+  node_sample.time_s = sample_time_s;
+  node_sample.iteration_index = frame_index;
+  node_sample.value = frame;
+  node_sample.time_info = time_info;
+  sample_buffer.recordSample(node_sample);
+
+  RuntimePortSample port_sample;
+  port_sample.channel_id = RuntimePortSampleBuffer::portChannel("external_observation", "observation.actual");
+  port_sample.source_node_id = "external_observation";
+  port_sample.source_port_id = "observation.actual";
+  port_sample.time_s = sample_time_s;
+  port_sample.iteration_index = frame_index;
+  port_sample.value = value;
+  port_sample.time_info = time_info;
+  sample_buffer.recordSample(port_sample);
+
+  return {
+      {"sample_recorded", true},
+      {"source_node_id", "external_observation"},
+      {"source_port_id", "observation.actual"},
+      {"channel_id", port_sample.channel_id},
+      {"node_channel_id", node_sample.channel_id},
+      {"sample_time_s", sample_time_s},
+      {"sample_time_ns", event.event_time.nanoseconds},
+      {"frame_index", frame_index},
+      {"value_kind", value.type_name()},
+      {"has_actual_snapshot", !actual_snapshot.empty()},
+  };
+}
+
 json recurrentSeedFromOutputs(const json& outputs, int iteration_index) {
   json seed = {
       {"__previous_iteration__", {{"loop_iteration_index", iteration_index}, {"outputs", outputs}}},
@@ -784,6 +805,8 @@ json seedFromRuntimeOutputs(const fs::path& path) {
 flightenv::platform::RuntimePacket buildRuntimePacket(
     const std::string& run_id,
     const std::string& object_id,
+    const std::string& branch_id,
+    const std::string& timeline_id,
     const std::string& node_id,
     const json& execute_result,
     const json& time_info,
@@ -829,6 +852,8 @@ flightenv::platform::RuntimePacket buildRuntimePacket(
     packet.zero_copy_eligible = jsonBool(first_output_ref, "zero_copy_eligible", false);
   }
   packet.tags["created_at_utc"] = nowUtcIso();
+  packet.tags["branch_id"] = branch_id;
+  packet.tags["timeline_id"] = timeline_id;
   packet.tags["data_plane_ref_count"] = std::to_string(output_refs.size());
   return packet;
 }
@@ -843,6 +868,8 @@ json runtimePacketToJson(const flightenv::platform::RuntimePacket& packet) {
   return {
       {"run_id", packet.run_id},
       {"object_id", packet.object_id},
+      {"branch_id", packet.tags.count("branch_id") ? packet.tags.at("branch_id") : ""},
+      {"timeline_id", packet.tags.count("timeline_id") ? packet.tags.at("timeline_id") : ""},
       {"port_name", packet.port_name},
       {"node_id", packet.node_id},
       {"time_s", packet.time_point.run_time_s},
@@ -880,175 +907,6 @@ json makeDataPlaneEntries(
       output_payload,
       time_info,
       iteration_index);
-}
-
-bool hasArtifactOrTensorRef(const json& value) {
-  if (!value.is_object()) {
-    return false;
-  }
-  if (value.contains("artifact_ref") && value.at("artifact_ref").is_object()) {
-    return true;
-  }
-  if (value.contains("tensor_ref") && value.at("tensor_ref").is_object()) {
-    return true;
-  }
-  if (value.contains("typed_buffer_ref") && value.at("typed_buffer_ref").is_object()) {
-    return true;
-  }
-  if (value.contains("typed_payload_ref") && value.at("typed_payload_ref").is_string() &&
-      !value.at("typed_payload_ref").get<std::string>().empty()) {
-    return true;
-  }
-  for (const auto* key : {"artifact_uri", "artifact_path", "uri", "path"}) {
-    if (value.contains(key) && value.at(key).is_string() && !value.at(key).get<std::string>().empty()) {
-      return true;
-    }
-  }
-  return false;
-}
-
-void validateExecuteOutputContracts(
-    const json& data_plane_info,
-    const json& execute_result,
-    const std::string& node_id,
-    bool allow_inline_typed_outputs = false) {
-  const json output_specs = data_plane_info.value("outputs", json::array());
-  if (!output_specs.is_array() || output_specs.empty()) {
-    return;
-  }
-  if (!execute_result.is_object() || !execute_result.contains("outputs") ||
-      !execute_result.at("outputs").is_object()) {
-    throw std::runtime_error("Node " + node_id + " execute result must contain an object 'outputs'.");
-  }
-  const json& outputs = execute_result.at("outputs");
-  for (const auto& spec : output_specs) {
-    if (!spec.is_object()) {
-      continue;
-    }
-    const std::string port_id = jsonString(spec, "port_id");
-    if (port_id.empty()) {
-      continue;
-    }
-    if (!outputs.contains(port_id)) {
-      if (!spec.value("required", true)) {
-        continue;
-      }
-      throw std::runtime_error("Node " + node_id + " missing required output port: " + port_id);
-    }
-    const json& payload = outputs.at(port_id);
-    if (!payload.is_object()) {
-      throw std::runtime_error("Node " + node_id + " output port " + port_id + " must be an object.");
-    }
-    for (const auto* key : {"contract_id", "frame_contract", "value_kind"}) {
-      const std::string expected = jsonString(spec, key);
-      if (payload.contains(key) && !expected.empty() && jsonString(payload, key) != expected) {
-        throw std::runtime_error(
-            "Node " + node_id + " output port " + port_id + " " + key +
-            " mismatch: expected '" + expected + "', got '" + jsonString(payload, key) + "'.");
-      }
-    }
-    const json policy = spec.value("data_policy", json::object());
-    const bool requires_artifact = policy.value("artifact_required", false);
-    const bool requires_tensor = policy.value("tensor_required", false);
-    const bool requires_typed_ref =
-        typedIoJsonForbidden(spec) && !allow_inline_typed_outputs;
-    if ((requires_artifact || requires_tensor || requires_typed_ref) && !hasArtifactOrTensorRef(payload)) {
-      throw std::runtime_error(
-          "Node " + node_id + " output port " + port_id +
-          " requires artifact_ref/tensor_ref/typed_payload_ref/typed_buffer_ref; inline-only output is not allowed.");
-    }
-    const int max_inline_bytes = jsonInt(policy, "max_inline_bytes", 0);
-    if (max_inline_bytes > 0 && !hasArtifactOrTensorRef(payload)) {
-      const int byte_size = jsonInt(summarizeJson(payload), "byte_size", 0);
-      if (byte_size > max_inline_bytes) {
-        throw std::runtime_error(
-            "Node " + node_id + " output port " + port_id +
-            " inline payload exceeds max_inline_bytes=" + std::to_string(max_inline_bytes));
-      }
-    }
-  }
-}
-
-json loopStopStatus(const json& outputs, int iteration_index, const json& loop_policy) {
-  const int max_iterations = jsonInt(loop_policy, "max_iterations", 1);
-  const double base_dt_s = jsonDouble(loop_policy, "base_dt_s", 0.0);
-  const json stop_policy = loop_policy.value("stop_policy", json::object());
-  const json alternatives = stop_policy.value("alternatives", json::array());
-  bool stop = false;
-  std::string reason = "";
-  json matched = json::object();
-
-  const auto compare = [](double value, const std::string& comparator, double threshold) {
-    if (!std::isfinite(value)) {
-      return false;
-    }
-    if (comparator == "<" || comparator == "lt") return value < threshold;
-    if (comparator == "<=" || comparator == "le") return value <= threshold;
-    if (comparator == ">" || comparator == "gt") return value > threshold;
-    if (comparator == ">=" || comparator == "ge") return value >= threshold;
-    if (comparator == "==" || comparator == "eq") return value == threshold;
-    if (comparator == "!=" || comparator == "ne") return value != threshold;
-    return value <= threshold;
-  };
-
-  if (alternatives.is_array()) {
-    for (const auto& alternative : alternatives) {
-      if (!alternative.is_object()) {
-        continue;
-      }
-      const std::string kind = jsonString(alternative, "kind");
-      if ((kind == "max_steps" || kind == "max_iterations") &&
-          iteration_index + 1 >= jsonInt(alternative, kind == "max_steps" ? "max_steps" : "max_iterations", max_iterations)) {
-        stop = true;
-        reason = jsonString(alternative, "stop_reason", kind);
-        matched = alternative;
-        break;
-      }
-      if ((kind == "max_horizon_time" || kind == "max_runtime_time") && base_dt_s > 0.0) {
-        const double elapsed = (iteration_index + 1) * base_dt_s;
-        const double max_time = jsonDouble(alternative, "max_time_s", jsonDouble(alternative, "max_runtime_time_s", 0.0));
-        if (max_time > 0.0 && elapsed >= max_time) {
-          stop = true;
-          reason = jsonString(alternative, "stop_reason", kind);
-          matched = alternative;
-          matched["elapsed_time_s"] = elapsed;
-          break;
-        }
-      }
-      const json metric_keys = alternative.value("metric_keys", json::array());
-      if (metric_keys.is_array() && !metric_keys.empty()) {
-        std::vector<std::string> keys;
-        for (const auto& key : metric_keys) {
-          if (key.is_string()) {
-            keys.push_back(key.get<std::string>());
-          }
-        }
-        const double value = findNumberRecursive(outputs, keys);
-        const double threshold = jsonDouble(alternative, "threshold", jsonDouble(alternative, "impact_altitude_m", 0.0));
-        const std::string comparator = jsonString(alternative, "comparator", "<=");
-        if (compare(value, comparator, threshold)) {
-          stop = true;
-          reason = jsonString(alternative, "stop_reason", kind.empty() ? "metric_threshold_reached" : kind);
-          matched = alternative;
-          matched["metric_value"] = value;
-          matched["threshold"] = threshold;
-          break;
-        }
-      }
-    }
-  }
-  if (iteration_index + 1 >= max_iterations) {
-    stop = true;
-    if (reason.empty()) {
-      reason = "max_iterations";
-    }
-  }
-  return {
-      {"loop_iteration_index", iteration_index},
-      {"stop", stop},
-      {"stop_reason", reason},
-      {"matched_stop_alternative", matched},
-  };
 }
 
 #ifdef _WIN32
@@ -2037,6 +1895,12 @@ class NativeWorkflowRunner::Impl {
   NativeWorkflowResult run(const NativeWorkflowRequest& request) {
     NativeWorkflowRequest req = request;
     req.run_dir = fs::absolute(req.run_dir);
+    if (req.branch_id.empty()) {
+      req.branch_id = req.run_id.empty() ? std::string("default") : req.run_id;
+    }
+    if (req.timeline_id.empty()) {
+      req.timeline_id = workflow_id_.empty() ? std::string("workflow") : workflow_id_;
+    }
     fs::create_directories(req.run_dir);
     appendTrace(req.run_dir, "native_workflow_run_begin workflow=" + workflow_id_ +
                                " run_id=" + req.run_id +
@@ -2058,11 +1922,10 @@ class NativeWorkflowRunner::Impl {
     int iteration_count = 0;
     flightenv::platform::ThreadSafePortStore port_store;
     RuntimePortSampleBuffer port_sample_buffer;
-    const flightenv::platform::ReadyQueueScheduler pdk_scheduler =
-        buildReadyQueueSchedulerFromPlan(scheduler_plan_);
-    flightenv::platform::ThreadPoolExecutorDescriptor pdk_executor;
-    pdk_executor.options.max_workers = pdk_scheduler.max_parallelism();
-    pdk_executor.options.worker_name_prefix = "flightenv-runtime-native";
+    RuntimeReadyQueueExecutor ready_executor =
+        RuntimeReadyQueueExecutor::fromSchedulerPlan(scheduler_plan_);
+    const flightenv::platform::ReadyQueueScheduler& pdk_scheduler = ready_executor.scheduler();
+    const flightenv::platform::ThreadPoolExecutorDescriptor& pdk_executor = ready_executor.executor();
 
     json previous_seed = seedFromRuntimeOutputs(req.seed_runtime_outputs);
     const json external_observations = loadExternalObservations(req.external_observation_stream);
@@ -2083,12 +1946,34 @@ class NativeWorkflowRunner::Impl {
       writeArtifacts(req, lifecycle_events, scheduler_events, node_snapshots, uncertainty_nodes, checkpoints,
                      data_plane_entries, input_artifacts, output_artifacts, loop_iterations, runtime_packets, outputs,
                      previous_seed, external_observations, port_store, pdk_scheduler, pdk_executor,
+                     ready_executor,
                      0, failed_nodes, true);
       return NativeWorkflowResult{0, 0, 0, {{"status", "prepared"}, {"session_count", sessions_.size()}}};
     }
 
-    RuntimeEventQueue loop_events;
-    time_scheduler.seedWorkflowEvents(loop_events, nodes_, max_iterations, base_dt_s, output_period_s);
+    RuntimeEventLoop event_loop;
+    time_scheduler.seedWorkflowEvents(event_loop.queue(), nodes_, max_iterations, base_dt_s, output_period_s);
+    if (external_observations.is_array()) {
+      const int input_event_count =
+          std::min<int>(max_iterations, static_cast<int>(external_observations.size()));
+      for (int input_index = 0; input_index < input_event_count; ++input_index) {
+        const json raw_frame = external_observations.at(static_cast<std::size_t>(input_index));
+        const json frame = externalObservationFramePayload(raw_frame);
+        const double sample_time_s = jsonDouble(frame, "sample_time_s", jsonDouble(frame, "time_s", input_index));
+        event_loop.queue().push(RuntimeEventQueue::inputArrivedEvent(
+            "external_observation",
+            sample_time_s,
+            input_index,
+            {
+                {"source", "external_observation_stream"},
+                {"source_stream_path", pathString(req.external_observation_stream)},
+                {"frame_index", input_index},
+                {"sample_time_s", sample_time_s},
+                {"has_payload", frame.is_object() && !frame.empty()},
+                {"frame", frame},
+            }));
+      }
+    }
     std::map<std::string, json> node_by_id;
     for (const auto& node : nodes_) {
       const std::string node_id = jsonString(node, "node_id");
@@ -2097,38 +1982,51 @@ class NativeWorkflowRunner::Impl {
       }
     }
     json public_tick_outputs = json::object();
-    json public_tick_held_outputs = json::array();
     json public_tick_effective_delta_t_by_node = json::object();
+    json stop_status_by_iteration = json::object();
     int public_tick_failed_nodes = 0;
     int dispatch_tick_index = 0;
     bool stop_requested = false;
-    while (!loop_events.empty()) {
-      const RuntimeEvent loop_event = loop_events.pop();
+    while (!event_loop.empty()) {
+      const RuntimeEvent loop_event = event_loop.next();
       if (loop_event.event_kind == "input_arrived") {
-        scheduler_events.push_back({
-            {"timestamp_utc", nowUtcIso()},
-            {"event", "input_arrived"},
-            {"runtime_event_id", loop_event.event_id},
-            {"runtime_event_kind", loop_event.event_kind},
-            {"target_id", loop_event.target_id},
-            {"event_time_s", loop_event.event_time_s},
-            {"loop_iteration_index", loop_event.iteration_index},
-            {"payload", loop_event.payload},
-        });
+        scheduler_events.push_back(RuntimeEventLoop::schedulerEvent(
+            loop_event,
+            "input_arrived",
+            recordExternalObservationSample(port_sample_buffer, loop_event, req.external_observation_stream)));
         continue;
       }
 
       if (loop_event.event_kind == "checkpoint_due") {
-        scheduler_events.push_back({
-            {"timestamp_utc", nowUtcIso()},
-            {"event", "checkpoint_due"},
-            {"runtime_event_id", loop_event.event_id},
-            {"runtime_event_kind", loop_event.event_kind},
-            {"target_id", loop_event.target_id},
-            {"event_time_s", loop_event.event_time_s},
-            {"loop_iteration_index", loop_event.iteration_index},
-            {"payload", loop_event.payload},
-        });
+        scheduler_events.push_back(RuntimeEventLoop::schedulerEvent(loop_event));
+        continue;
+      }
+
+      if (loop_event.event_kind == "stop_check_due") {
+        const int iteration = std::max(0, loop_event.iteration_index);
+        const std::string iteration_key = std::to_string(iteration);
+        const json stop_status =
+            stop_status_by_iteration.value(iteration_key, json::object({{"stop", false},
+                                                                        {"stop_reason", "public_tick_not_finished"}}));
+        scheduler_events.push_back(RuntimeEventLoop::schedulerEvent(
+            loop_event,
+            "stop_check_due",
+            {
+                {"loop_iteration_index", iteration},
+                {"status", stop_status.value("stop", false) ? "stop_requested" : "continue"},
+                {"stop", stop_status.value("stop", false)},
+                {"stop_reason", stop_status.value("stop_reason", "")},
+                {"stop_status", stop_status},
+            }));
+        if (stop_status.value("stop", false)) {
+          stop_requested = true;
+          break;
+        }
+        continue;
+      }
+
+      if (loop_event.event_kind == "branch_triggered") {
+        scheduler_events.push_back(RuntimeEventLoop::schedulerEvent(loop_event));
         continue;
       }
 
@@ -2136,15 +2034,10 @@ class NativeWorkflowRunner::Impl {
         const int iteration = std::max(0, loop_event.iteration_index);
         const auto node_it = node_by_id.find(loop_event.target_id);
         if (node_it == node_by_id.end()) {
-          scheduler_events.push_back({
-              {"timestamp_utc", nowUtcIso()},
-              {"event", "node_due_missing_target"},
-              {"runtime_event_id", loop_event.event_id},
-              {"runtime_event_kind", loop_event.event_kind},
-              {"target_id", loop_event.target_id},
-              {"event_time_s", loop_event.event_time_s},
-              {"loop_iteration_index", iteration},
-          });
+          scheduler_events.push_back(RuntimeEventLoop::schedulerEvent(
+              loop_event,
+              "node_due_missing_target",
+              {{"loop_iteration_index", iteration}}));
           continue;
         }
         const json& node = node_it->second;
@@ -2152,131 +2045,34 @@ class NativeWorkflowRunner::Impl {
         appendTrace(req.run_dir, "execute_node_begin iteration=" + std::to_string(iteration) +
                                    " event_time=" + std::to_string(loop_event.event_time_s) +
                                    " node=" + node_id);
-        json upstream = previous_seed.is_object() ? previous_seed : json::object();
-        upstream.update(externalObservationSeed(external_observations, iteration, req.external_observation_stream));
-        if (node.contains("depends_on") && node.at("depends_on").is_array()) {
-          for (const auto& dep : node.at("depends_on")) {
-            if (dep.is_string() && outputs.contains(dep.get<std::string>())) {
-              upstream[dep.get<std::string>()] = outputs.at(dep.get<std::string>());
-            }
-          }
-        }
-        if (node.contains("edge_bindings") && node.at("edge_bindings").is_array()) {
-          if (!upstream.contains("input_ports") || !upstream.at("input_ports").is_object()) {
-            upstream["input_ports"] = json::object();
-          }
-          if (!upstream.contains("edge_bindings") || !upstream.at("edge_bindings").is_array()) {
-            upstream["edge_bindings"] = json::array();
-          }
-          for (const auto& binding : node.at("edge_bindings")) {
-            if (!binding.is_object()) {
-              continue;
-            }
-            const std::string source_node_id = jsonString(binding, "source_node_id");
-            const std::string source_port_id = jsonString(binding, "source_port_id");
-            const std::string target_port_id = jsonString(binding, "target_port_id");
-            if (source_node_id.empty() || source_port_id.empty() || target_port_id.empty() ||
-                !outputs.contains(source_node_id)) {
-              continue;
-            }
-            const json& source_output = outputs.at(source_node_id);
-            const json source_ports = source_output.value("outputs",
-                                      source_output.value("output_ports", json::object()));
-            if (!source_ports.is_object() || !source_ports.contains(source_port_id)) {
-              continue;
-            }
-            upstream[target_port_id] = source_ports.at(source_port_id);
-            upstream["input_ports"][target_port_id] = source_ports.at(source_port_id);
-            upstream["edge_bindings"].push_back({
-                {"source_node_id", source_node_id},
-                {"source_port_id", source_port_id},
-                {"target_node_id", node_id},
-                {"target_port_id", target_port_id},
-            });
-          }
-        }
+        const json base_upstream = previous_seed.is_object() ? previous_seed : json::object();
         const json target_data_plane = nodePlanInfo(data_plane_plan_, node_id);
-        const json target_inputs = target_data_plane.value("inputs", json::array());
-        if (target_inputs.is_array() && node.contains("depends_on") && node.at("depends_on").is_array()) {
-          auto field_token = [](std::string port_id) {
-            const std::string prefix = "field.";
-            const std::size_t pos = port_id.find(prefix);
-            if (pos != std::string::npos) {
-              port_id = port_id.substr(pos + prefix.size());
-            }
-            for (const std::string suffix : {".next", ".current"}) {
-              if (port_id.size() > suffix.size() &&
-                  port_id.compare(port_id.size() - suffix.size(), suffix.size(), suffix) == 0) {
-                port_id = port_id.substr(0, port_id.size() - suffix.size());
-              }
-            }
-            return port_id;
-          };
-          if (!upstream.contains("input_ports") || !upstream.at("input_ports").is_object()) {
-            upstream["input_ports"] = json::object();
-          }
-          for (const auto& input_spec : target_inputs) {
-            if (!input_spec.is_object()) {
-              continue;
-            }
-            const std::string target_port_id = jsonString(input_spec, "port_id");
-            const std::string target_contract_id = jsonString(input_spec, "contract_id");
-            const std::string target_field = field_token(target_port_id);
-            if (target_port_id.empty()) {
-              continue;
-            }
-            for (const auto& dep : node.at("depends_on")) {
-              if (!dep.is_string()) {
-                continue;
-              }
-              const std::string source_node_id = dep.get<std::string>();
-              if (!outputs.contains(source_node_id)) {
-                continue;
-              }
-              const json& source_output = outputs.at(source_node_id);
-              const json source_ports = source_output.value("outputs",
-                                        source_output.value("output_ports", json::object()));
-              if (!source_ports.is_object()) {
-                continue;
-              }
-              bool injected = false;
-              for (auto it = source_ports.begin(); it != source_ports.end(); ++it) {
-                if (!it.value().is_object()) {
-                  continue;
-                }
-                const std::string source_contract_id = jsonString(it.value(), "contract_id");
-                const std::string source_port_id = jsonString(it.value(), "port_id", it.key());
-                const std::string source_field =
-                    jsonString(it.value(), "field_name", field_token(source_port_id));
-                const bool contract_match =
-                    !target_contract_id.empty() && source_contract_id == target_contract_id;
-                const bool field_match = !target_field.empty() && source_field == target_field;
-                if (!contract_match && !field_match) {
-                  continue;
-                }
-                upstream[target_port_id] = it.value();
-                upstream["input_ports"][target_port_id] = it.value();
-                upstream["edge_bindings"].push_back({
-                    {"source_node_id", source_node_id},
-                    {"source_port_id", source_port_id},
-                    {"target_node_id", node_id},
-                    {"target_port_id", target_port_id},
-                    {"match", contract_match ? "contract_id" : "field_name"},
-                });
-                appendTrace(req.run_dir,
-                            "input_port_injected target=" + node_id +
-                                " port=" + target_port_id +
-                                " source=" + source_node_id +
-                                " source_port=" + source_port_id);
-                injected = true;
-                break;
-              }
-              if (injected) {
-                break;
-              }
-            }
-          }
-        }
+        RuntimePortBindingResolveRequest binding_request;
+        binding_request.node = node;
+        binding_request.base_upstream = base_upstream;
+        binding_request.external_seed =
+            externalObservationSeed(external_observations, iteration, req.external_observation_stream);
+        binding_request.current_outputs = outputs;
+        binding_request.data_plane_info = target_data_plane;
+        binding_request.port_store = &port_store;
+        binding_request.branch_id = req.branch_id;
+        binding_request.timeline_id = req.timeline_id;
+        binding_request.event_time_ns = loop_event.event_time.nanoseconds;
+        binding_request.allow_implicit_contract_port_binding =
+            envFlagEnabled("FLIGHTENV_ALLOW_IMPLICIT_CONTRACT_PORT_BINDING");
+        binding_request.trace = [&](const std::string& message) {
+          appendTrace(req.run_dir, message);
+        };
+        const RuntimePortBindingResolveResult port_binding =
+            RuntimePortBindingResolver::resolve(binding_request);
+        json input_binding_event = RuntimeEventLoop::schedulerEvent(
+            loop_event,
+            "input_binding",
+            port_binding.evidence);
+        input_binding_event["node_id"] = node_id;
+        input_binding_event["input_binding"] = port_binding.evidence;
+        scheduler_events.push_back(input_binding_event);
+        json upstream = port_binding.upstream;
 
         const RuntimeNodeDispatch cadence =
             time_scheduler.planEventDispatch(node, loop_event, base_dt_s, output_period_s);
@@ -2285,6 +2081,34 @@ class NativeWorkflowRunner::Impl {
             RuntimeInputAlignment::alignNodeInputs(node, time_info, port_sample_buffer);
         RuntimeInputAlignment::applyAlignedInputs(input_alignment, upstream);
         public_tick_effective_delta_t_by_node[node_id] = cadence.effective_delta_t_s;
+        RuntimeReadyAdmission admission =
+            ready_executor.admitNode(node, loop_event, outputs, port_store, req.branch_id, req.timeline_id);
+        scheduler_events.push_back({
+            {"timestamp_utc", nowUtcIso()},
+            {"node_id", node_id},
+            {"event", "ready_queue_admission"},
+            {"runtime_event_id", loop_event.event_id},
+            {"runtime_event_kind", loop_event.event_kind},
+            {"status", admission.status},
+            {"accepted", admission.accepted},
+            {"reason", admission.reason},
+            {"dispatch_tick_index", dispatch_tick_index},
+            {"runtime_event_time_s", loop_event.event_time_s},
+            {"runtime_event_time_ns", loop_event.event_time.nanoseconds},
+            {"loop_iteration_index", iteration},
+            {"input_binding", port_binding.evidence},
+            {"dependency_check", admission.evidence.value("dependency_check", json::object())},
+            {"port_check", admission.evidence.value("port_check", json::object())},
+            {"resource_check", admission.evidence.value("resource_check", json::object())},
+            {"parallel_check", admission.evidence.value("parallel_check", json::object())},
+            {"deadline_check", admission.evidence.value("deadline_check", json::object())},
+            {"ready_queue", admission.evidence},
+        });
+        if (!admission.accepted) {
+          appendTrace(req.run_dir, "execute_node_deferred iteration=" + std::to_string(iteration) +
+                                     " node=" + node_id + " reason=" + admission.reason);
+          continue;
+        }
         scheduler_events.push_back({
             {"timestamp_utc", nowUtcIso()},
             {"node_id", node_id},
@@ -2294,12 +2118,19 @@ class NativeWorkflowRunner::Impl {
             {"status", "running"},
             {"dispatch_tick_index", dispatch_tick_index},
             {"dispatch_time_s", cadence.public_output_time_s},
+            {"dispatch_time_ns", cadence.public_output_time.nanoseconds},
             {"runtime_event_time_s", loop_event.event_time_s},
+            {"runtime_event_time_ns", loop_event.event_time.nanoseconds},
             {"loop_iteration_index", iteration},
             {"output_period_s", cadence.output_period_s},
+            {"output_period_ns", cadence.output_period.nanoseconds},
             {"effective_delta_t_s", cadence.effective_delta_t_s},
+            {"effective_delta_t_ns", cadence.effective_delta_t.nanoseconds},
             {"next_due_time_s", cadence.next_due_time_s},
+            {"next_due_time_ns", cadence.next_due_time.nanoseconds},
+            {"input_binding", port_binding.evidence},
             {"input_alignment", input_alignment.evidence()},
+            {"ready_queue", admission.evidence},
             {"scheduling_level", jsonInt(schedulerInfo(scheduler_plan_, node_id), "scheduling_level", 0)},
             {"parallel_group_id", jsonString(schedulerInfo(scheduler_plan_, node_id), "parallel_group_id")},
         });
@@ -2318,6 +2149,11 @@ class NativeWorkflowRunner::Impl {
           uncertainty_nodes.push_back(node_result.at("uncertainty_node"));
           checkpoints.push_back(node_result.at("checkpoint"));
           runtime_packets.push_back(node_result.at("runtime_packet"));
+          if (node_result.contains("runtime_port_packets") && node_result.at("runtime_port_packets").is_array()) {
+            for (const auto& packet : node_result.at("runtime_port_packets")) {
+              runtime_packets.push_back(packet);
+            }
+          }
           scheduler_events.push_back({
               {"timestamp_utc", nowUtcIso()},
               {"node_id", node_id},
@@ -2328,11 +2164,16 @@ class NativeWorkflowRunner::Impl {
               {"duration_ms", jsonInt(node_result, "duration_ms", 0)},
               {"dispatch_tick_index", dispatch_tick_index},
               {"runtime_event_time_s", loop_event.event_time_s},
+              {"runtime_event_time_ns", loop_event.event_time.nanoseconds},
               {"loop_iteration_index", iteration},
               {"output_period_s", cadence.output_period_s},
+              {"output_period_ns", cadence.output_period.nanoseconds},
               {"effective_delta_t_s", cadence.effective_delta_t_s},
+              {"effective_delta_t_ns", cadence.effective_delta_t.nanoseconds},
           });
+          ready_executor.completeNode(admission);
         } catch (const std::exception& exc) {
+          ready_executor.completeNode(admission);
           appendTrace(req.run_dir, "execute_node_failed iteration=" + std::to_string(iteration) +
                                      " node=" + node_id + " reason=" + exc.what());
           ++public_tick_failed_nodes;
@@ -2355,6 +2196,7 @@ class NativeWorkflowRunner::Impl {
               {"status", "failed"},
               {"reason", exc.what()},
               {"runtime_event_time_s", loop_event.event_time_s},
+              {"runtime_event_time_ns", loop_event.event_time.nanoseconds},
               {"loop_iteration_index", iteration},
           });
           stop_requested = true;
@@ -2365,123 +2207,45 @@ class NativeWorkflowRunner::Impl {
       }
 
       if (loop_event.event_kind != "public_tick") {
-        scheduler_events.push_back({
-            {"timestamp_utc", nowUtcIso()},
-            {"event", "unsupported_runtime_event"},
-            {"runtime_event_id", loop_event.event_id},
-            {"runtime_event_kind", loop_event.event_kind},
-            {"target_id", loop_event.target_id},
-            {"event_time_s", loop_event.event_time_s},
-            {"loop_iteration_index", loop_event.iteration_index},
-        });
+        scheduler_events.push_back(RuntimeEventLoop::schedulerEvent(loop_event, "unsupported_runtime_event"));
         continue;
       }
 
       const RuntimeLoopTick tick = loop_event.loop_tick;
       const int iteration = tick.iteration_index;
-      const double time_offset_s = tick.time_offset_s;
-      const double public_output_time_s = tick.public_output_time_s;
-      scheduler_events.push_back({
-          {"timestamp_utc", nowUtcIso()},
-          {"event", "loop_iteration_start"},
-          {"runtime_event_id", loop_event.event_id},
-          {"runtime_event_kind", loop_event.event_kind},
-          {"status", "running"},
-          {"loop_iteration_index", iteration},
-          {"time_offset_s", time_offset_s},
-          {"public_output_time_s", public_output_time_s},
-          {"output_period_s", tick.output_period_s},
-          {"external_observation", externalObservationSeed(external_observations, iteration, req.external_observation_stream)
-                                     .value("__external_observation__", json::object())},
+      const RuntimePublicFrameResult public_frame = RuntimePublicFrameBuilder::build({
+          &loop_event,
+          &tick,
+          &nodes_,
+          &data_plane_plan_,
+          &port_store,
+          &time_scheduler,
+          &outputs,
+          &public_tick_outputs,
+          public_tick_effective_delta_t_by_node,
+          loop_policy,
+          externalObservationSeed(external_observations, iteration, req.external_observation_stream)
+              .value("__external_observation__", json::object()),
+          nowUtcIso(),
+          base_dt_s,
+          output_period_s,
+          public_tick_failed_nodes,
+          dispatch_tick_index,
       });
-
-      for (const auto& node : nodes_) {
-        const std::string node_id = jsonString(node, "node_id");
-        if (public_tick_outputs.contains(node_id)) {
-          continue;
-        }
-        const RuntimeNodeClockState* state = time_scheduler.stateFor(node_id);
-        if (state == nullptr || !state->has_executed) {
-          public_tick_held_outputs.push_back({
-              {"node_id", node_id},
-              {"operator_id", jsonString(node, "operator_id")},
-              {"loop_iteration_index", iteration},
-              {"reason", "not_yet_due"},
-              {"has_output", false},
-              {"public_output_time_s", public_output_time_s},
-          });
-          continue;
-        }
-        outputs[node_id] = state->last_execute_result;
-        public_tick_outputs[node_id] = state->last_execute_result;
-        scheduler_events.push_back({
-            {"timestamp_utc", nowUtcIso()},
-            {"node_id", node_id},
-            {"event", "held"},
-            {"runtime_event_id", loop_event.event_id},
-            {"runtime_event_kind", loop_event.event_kind},
-            {"status", "held"},
-            {"reason", "carried_forward_until_public_tick"},
-            {"dispatch_tick_index", dispatch_tick_index},
-            {"dispatch_time_s", public_output_time_s},
-            {"loop_iteration_index", iteration},
-            {"held_from_loop_iteration_index", state->last_execution_iteration},
-            {"last_time_info", state->last_time_info},
-        });
-        ++dispatch_tick_index;
-        public_tick_held_outputs.push_back({
-            {"node_id", node_id},
-            {"operator_id", jsonString(node, "operator_id")},
-            {"loop_iteration_index", iteration},
-            {"held_from_loop_iteration_index", state->last_execution_iteration},
-            {"reason", "carried_forward_until_public_tick"},
-            {"has_output", true},
-            {"public_output_time_s", public_output_time_s},
-            {"last_time_info", state->last_time_info},
-        });
+      for (const auto& event : public_frame.scheduler_events) {
+        scheduler_events.push_back(event);
       }
-
       ++iteration_count;
-      json stop_status = loopStopStatus(outputs, iteration, loop_policy);
-      stop_status["failed_nodes"] = public_tick_failed_nodes;
-      stop_status["run_time_s"] = public_output_time_s;
-      stop_status["public_output_time_s"] = public_output_time_s;
-      stop_status["output_period_s"] = output_period_s;
-      stop_status["base_dt_s"] = base_dt_s;
-      stop_status["effective_delta_t_s_by_node"] = public_tick_effective_delta_t_by_node;
-      stop_status["event_scheduler"] = {
-          {"mode", "event_queue"},
-          {"public_event_id", loop_event.event_id},
-          {"public_event_time_s", loop_event.event_time_s},
-          {"node_event_count", public_tick_outputs.size()},
-      };
-      stop_status["held_outputs"] = public_tick_held_outputs;
-      stop_status["held_output_count"] = public_tick_held_outputs.size();
+      json stop_status = public_frame.stop_status;
+      stop_status_by_iteration[std::to_string(iteration)] = stop_status;
       loop_iterations.push_back(stop_status);
-      scheduler_events.push_back({
-          {"timestamp_utc", nowUtcIso()},
-          {"event", "loop_iteration_finish"},
-          {"runtime_event_id", loop_event.event_id},
-          {"runtime_event_kind", loop_event.event_kind},
-          {"status", public_tick_failed_nodes ? "failed" : "ok"},
-          {"loop_iteration_index", iteration},
-          {"public_output_time_s", public_output_time_s},
-          {"output_period_s", output_period_s},
-          {"held_output_count", public_tick_held_outputs.size()},
-          {"stop", stop_status.value("stop", false)},
-          {"stop_reason", stop_status.value("stop_reason", "")},
-      });
-      if (public_tick_failed_nodes > 0) {
-        stop_requested = true;
-        break;
-      }
-      if (stop_status.value("stop", false)) {
+      dispatch_tick_index = public_frame.next_dispatch_tick_index;
+      if (public_frame.failed) {
         stop_requested = true;
         break;
       }
       previous_seed = recurrentSeedFromOutputs(outputs, iteration);
       public_tick_outputs = json::object();
-      public_tick_held_outputs = json::array();
       public_tick_effective_delta_t_by_node = json::object();
       public_tick_failed_nodes = 0;
       dispatch_tick_index = 0;
@@ -2493,6 +2257,7 @@ class NativeWorkflowRunner::Impl {
     writeArtifacts(req, lifecycle_events, scheduler_events, node_snapshots, uncertainty_nodes, checkpoints,
                    data_plane_entries, input_artifacts, output_artifacts, loop_iterations, runtime_packets, outputs,
                    previous_seed, external_observations, port_store, pdk_scheduler, pdk_executor,
+                   ready_executor,
                    iteration_count, failed_nodes, false);
     return NativeWorkflowResult{
         failed_nodes == 0 ? 0 : 2,
@@ -2596,52 +2361,75 @@ class NativeWorkflowRunner::Impl {
     uncertainty_plan_ = readJsonIfExists(options_.compiled_workflow / "uncertainty_plan.json");
     state_store_plan_ = readJsonIfExists(options_.compiled_workflow / "state_store_plan.json");
     data_plane_plan_ = readJsonIfExists(options_.compiled_workflow / "data_plane_plan.json");
+    edge_binding_plan_ = readJson(options_.compiled_workflow / "edge_binding_plan.json");
     workflow_snapshot_ = readJsonIfExists(options_.compiled_workflow / "workflow_snapshot.json");
     operator_snapshot_ = readJsonIfExists(options_.compiled_workflow / "operator_snapshot.json");
     resource_lock_ = readJsonIfExists(options_.compiled_workflow / "resource_lock.json");
     model_snapshot_ = readJsonIfExists(options_.compiled_workflow / "model_snapshot.json");
     json execution_nodes = requireArray(execution_plan_, "nodes", options_.compiled_workflow / "execution_plan.json");
     edge_bindings_by_target_ = json::object();
-    const json workflow = workflow_snapshot_.value("workflow", json::object());
-    const json phases = workflow.value("phases", json::array());
-    if (phases.is_array()) {
-      for (const auto& phase : phases) {
-        if (!phase.is_object()) {
+    const json compiled_bindings = edge_binding_plan_.value("bindings", json::array());
+    if (compiled_bindings.is_array()) {
+      for (const auto& binding : compiled_bindings) {
+        if (!binding.is_object()) {
           continue;
         }
-        const std::string phase_id = jsonString(phase, "phase_id");
-        const json stages = phase.value("stages", json::array());
-        if (!stages.is_array()) {
-          continue;
+        const std::string target_node_id = jsonString(binding, "target_node_id");
+        const std::string source_node_id = jsonString(binding, "source_node_id");
+        const std::string source_port_id = jsonString(binding, "source_port_id");
+        const std::string target_port_id = jsonString(binding, "target_port_id");
+        if (target_node_id.empty() || source_node_id.empty() ||
+            source_port_id.empty() || target_port_id.empty()) {
+          throw std::runtime_error("edge_binding_plan.json contains an incomplete binding");
         }
-        for (const auto& stage : stages) {
-          if (!stage.is_object()) {
+        edge_bindings_by_target_[target_node_id].push_back(binding);
+      }
+    }
+    if (edge_bindings_by_target_.empty() &&
+        envFlagEnabled("FLIGHTENV_ALLOW_WORKFLOW_SNAPSHOT_EDGE_BINDING_FALLBACK")) {
+      const json workflow = workflow_snapshot_.value("workflow", json::object());
+      const json phases = workflow.value("phases", json::array());
+      if (phases.is_array()) {
+        for (const auto& phase : phases) {
+          if (!phase.is_object()) {
             continue;
           }
-          const std::string stage_id = jsonString(stage, "stage_id");
-          const json subgraph = stage.value("subgraph", json::object());
-          const json edges = subgraph.value("edges", json::array());
-          if (!edges.is_array()) {
+          const std::string phase_id = jsonString(phase, "phase_id");
+          const json stages = phase.value("stages", json::array());
+          if (!stages.is_array()) {
             continue;
           }
-          for (const auto& edge : edges) {
-            if (!edge.is_object()) {
+          for (const auto& stage : stages) {
+            if (!stage.is_object()) {
               continue;
             }
-            const json from = edge.value("from", json::object());
-            const json to = edge.value("to", json::object());
-            const std::string from_node = jsonString(from, "node_id");
-            const std::string to_node = jsonString(to, "node_id");
-            if (from_node.empty() || to_node.empty()) {
+            const std::string stage_id = jsonString(stage, "stage_id");
+            const json subgraph = stage.value("subgraph", json::object());
+            const json edges = subgraph.value("edges", json::array());
+            if (!edges.is_array()) {
               continue;
             }
-            const std::string source_node_id = phase_id + "." + stage_id + "." + from_node;
-            const std::string target_node_id = phase_id + "." + stage_id + "." + to_node;
-            edge_bindings_by_target_[target_node_id].push_back({
-                {"source_node_id", source_node_id},
-                {"source_port_id", jsonString(from, "port_id")},
-                {"target_port_id", jsonString(to, "port_id")},
-            });
+            for (const auto& edge : edges) {
+              if (!edge.is_object()) {
+                continue;
+              }
+              const json from = edge.value("from", json::object());
+              const json to = edge.value("to", json::object());
+              const std::string from_node = jsonString(from, "node_id");
+              const std::string to_node = jsonString(to, "node_id");
+              if (from_node.empty() || to_node.empty()) {
+                continue;
+              }
+              const std::string source_node_id = phase_id + "." + stage_id + "." + from_node;
+              const std::string target_node_id = phase_id + "." + stage_id + "." + to_node;
+              edge_bindings_by_target_[target_node_id].push_back({
+                  {"source_node_id", source_node_id},
+                  {"source_port_id", jsonString(from, "port_id")},
+                  {"target_node_id", target_node_id},
+                  {"target_port_id", jsonString(to, "port_id")},
+                  {"source", "workflow_snapshot_fallback"},
+              });
+            }
           }
         }
       }
@@ -2940,54 +2728,26 @@ class NativeWorkflowRunner::Impl {
     const std::string node_id = jsonString(node, "node_id");
     const std::string execution_tag = runtimeExecutionTag(time_info, iteration_index, node_id);
     const json input_summary = summarizeJson(upstream);
-    input_artifacts.push_back({
-        {"node_id", node_id},
-        {"loop_iteration_index", iteration_index},
-        {"artifact_id", execution_tag + ".input"},
-        {"kind", "runtime_input_summary"},
-        {"checksum", input_summary.value("digest", "")},
-        {"summary", input_summary},
-    });
 
     const json data_plane_info = nodePlanInfo(data_plane_plan_, node_id);
-    json execute_result = session.execute(context, {{"upstream", upstream}, {"data_plane", data_plane_info}});
-    appendTrace(req.run_dir, "execute_node_typed_materialize_begin iteration=" +
-                                 std::to_string(iteration_index) + " node=" + node_id);
-    execute_result = materializeTypedOutputPayloads(
-        req.run_dir,
-        data_plane_info,
-        execute_result,
-        time_info,
-        iteration_index,
-        options_.typed_buffer_persistence);
-    appendTrace(req.run_dir, "execute_node_typed_materialize_end iteration=" +
-                               std::to_string(iteration_index) + " node=" + node_id);
-    if (resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode) != RuntimeZeroCopyMode::Off) {
-      enforceOutputZeroCopyPolicy(data_plane_info, execute_result, node_id);
-      appendTrace(req.run_dir, "execute_node_zero_copy_policy_end iteration=" +
-                                 std::to_string(iteration_index) + " node=" + node_id);
-    } else {
-      appendTrace(req.run_dir, "execute_node_zero_copy_policy_skipped mode=off iteration=" +
-                                 std::to_string(iteration_index) + " node=" + node_id);
-    }
-    const bool allow_inline_typed_outputs =
-        resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode) == RuntimeZeroCopyMode::Off;
-    validateExecuteOutputContracts(
-        data_plane_info, execute_result, node_id, allow_inline_typed_outputs);
-    appendTrace(req.run_dir, "execute_node_validate_contracts_end iteration=" +
-                               std::to_string(iteration_index) + " node=" + node_id);
+    RuntimeAdapterInvokeRequest invoke_request;
+    invoke_request.run_dir = req.run_dir;
+    invoke_request.context = context;
+    invoke_request.upstream = upstream;
+    invoke_request.data_plane_info = data_plane_info;
+    invoke_request.time_info = time_info;
+    invoke_request.iteration_index = iteration_index;
+    invoke_request.node_id = node_id;
+    invoke_request.runtime_zero_copy_mode = options_.runtime_zero_copy_mode;
+    invoke_request.typed_buffer_persistence = options_.typed_buffer_persistence;
+    invoke_request.trace = [&](const std::string& message) {
+      appendTrace(req.run_dir, message);
+    };
+    json execute_result = RuntimeAdapterInvoker::execute(session, invoke_request);
     logLifecycle(lifecycle_events, node, "execute", "ok", time_info, execute_result, iteration_index);
     appendTrace(req.run_dir, "execute_node_log_lifecycle_execute_end iteration=" +
                                std::to_string(iteration_index) + " node=" + node_id);
     const json output_summary = summarizeJson(execute_result);
-    output_artifacts.push_back({
-        {"node_id", node_id},
-        {"loop_iteration_index", iteration_index},
-        {"artifact_id", execution_tag + ".output"},
-        {"kind", "runtime_output_summary"},
-        {"checksum", output_summary.value("digest", "")},
-        {"summary", output_summary},
-    });
 
     const json snapshot = session.snapshot(context, json::object());
     logLifecycle(lifecycle_events, node, "snapshot", "ok", time_info, snapshot, iteration_index);
@@ -3007,7 +2767,15 @@ class NativeWorkflowRunner::Impl {
     appendTrace(req.run_dir, "execute_node_packet_build_begin iteration=" + std::to_string(iteration_index) +
                                  " node=" + node_id);
     flightenv::platform::RuntimePacket packet_candidate =
-        buildRuntimePacket(req.run_id, object_id_, node_id, execute_result, time_info, node_data_plane_entries);
+        buildRuntimePacket(
+            req.run_id,
+            object_id_,
+            req.branch_id,
+            req.timeline_id,
+            node_id,
+            execute_result,
+            time_info,
+            node_data_plane_entries);
     appendTrace(req.run_dir, "execute_node_packet_build_end iteration=" + std::to_string(iteration_index) +
                                " node=" + node_id +
                                " payload_bytes=" + std::to_string(packet_candidate.inline_payload_json.size()));
@@ -3021,39 +2789,47 @@ class NativeWorkflowRunner::Impl {
     const json runtime_packet_json = runtimePacketToJson(runtime_packet);
     appendTrace(req.run_dir, "execute_node_packet_json_end iteration=" + std::to_string(iteration_index) +
                              " node=" + node_id);
-    json node_snapshot = {
-        {"node_id", node_id},
-        {"operator_id", jsonString(node, "operator_id")},
-        {"adapter_id", jsonString(node, "adapter_id")},
-        {"execution_kind", jsonString(node, "execution_kind")},
-        {"adapter_protocol", session.protocol()},
-        {"status", "ok"},
-        {"loop_iteration_index", iteration_index},
-        {"time_info", time_info},
-        {"adapter_snapshot", snapshot},
-        {"runtime_packet", runtime_packet_json},
-    };
-    json uncertainty_node = {
-        {"node_id", node_id},
-        {"loop_iteration_index", iteration_index},
-        {"operator_id", jsonString(node, "operator_id")},
-        {"uncertainty_contract", nodePlanInfo(uncertainty_plan_, node_id).value("uncertainty_contract", json::object())},
-        {"input_artifact_hashes", json::array({input_summary.value("digest", "")})},
-        {"output_artifact_hashes", json::array({output_summary.value("digest", "")})},
-    };
-    json checkpoint = {
-        {"checkpoint_id", execution_tag},
-        {"node_id", node_id},
-        {"loop_iteration_index", iteration_index},
-        {"operator_id", jsonString(node, "operator_id")},
-        {"checkpoint_kind", nodePlanInfo(state_store_plan_, node_id).value("checkpoint_kind", "snapshot_only")},
-        {"replay_mode", nodePlanInfo(state_store_plan_, node_id).value("replay_mode", "record_replay")},
-        {"time_point", time_info.value("time_point", json::object())},
-        {"adapter_protocol", session.protocol()},
-        {"adapter_snapshot", snapshot},
-        {"input_hashes", json::array({input_summary.value("digest", "")})},
-        {"output_hashes", json::array({output_summary.value("digest", "")})},
-    };
+    appendTrace(req.run_dir, "execute_node_port_packets_begin iteration=" + std::to_string(iteration_index) +
+                               " node=" + node_id);
+    const RuntimePortPacketWriteResult port_packet_result =
+        RuntimePortPacketWriter::writeOutputPortPackets(
+            port_store,
+            RuntimePortPacketWriteRequest{
+                req.run_id,
+                object_id_,
+                req.branch_id,
+                req.timeline_id,
+                node_id,
+                execute_result,
+                time_info,
+                node_data_plane_entries,
+            });
+    appendTrace(req.run_dir, "execute_node_port_packets_end iteration=" + std::to_string(iteration_index) +
+                               " node=" + node_id +
+                               " count=" + std::to_string(port_packet_result.packets.size()));
+    const json uncertainty_info = nodePlanInfo(uncertainty_plan_, node_id);
+    const json state_store_info = nodePlanInfo(state_store_plan_, node_id);
+    const RuntimeNodeEvidenceResult node_evidence = RuntimeNodeEvidenceBuilder::build({
+        node_id,
+        jsonString(node, "operator_id"),
+        jsonString(node, "adapter_id"),
+        jsonString(node, "execution_kind"),
+        session.protocol(),
+        execution_tag,
+        iteration_index,
+        time_info,
+        snapshot,
+        runtime_packet_json,
+        port_packet_result.packets,
+        uncertainty_info.value("uncertainty_contract", json::object()),
+        input_summary,
+        output_summary,
+        jsonString(state_store_info, "checkpoint_kind", "snapshot_only"),
+        jsonString(state_store_info, "replay_mode", "record_replay"),
+    });
+    input_artifacts.push_back(node_evidence.input_artifact);
+    output_artifacts.push_back(node_evidence.output_artifact);
+
     const int duration_ms = static_cast<int>(
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count());
     return {
@@ -3061,10 +2837,12 @@ class NativeWorkflowRunner::Impl {
         {"node_id", node_id},
         {"duration_ms", duration_ms},
         {"execute_result", execute_result},
-        {"node_snapshot", node_snapshot},
-        {"uncertainty_node", uncertainty_node},
-        {"checkpoint", checkpoint},
+        {"node_snapshot", node_evidence.node_snapshot},
+        {"uncertainty_node", node_evidence.uncertainty_node},
+        {"checkpoint", node_evidence.checkpoint},
         {"runtime_packet", runtime_packet_json},
+        {"runtime_port_packets", port_packet_result.packets},
+        {"runtime_port_packet_by_port", port_packet_result.packet_by_port},
     };
   }
 
@@ -3119,10 +2897,12 @@ class NativeWorkflowRunner::Impl {
       const flightenv::platform::ThreadSafePortStore& port_store,
       const flightenv::platform::ReadyQueueScheduler& pdk_scheduler,
       const flightenv::platform::ThreadPoolExecutorDescriptor& pdk_executor,
+      const RuntimeReadyQueueExecutor& ready_executor,
       int iteration_count,
       int failed_nodes,
       bool prepare_only) const {
     const std::string status = failed_nodes == 0 ? (prepare_only ? "prepared" : "completed") : "failed";
+    const RuntimeEvidenceWriter evidence_writer(req.run_dir);
     int held_output_total = 0;
     double summary_base_dt_s = 0.0;
     double summary_output_period_s = 0.0;
@@ -3148,6 +2928,7 @@ class NativeWorkflowRunner::Impl {
         {"port_store", portStoreEvidence(port_store)},
         {"ready_queue_scheduler", readyQueueSchedulerEvidence(pdk_scheduler)},
         {"thread_pool_executor", threadPoolExecutorEvidence(pdk_executor)},
+        {"ready_queue_executor", ready_executor.runtimeCoreEvidence()},
         {"adapter_session_contract", kAdapterSessionContract},
         {"legacy_json_packet_buffer_count", runtime_packets.size()},
         {"typed_packet_fields",
@@ -3168,30 +2949,34 @@ class NativeWorkflowRunner::Impl {
         {"remaining_host_owned_services",
          {"online_loop_clock", "branch_manager", "runtime_index_writer", "health_ledger_writer"}},
     };
-    writeJson(req.run_dir / "adapter_lifecycle_log.json",
-              {{"schema_version", "flightenv.platform.adapter_lifecycle_log.v1"},
+    evidence_writer.writeJson(
+        "adapter_lifecycle_log.json",
+        {{"schema_version", "flightenv.platform.adapter_lifecycle_log.v1"},
                {"run_id", req.run_id},
                {"workflow_id", workflow_id_},
                {"object_id", object_id_},
                {"generated_at_utc", nowUtcIso()},
                {"execution_backend", "native_adapter_sessions"},
                {"events", lifecycle_events}});
-    writeJson(req.run_dir / "scheduler_timeline.json",
-              {{"schema_version", "flightenv.platform.scheduler_timeline.v1"},
+    evidence_writer.writeJson(
+        "scheduler_timeline.json",
+        {{"schema_version", "flightenv.platform.scheduler_timeline.v1"},
                {"run_id", req.run_id},
                {"workflow_id", workflow_id_},
                {"object_id", object_id_},
                {"generated_at_utc", nowUtcIso()},
                {"events", scheduler_events}});
-    writeJson(req.run_dir / "runtime_node_snapshot.json",
-              {{"schema_version", "flightenv.platform.runtime_node_snapshot.v1"},
+    evidence_writer.writeJson(
+        "runtime_node_snapshot.json",
+        {{"schema_version", "flightenv.platform.runtime_node_snapshot.v1"},
                {"run_id", req.run_id},
                {"workflow_id", workflow_id_},
                {"object_id", object_id_},
                {"generated_at_utc", nowUtcIso()},
                {"nodes", node_snapshots}});
-    writeJson(req.run_dir / "runtime_outputs.json",
-              {{"schema_version", "flightenv.platform.runtime_outputs.v1"},
+    evidence_writer.writeJson(
+        "runtime_outputs.json",
+        {{"schema_version", "flightenv.platform.runtime_outputs.v1"},
                {"run_id", req.run_id},
                {"workflow_id", workflow_id_},
                {"object_id", object_id_},
@@ -3199,8 +2984,9 @@ class NativeWorkflowRunner::Impl {
                {"last_loop_iteration_index", std::max(0, iteration_count - 1)},
                {"typed_buffer_store", typed_buffer_store_summary},
                {"outputs", outputs}});
-    writeJson(req.run_dir / "runtime_loop_summary.json",
-              {{"schema_version", "flightenv.platform.runtime_loop_summary.v1"},
+    evidence_writer.writeJson(
+        "runtime_loop_summary.json",
+        {{"schema_version", "flightenv.platform.runtime_loop_summary.v1"},
                {"run_id", req.run_id},
                {"workflow_id", workflow_id_},
                {"object_id", object_id_},
@@ -3212,53 +2998,64 @@ class NativeWorkflowRunner::Impl {
                  {"base_dt_s", summary_base_dt_s},
                  {"output_period_s", summary_output_period_s},
                  {"held_output_count", held_output_total}}}});
-    writeJson(req.run_dir / "runtime_packets.json",
-              {{"schema_version", "flightenv.platform.runtime_packets.v1"},
+    evidence_writer.writeJson(
+        "runtime_packets.json",
+        {{"schema_version", "flightenv.platform.runtime_packets.v1"},
                {"run_id", req.run_id},
                {"workflow_id", workflow_id_},
                {"object_id", object_id_},
+               {"branch_id", req.branch_id},
+               {"timeline_id", req.timeline_id},
                {"generated_at_utc", nowUtcIso()},
                {"producer", "ThreadSafePortStore"},
                {"summary", portStoreEvidence(port_store)},
                {"packets", port_store_packets}});
-    writeJson(req.run_dir / "data_plane_manifest.json",
-              {{"schema_version", "flightenv.platform.data_plane_manifest.v1"},
+    evidence_writer.writeJson(
+        "data_plane_manifest.json",
+        {{"schema_version", "flightenv.platform.data_plane_manifest.v1"},
                {"run_id", req.run_id},
                {"workflow_id", workflow_id_},
                {"object_id", object_id_},
                {"generated_at_utc", nowUtcIso()},
                {"entries", data_plane_entries},
                {"summary", {{"entry_count", data_plane_entries.size()}}}});
-    writeJson(req.run_dir / "uncertainty_evidence.json",
-              {{"schema_version", "flightenv.platform.uncertainty_evidence.v1"},
+    evidence_writer.writeJson(
+        "uncertainty_evidence.json",
+        {{"schema_version", "flightenv.platform.uncertainty_evidence.v1"},
                {"run_id", req.run_id},
                {"workflow_id", workflow_id_},
                {"object_id", object_id_},
                {"generated_at_utc", nowUtcIso()},
                {"nodes", uncertainty_nodes}});
-    writeJson(req.run_dir / "state_checkpoint.json",
-              {{"schema_version", "flightenv.platform.state_checkpoint.v1"},
+    evidence_writer.writeJson(
+        "state_checkpoint.json",
+        {{"schema_version", "flightenv.platform.state_checkpoint.v1"},
                {"run_id", req.run_id},
                {"workflow_id", workflow_id_},
                {"object_id", object_id_},
                {"generated_at_utc", nowUtcIso()},
                {"checkpoints", checkpoints}});
-    writeJson(req.run_dir / "runtime_artifacts.json",
-              {{"schema_version", "flightenv.platform.runtime_artifacts.v1"},
+    evidence_writer.writeJson(
+        "runtime_artifacts.json",
+        {{"schema_version", "flightenv.platform.runtime_artifacts.v1"},
                {"run_id", req.run_id},
                {"workflow_id", workflow_id_},
                {"object_id", object_id_},
                {"generated_at_utc", nowUtcIso()},
                {"inputs", input_artifacts},
                {"outputs", output_artifacts}});
-    writeJson(req.run_dir / "sensor_stream.json", buildSensorStreamArtifact(req, external_observations));
-    writeJson(req.run_dir / "adapter_session_summary.json", sessionSummary());
-    writeJson(req.run_dir / "adapter_backend_capability_report.json", backend_capability_report);
-    writeJson(req.run_dir / "runtime_evidence.json",
-              {{"schema_version", "flightenv.platform.runtime_evidence.v1"},
+    evidence_writer.writeJson("sensor_stream.json", buildSensorStreamArtifact(req, external_observations));
+    evidence_writer.writeJson("adapter_session_summary.json", sessionSummary());
+    evidence_writer.writeJson("adapter_backend_capability_report.json", backend_capability_report);
+    evidence_writer.writeJson("edge_binding_plan.json", edge_binding_plan_);
+    evidence_writer.writeJson(
+        "runtime_evidence.json",
+        {{"schema_version", "flightenv.platform.runtime_evidence.v1"},
                {"run_id", req.run_id},
                {"workflow_id", workflow_id_},
                {"object_id", object_id_},
+               {"branch_id", req.branch_id},
+               {"timeline_id", req.timeline_id},
                {"status", status},
                {"generated_at_utc", nowUtcIso()},
                {"execution_backend", "native_adapter_sessions"},
@@ -3280,6 +3077,7 @@ class NativeWorkflowRunner::Impl {
                  {"typed_buffer_store", typed_buffer_store_summary},
                  {"runtime_packet_count", port_store_packets.size()},
                  {"port_store_node_output_count", portStoreEvidence(port_store).value("node_output_count", 0)},
+                 {"edge_binding_count", edge_binding_plan_.value("summary", json::object()).value("binding_count", 0)},
                  {"ready_queue_plan_node_count", pdk_scheduler.plan_nodes.size()},
                  {"worker_pool_size", pdk_executor.options.max_workers},
                  {"pdk_workflow_process_spawned", false},
@@ -3291,6 +3089,7 @@ class NativeWorkflowRunner::Impl {
                  {"runtime_node_snapshot", "runtime_node_snapshot.json"},
                  {"runtime_outputs", "runtime_outputs.json"},
                  {"runtime_loop_summary", "runtime_loop_summary.json"},
+                 {"edge_binding_plan", "edge_binding_plan.json"},
                  {"data_plane_manifest", "data_plane_manifest.json"},
                  {"state_checkpoint", "state_checkpoint.json"},
                  {"sensor_stream", "sensor_stream.json"}}}});
@@ -3303,6 +3102,7 @@ class NativeWorkflowRunner::Impl {
   json uncertainty_plan_ = json::object();
   json state_store_plan_ = json::object();
   json data_plane_plan_ = json::object();
+  json edge_binding_plan_ = json::object();
   json workflow_snapshot_ = json::object();
   json operator_snapshot_ = json::object();
   json resource_lock_ = json::object();

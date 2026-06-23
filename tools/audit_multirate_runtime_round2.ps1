@@ -204,31 +204,45 @@ foreach ($pathToClean in @($runDir, $chainDir)) {
 }
 New-Item -ItemType Directory -Force -Path $scratchRoot | Out-Null
 
-& $exe `
-    --workspace-root $workspaceRoot `
-    --pdk-root $pdkRoot `
-    --object-package-root $objectRoot `
-    --compiled-online $compiledAudit `
-    --compiled-future $compiledAudit `
-    --adapter-registry $registryPath `
-    --run-root $runRoot `
-    --chain-dir $chainDir `
-    --run-id-prefix $RunIdPrefix `
-    --branch-worker `
-    --branch-id audit.round2_multirate `
-    --branch-run-id round2_multirate_branch `
-    --branch-run-dir $runDir `
-    --seed-runtime-outputs $seedPath `
-    --trigger-frame-index 0 `
-    --trigger-time-s 0 `
-    --future-max-iterations 5 `
-    --branch-chunk-iterations 5 `
-    --execution-backend native_adapter_sessions `
-    --python $Python `
-    --require-adapter-registry
+$previousTypedBridge = $env:FLIGHTENV_ALLOW_INLINE_JSON_TYPED_PAYLOAD_BRIDGE
+$runtimeExitCode = 0
+try {
+    # This audit uses json_echo_adapter to isolate scheduler behavior, so it
+    # explicitly enables the migration bridge that production runs leave off.
+    $env:FLIGHTENV_ALLOW_INLINE_JSON_TYPED_PAYLOAD_BRIDGE = '1'
+    & $exe `
+        --workspace-root $workspaceRoot `
+        --pdk-root $pdkRoot `
+        --object-package-root $objectRoot `
+        --compiled-online $compiledAudit `
+        --compiled-future $compiledAudit `
+        --adapter-registry $registryPath `
+        --run-root $runRoot `
+        --chain-dir $chainDir `
+        --run-id-prefix $RunIdPrefix `
+        --branch-worker `
+        --branch-id audit.round2_multirate `
+        --branch-run-id round2_multirate_branch `
+        --branch-run-dir $runDir `
+        --seed-runtime-outputs $seedPath `
+        --trigger-frame-index 0 `
+        --trigger-time-s 0 `
+        --future-max-iterations 5 `
+        --branch-chunk-iterations 5 `
+        --execution-backend native_adapter_sessions `
+        --python $Python `
+        --require-adapter-registry
+    $runtimeExitCode = $LASTEXITCODE
+} finally {
+    if ($null -eq $previousTypedBridge) {
+        Remove-Item Env:\FLIGHTENV_ALLOW_INLINE_JSON_TYPED_PAYLOAD_BRIDGE -ErrorAction SilentlyContinue
+    } else {
+        $env:FLIGHTENV_ALLOW_INLINE_JSON_TYPED_PAYLOAD_BRIDGE = $previousTypedBridge
+    }
+}
 
-if ($LASTEXITCODE -ne 0) {
-    throw "RuntimeHost Round2 multirate audit failed with exit code $LASTEXITCODE"
+if ($runtimeExitCode -ne 0) {
+    throw "RuntimeHost Round2 multirate audit failed with exit code $runtimeExitCode"
 }
 
 $scheduler = Read-JsonFile -PathValue (Join-Path $runDir '_branch_chunks\chunk_000000\scheduler_timeline.json')

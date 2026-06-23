@@ -46,6 +46,8 @@ struct NativeWorkflowOptions {
 struct NativeWorkflowRequest {
   std::filesystem::path run_dir;                      ///< 写入运行时证据和制品的目录。
   std::string run_id;                                 ///< 嵌入证据记录的稳定 run 标识。
+  std::string branch_id;                              ///< 可选分支标识；为空时运行器用 run_id 作为平台默认分支。
+  std::string timeline_id;                            ///< 可选时间线标识；为空时使用 workflow_id 派生的默认时间线。
   std::filesystem::path seed_runtime_outputs;         ///< 可选的历史运行时输出，用作初始输入状态。
   std::filesystem::path external_observation_stream;  ///< workflow 消费的可选外部输入流。
   int max_iterations = 1;                             ///< 运行时循环迭代上限；小于一的值由实现收口。

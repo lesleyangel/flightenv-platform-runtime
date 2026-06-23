@@ -207,6 +207,8 @@ nlohmann::json makeEntry(
       {"typed_payload_ref", ""},
       {"typed_buffer_ref", ""},
       {"buffer_layout_id", jsonString(typed_contract, "buffer_layout_id")},
+      {"value_kind", jsonString(spec, "value_kind", jsonString(value, "value_kind"))},
+      {"role", jsonString(spec, "role", jsonString(value, "role", jsonString(value, "display_role")))},
       {"buffer_bytes", 0},
       {"zero_copy_eligible", jsonBool(typed_contract, "zero_copy_eligible", false)},
       {"representation", "inline_json"},
