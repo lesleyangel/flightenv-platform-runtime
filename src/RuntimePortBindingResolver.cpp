@@ -32,6 +32,26 @@ void ensureBindingContainers(nlohmann::json& upstream) {
   }
 }
 
+void retargetBoundInputValue(nlohmann::json& value, const std::string& target_port_id) {
+  if (!value.is_object() || target_port_id.empty()) {
+    return;
+  }
+  const std::string source_port_id = jsonString(value, "port_id");
+  if (!source_port_id.empty() && !value.contains("source_port_id")) {
+    value["source_port_id"] = source_port_id;
+  }
+  value["port_id"] = target_port_id;
+
+  if (value.contains("typed_buffer_ref") && value.at("typed_buffer_ref").is_object()) {
+    nlohmann::json& typed_ref = value["typed_buffer_ref"];
+    const std::string typed_source_port_id = jsonString(typed_ref, "port_id", source_port_id);
+    if (!typed_source_port_id.empty() && !typed_ref.contains("source_port_id")) {
+      typed_ref["source_port_id"] = typed_source_port_id;
+    }
+    typed_ref["port_id"] = target_port_id;
+  }
+}
+
 nlohmann::json outputPorts(const nlohmann::json& node_output) {
   if (!node_output.is_object()) {
     return nlohmann::json::object();
@@ -200,6 +220,7 @@ RuntimePortBindingResolveResult RuntimePortBindingResolver::resolve(
         continue;
       }
 
+      retargetBoundInputValue(bound_value, target_port_id);
       result.upstream[target_port_id] = bound_value;
       result.upstream["input_ports"][target_port_id] = bound_value;
       nlohmann::json binding_record = {
@@ -261,8 +282,10 @@ RuntimePortBindingResolveResult RuntimePortBindingResolver::resolve(
           if (!contract_match && !field_match) {
             continue;
           }
-          result.upstream[target_port_id] = it.value();
-          result.upstream["input_ports"][target_port_id] = it.value();
+          nlohmann::json bound_value = it.value();
+          retargetBoundInputValue(bound_value, target_port_id);
+          result.upstream[target_port_id] = bound_value;
+          result.upstream["input_ports"][target_port_id] = bound_value;
           nlohmann::json binding_record = {
               {"source_node_id", source_node_id},
               {"source_port_id", source_port_id},

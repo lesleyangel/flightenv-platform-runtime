@@ -221,6 +221,14 @@ bool jsonBool(const json& value, const std::string& key, bool fallback = false) 
   return value.at(key).get<bool>();
 }
 
+json objectOrEmpty(const json& value) {
+  return value.is_object() ? value : json::object();
+}
+
+json arrayOrEmpty(const json& value) {
+  return value.is_array() ? value : json::array();
+}
+
 std::vector<std::string> jsonStringArray(const json& value) {
   std::vector<std::string> out;
   if (!value.is_array()) {
@@ -309,7 +317,7 @@ json loadObjectRuntimeProfile(const fs::path& object_package_root) {
 }
 
 json workflowRole(const json& profile, const std::string& role) {
-  const json roles = profile.value("workflow_roles", json::array());
+  const json roles = objectOrEmpty(profile).value("workflow_roles", json::array());
   if (!roles.is_array()) {
     return json::object();
   }
@@ -322,7 +330,7 @@ json workflowRole(const json& profile, const std::string& role) {
 }
 
 json workflowRoleForWorkflowId(const json& profile, const std::string& workflow_id) {
-  const json roles = profile.value("workflow_roles", json::array());
+  const json roles = objectOrEmpty(profile).value("workflow_roles", json::array());
   if (!roles.is_array()) {
     return json::object();
   }
@@ -339,7 +347,7 @@ std::string defaultWorkflowIdForRole(const json& profile, const std::string& rol
   if (!role_item.empty()) {
     return jsonString(role_item, "workflow_id");
   }
-  const json defaults = profile.value("default_runtime_host", json::object());
+  const json defaults = objectOrEmpty(profile).value("default_runtime_host", json::object());
   if (role == "online_mainline") {
     return jsonString(defaults, "online_workflow_id");
   }
@@ -356,7 +364,7 @@ fs::path compiledWorkflowPathForRole(const json& profile,
   if (workflow_id.empty()) {
     return {};
   }
-  const json defaults = profile.value("default_runtime_host", json::object());
+  const json defaults = objectOrEmpty(profile).value("default_runtime_host", json::object());
   const std::string root_ref =
       jsonString(defaults, "compiled_workflow_root", "_local_artifacts/platform-pdk/compiled-workflows");
   fs::path root(root_ref);
@@ -458,7 +466,7 @@ bool fieldDisplayRoleMatches(const json& item, const json& rule) {
 }
 
 json fieldDisplayRoleRule(const json& profile, const std::string& display_role) {
-  const json rules = profile.value("field_display_roles", json::array());
+  const json rules = objectOrEmpty(profile).value("field_display_roles", json::array());
   if (!rules.is_array()) {
     return json::object();
   }
@@ -558,7 +566,7 @@ json stateLabelFromStateOutput(const json& state_output, const json& profile) {
     }
   };
 
-  const json state_label = profile.value("state_label", json::object());
+  const json state_label = objectOrEmpty(profile).value("state_label", json::object());
   const json mappings = state_label.value("value_mappings", json::array());
   if (mappings.is_array() && !mappings.empty()) {
     for (const auto& mapping : mappings) {
@@ -635,15 +643,15 @@ json stateLabelFromOnlineFrame(const json& frame, const json& profile) {
 
 std::map<int, json> futureStateLabelsByStep(const fs::path& run_dir, const json& profile) {
   std::map<int, json> labels;
-  const json source = profile.value("future_state_label_source", json::object());
+  const json source = objectOrEmpty(profile).value("future_state_label_source", json::object());
   std::vector<std::string> producer_nodes = jsonStringArray(source, "producer_nodes");
   if (producer_nodes.empty()) {
     return labels;
   }
   const std::string output_port = jsonString(source, "output_port", "state.next");
   auto collect_packets = [&](const fs::path& packets_path, bool append_in_order, int& append_index) {
-    const json packets = readJsonIfExists(packets_path);
-    const json packet_array = packets.value("packets", json::array());
+    const json packets = objectOrEmpty(readJsonIfExists(packets_path));
+    const json packet_array = arrayOrEmpty(packets.value("packets", json::array()));
     if (!packet_array.is_array()) {
       return;
     }
@@ -657,9 +665,9 @@ std::map<int, json> futureStateLabelsByStep(const fs::path& run_dir, const json&
       if (!stringListContains(producer_nodes, node)) {
         continue;
       }
-      const json payload = packet.value("payload", json::object());
-      const json output_ports = payload.value("output_ports", json::object());
-      const json state_next = output_ports.value(output_port, json::object());
+      const json payload = objectOrEmpty(packet.value("payload", json::object()));
+      const json output_ports = objectOrEmpty(payload.value("output_ports", json::object()));
+      const json state_next = objectOrEmpty(output_ports.value(output_port, json::object()));
       const json label = stateLabelFromStateOutput(state_next, profile);
       if (label.empty()) {
         continue;
@@ -735,7 +743,7 @@ void applyStateLabel(json& item, const json& label) {
 }
 
 std::string displayRoleForPredictionArtifact(const json& item, const json& profile) {
-  const json rules = profile.value("field_display_roles", json::array());
+  const json rules = objectOrEmpty(profile).value("field_display_roles", json::array());
   if (rules.is_array()) {
     for (const auto& rule : rules) {
       if (!rule.is_object()) {
@@ -784,7 +792,7 @@ std::string inferRuntimeBranchKind(const std::string& workflow_id, const json& s
       sensor_stream.is_object() && sensor_stream.contains("frames") &&
       sensor_stream.at("frames").is_array() && !sensor_stream.at("frames").empty();
   if (has_frames) {
-    const json roles = profile.value("workflow_roles", json::array());
+    const json roles = objectOrEmpty(profile).value("workflow_roles", json::array());
     if (roles.is_array()) {
       for (const auto& item : roles) {
         if (item.is_object() && jsonBool(item, "requires_sensor_stream", false)) {
@@ -803,7 +811,7 @@ std::string inferRuntimeBranchKind(const std::string& workflow_id, const json& s
 }
 
 json branchTemplate(const json& profile, const std::string& key) {
-  const json templates = profile.value("branch_templates", json::object());
+  const json templates = objectOrEmpty(profile).value("branch_templates", json::object());
   if (templates.is_object() && templates.contains(key) && templates.at(key).is_object()) {
     return templates.at(key);
   }
@@ -839,8 +847,8 @@ std::string branchParentFromProfile(const json& profile,
 }
 
 bool matchesAccumulatedStatePolicy(const json& item, const json& profile) {
-  const json policy =
-      profile.value("health_ledger", json::object()).value("accumulated_state_match", json::object());
+  const json policy = objectOrEmpty(objectOrEmpty(profile).value("health_ledger", json::object()))
+                          .value("accumulated_state_match", json::object());
   if (!policy.is_object() || policy.empty()) {
     return false;
   }
@@ -1897,12 +1905,12 @@ fs::path PlatformRuntimeHost::runOneOnlineFrame(
 }
 
 void PlatformRuntimeHost::writeRuntimeBranchIndex(const fs::path& run_dir) const {
-  const json runtime_evidence = readJsonIfExists(run_dir / "runtime_evidence.json");
-  const json runtime_outputs = readJsonIfExists(run_dir / "runtime_outputs.json");
-  const json runtime_loop = readJsonIfExists(run_dir / "runtime_loop_summary.json");
-  const json sensor_stream = readJsonIfExists(run_dir / "sensor_stream.json");
-  const json data_plane = readJsonIfExists(run_dir / "data_plane_manifest.json");
-  const json state_checkpoint = readJsonIfExists(run_dir / "state_checkpoint.json");
+  const json runtime_evidence = objectOrEmpty(readJsonIfExists(run_dir / "runtime_evidence.json"));
+  const json runtime_outputs = objectOrEmpty(readJsonIfExists(run_dir / "runtime_outputs.json"));
+  const json runtime_loop = objectOrEmpty(readJsonIfExists(run_dir / "runtime_loop_summary.json"));
+  const json sensor_stream = objectOrEmpty(readJsonIfExists(run_dir / "sensor_stream.json"));
+  const json data_plane = objectOrEmpty(readJsonIfExists(run_dir / "data_plane_manifest.json"));
+  const json state_checkpoint = objectOrEmpty(readJsonIfExists(run_dir / "state_checkpoint.json"));
 
   const std::string run_id =
       jsonString(runtime_evidence, "run_id",
@@ -1914,7 +1922,7 @@ void PlatformRuntimeHost::writeRuntimeBranchIndex(const fs::path& run_dir) const
       jsonString(runtime_evidence, "object_id",
                  jsonString(runtime_outputs, "object_id", jsonString(sensor_stream, "object_id", object_id_)));
   const std::string generated = nowUtcIso();
-  const json initial_seed = runtime_loop.value("initial_seed", json::object());
+  const json initial_seed = objectOrEmpty(runtime_loop.value("initial_seed", json::object()));
   const std::string seed_runtime_outputs_ref =
       jsonString(initial_seed, "seed_runtime_outputs_path", jsonString(runtime_evidence, "seed_runtime_outputs_ref", ""));
   const std::string branch_kind = inferRuntimeBranchKind(workflow_id, sensor_stream, object_runtime_profile_);
@@ -1927,7 +1935,7 @@ void PlatformRuntimeHost::writeRuntimeBranchIndex(const fs::path& run_dir) const
       branch_kind == "future_prediction" ? futureStateLabelsByStep(run_dir, object_runtime_profile_) : std::map<int, json>{};
 
   json frames = json::array();
-  const json source_frames = sensor_stream.value("frames", json::array());
+  const json source_frames = arrayOrEmpty(sensor_stream.value("frames", json::array()));
   if (source_frames.is_array()) {
     for (auto frame : source_frames) {
       if (!frame.is_object()) {
@@ -1940,7 +1948,7 @@ void PlatformRuntimeHost::writeRuntimeBranchIndex(const fs::path& run_dir) const
 
   json steps = json::array();
   json series_by_id = json::object();
-  const json iterations = runtime_loop.value("iterations", json::array());
+  const json iterations = arrayOrEmpty(runtime_loop.value("iterations", json::array()));
   if (iterations.is_array()) {
     for (auto iteration : iterations) {
       if (!iteration.is_object()) {
@@ -1974,10 +1982,9 @@ void PlatformRuntimeHost::writeRuntimeBranchIndex(const fs::path& run_dir) const
       }
     }
   }
-
   json artifact_refs = json::array();
   json qoi_refs = json::array();
-  const json entries = data_plane.value("entries", json::array());
+  const json entries = arrayOrEmpty(data_plane.value("entries", json::array()));
   if (entries.is_array()) {
     for (auto entry : entries) {
       if (!entry.is_object() || jsonString(entry, "direction", "output") != "output") {
@@ -1995,13 +2002,13 @@ void PlatformRuntimeHost::writeRuntimeBranchIndex(const fs::path& run_dir) const
       if (RuntimeTimelineMaterializer::isQoiRef(entry)) {
         qoi_refs.push_back(entry);
       }
-      const json time_point = entry.value("time_point", json::object());
+      const json time_point = objectOrEmpty(entry.value("time_point", json::object()));
       const double time_s = jsonDouble(entry,
                                        "public_time_s",
                                        jsonDouble(time_point,
                                                   "run_time_s",
                                                   step_index >= 0 ? static_cast<double>(step_index) : 0.0));
-      const json stats = entry.value("statistics", json::object());
+      const json stats = objectOrEmpty(entry.value("statistics", json::object()));
       if (stats.is_object()) {
         for (auto it = stats.begin(); it != stats.end(); ++it) {
           if (!it.value().is_number()) {
@@ -2023,9 +2030,8 @@ void PlatformRuntimeHost::writeRuntimeBranchIndex(const fs::path& run_dir) const
       }
     }
   }
-
   json checkpoint_refs = json::array();
-  const json checkpoints = state_checkpoint.value("checkpoints", json::array());
+  const json checkpoints = arrayOrEmpty(state_checkpoint.value("checkpoints", json::array()));
   if (checkpoints.is_array()) {
     for (auto checkpoint : checkpoints) {
       if (!checkpoint.is_object()) {
@@ -2035,7 +2041,6 @@ void PlatformRuntimeHost::writeRuntimeBranchIndex(const fs::path& run_dir) const
       checkpoint_refs.push_back(checkpoint);
     }
   }
-
   const std::string status = jsonString(runtime_evidence, "status", "unknown");
   json branch_summary = {
       {"frame_count", frames.size()},
@@ -2045,7 +2050,7 @@ void PlatformRuntimeHost::writeRuntimeBranchIndex(const fs::path& run_dir) const
       {"checkpoint_count", checkpoint_refs.size()},
   };
   if (runtime_loop.contains("summary")) {
-    branch_summary["loop_summary"] = runtime_loop.value("summary", json::object());
+    branch_summary["loop_summary"] = objectOrEmpty(runtime_loop.value("summary", json::object()));
   }
 
   json branch = {
@@ -2933,17 +2938,17 @@ int PlatformRuntimeHost::runBranchWorker() {
       };
       aggregate_data["generated_at_utc"] = nowUtcIso();
       aggregate_data["summary"] = {
-          {"entry_count", aggregate_data.value("entries", json::array()).size()},
+          {"entry_count", arrayOrEmpty(aggregate_data.value("entries", json::array())).size()},
           {"field_artifact_count", countFieldArtifactEntries(aggregate_data)},
           {"chunk_count", chunk_index},
       };
       aggregate_checkpoint["generated_at_utc"] = nowUtcIso();
       aggregate_checkpoint["summary"] = {
-          {"checkpoint_count", aggregate_checkpoint.value("checkpoints", json::array()).size()},
+          {"checkpoint_count", arrayOrEmpty(aggregate_checkpoint.value("checkpoints", json::array())).size()},
       };
       aggregate_nodes["generated_at_utc"] = nowUtcIso();
       aggregate_nodes["summary"] = {
-          {"node_snapshot_count", aggregate_nodes.value("nodes", json::array()).size()},
+          {"node_snapshot_count", arrayOrEmpty(aggregate_nodes.value("nodes", json::array())).size()},
       };
       writeJson(options_.branch_run_dir / "runtime_loop_summary.json", aggregate_loop);
       writeJson(options_.branch_run_dir / "data_plane_manifest.json", aggregate_data);
@@ -3325,12 +3330,14 @@ int PlatformRuntimeHost::runBranchWorker() {
           "future.prediction");
       writeRuntimeBranchIndex(chunk_dir);
 
-      const json chunk_loop = readJson(chunk_dir / "runtime_loop_summary.json");
-      const json chunk_data = readJson(chunk_dir / "data_plane_manifest.json");
-      const json chunk_checkpoint = readJsonIfExists(chunk_dir / "state_checkpoint.json");
-      const json chunk_nodes = readJsonIfExists(chunk_dir / "runtime_node_snapshot.json");
+      const json chunk_loop = objectOrEmpty(readJson(chunk_dir / "runtime_loop_summary.json"));
+      const json chunk_data = objectOrEmpty(readJson(chunk_dir / "data_plane_manifest.json"));
+      const json chunk_checkpoint = objectOrEmpty(readJsonIfExists(chunk_dir / "state_checkpoint.json"));
+      const json chunk_nodes = objectOrEmpty(readJsonIfExists(chunk_dir / "runtime_node_snapshot.json"));
       const int produced_iterations =
-          jsonInt(chunk_loop.value("summary", json::object()), "iteration_count", this_chunk_iterations);
+          jsonInt(objectOrEmpty(chunk_loop.value("summary", json::object())),
+                  "iteration_count",
+                  this_chunk_iterations);
       if (produced_iterations <= 0) {
         throw std::runtime_error("Branch chunk produced zero iterations: " + pathString(chunk_dir));
       }
@@ -3339,28 +3346,28 @@ int PlatformRuntimeHost::runBranchWorker() {
       const double time_offset_s = base_dt_s > 0.0 ? base_dt_s * static_cast<double>(previous_completed) : 0.0;
       appendArrayWithMetadata(
           aggregate_loop["iterations"],
-          chunk_loop.value("iterations", json::array()),
+          arrayOrEmpty(chunk_loop.value("iterations", json::array())),
           previous_completed,
           current_chunk_index,
           chunk_dir,
           time_offset_s);
       appendArrayWithMetadata(
           aggregate_data["entries"],
-          chunk_data.value("entries", json::array()),
+          arrayOrEmpty(chunk_data.value("entries", json::array())),
           previous_completed,
           current_chunk_index,
           chunk_dir,
           time_offset_s);
       appendArrayWithMetadata(
           aggregate_checkpoint["checkpoints"],
-          chunk_checkpoint.value("checkpoints", json::array()),
+          arrayOrEmpty(chunk_checkpoint.value("checkpoints", json::array())),
           previous_completed,
           current_chunk_index,
           chunk_dir,
           time_offset_s);
       appendArrayWithMetadata(
           aggregate_nodes["nodes"],
-          chunk_nodes.value("nodes", json::array()),
+          arrayOrEmpty(chunk_nodes.value("nodes", json::array())),
           previous_completed,
           current_chunk_index,
           chunk_dir,
@@ -3868,7 +3875,7 @@ nlohmann::json PlatformRuntimeHost::buildHealthLedgerLocked() const {
   }
 
   const std::string continuity_note =
-      jsonString(object_runtime_profile_.value("health_ledger", json::object()),
+      jsonString(objectOrEmpty(object_runtime_profile_).value("health_ledger", json::object()),
                  "state_continuity_note",
                  "Prediction QoI results do not overwrite the online fact state. "
                  "Only object-declared accumulated state checkpoints can be used as restart baseline when explicitly selected.");
@@ -3922,10 +3929,11 @@ void PlatformRuntimeHost::writeHealthLedgerLocked() const {
                 {"object_id", object_id_},
                 {"generated_at_utc", nowUtcIso()},
                 {"health_ledger_ref", "health_ledger.json"},
-                {"state_continuity", ledger.value("state_continuity", json::object())},
-                {"summary", ledger.value("summary", json::object())},
+                {"state_continuity", objectOrEmpty(ledger.value("state_continuity", json::object()))},
+                {"summary", objectOrEmpty(ledger.value("summary", json::object()))},
                 {"latest_prediction_health",
-                 ledger.value("prediction_health_entries", json::object()).value("latest", json::object())},
+                 objectOrEmpty(ledger.value("prediction_health_entries", json::object()))
+                     .value("latest", json::object())},
             });
 }
 
@@ -4043,6 +4051,13 @@ void PlatformRuntimeHost::writeRuntimeIndexesLocked(const std::string& cursor_mo
                                     "iteration_count", "output_period_s", "stop_reason",
                                     "target_iterations"}) {
         if (prediction.contains(key)) {
+          const bool state_owns_branch_progress =
+              state_has_terminal_status &&
+              (key == "chunk_iterations" || key == "iteration_count" ||
+               key == "stop_reason" || key == "target_iterations");
+          if (state_owns_branch_progress && summary.contains(key)) {
+            continue;
+          }
           summary[key] = prediction.at(key);
         }
       }
@@ -4112,6 +4127,14 @@ void PlatformRuntimeHost::writeRuntimeIndexesLocked(const std::string& cursor_mo
     append_branch_timeline_items(merged_qoi_refs, branch_timeline, "qoi_refs", branch, branch_run_dir);
     append_branch_timeline_items(merged_checkpoint_refs, branch_timeline, "checkpoint_refs", branch, branch_run_dir);
 
+    int display_field_artifact_count = 0;
+    const json branch_artifact_refs = arrayOrEmpty(branch_timeline.value("artifact_refs", json::array()));
+    for (const auto& artifact_ref : branch_artifact_refs) {
+      if (artifact_ref.is_object() && jsonString(artifact_ref, "representation", "") == "artifact_ref") {
+        ++display_field_artifact_count;
+      }
+    }
+
     const json summary =
         branch.contains("summary") && branch.at("summary").is_object() ? branch.at("summary") : json::object();
     json prediction = {
@@ -4126,7 +4149,10 @@ void PlatformRuntimeHost::writeRuntimeIndexesLocked(const std::string& cursor_mo
         {"iteration_count", jsonInt(summary, "iteration_count", jsonInt(summary, "completed_iterations", 0))},
         {"target_iterations", jsonInt(summary, "target_iterations", 0)},
         {"chunk_iterations", jsonInt(summary, "chunk_iterations", 0)},
-        {"field_artifact_count", jsonInt(summary, "field_artifact_count", 0)},
+        {"field_artifact_count",
+         display_field_artifact_count > 0 ? display_field_artifact_count
+                                          : jsonInt(summary, "field_artifact_count", 0)},
+        {"field_artifact_ref_count", display_field_artifact_count},
         {"stop_reason", jsonString(summary, "stop_reason", "")},
     };
     if (summary.contains("base_dt_s")) {
@@ -4646,6 +4672,10 @@ int PlatformRuntimeHost::run() {
       return 0;
     }
     waitForPredictionBranches();
+    {
+      StateLock lock(*this);
+      writeRuntimeIndexesLocked("completed");
+    }
     {
       const json registry = readJsonIfExists(options_.chain_dir / "branch_registry.json");
       if (registry.is_object() && registry.contains("branches") && registry.at("branches").is_array()) {

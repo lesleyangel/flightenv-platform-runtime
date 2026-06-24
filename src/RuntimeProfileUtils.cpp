@@ -33,6 +33,10 @@ bool jsonBool(const nlohmann::json& value, const std::string& key, bool fallback
   return value.at(key).get<bool>();
 }
 
+nlohmann::json objectOrEmpty(const nlohmann::json& value) {
+  return value.is_object() ? value : nlohmann::json::object();
+}
+
 std::vector<std::string> jsonStringArray(const nlohmann::json& value, const std::string& key) {
   std::vector<std::string> out;
   if (!value.is_object() || !value.contains(key) || !value.at(key).is_array()) {
@@ -87,14 +91,17 @@ double findNumberRecursive(const nlohmann::json& value,
 
 std::vector<std::string> metricKeysForId(const nlohmann::json& profile, const std::string& metric_id) {
   std::vector<std::string> keys;
-  const nlohmann::json health_ledger = profile.value("health_ledger", nlohmann::json::object());
-  const nlohmann::json health_keys = health_ledger.value("metric_keys", nlohmann::json::object());
+  const nlohmann::json profile_object = objectOrEmpty(profile);
+  const nlohmann::json health_ledger = objectOrEmpty(profile_object.value("health_ledger", nlohmann::json::object()));
+  const nlohmann::json health_keys = objectOrEmpty(health_ledger.value("metric_keys", nlohmann::json::object()));
   for (const std::string& key : jsonStringArray(health_keys, metric_id)) {
     appendUnique(keys, key);
   }
 
-  const nlohmann::json termination = profile.value("termination_policy", nlohmann::json::object());
-  const nlohmann::json termination_keys = termination.value("metric_key_groups", nlohmann::json::object());
+  const nlohmann::json termination =
+      objectOrEmpty(profile_object.value("termination_policy", nlohmann::json::object()));
+  const nlohmann::json termination_keys =
+      objectOrEmpty(termination.value("metric_key_groups", nlohmann::json::object()));
   for (const std::string& key : jsonStringArray(termination_keys, metric_id)) {
     appendUnique(keys, key);
   }
@@ -120,12 +127,16 @@ double findMetricByKeys(const nlohmann::json& primary,
 
 std::vector<std::string> terminalStopReasonsFromProfile(const nlohmann::json& profile) {
   std::vector<std::string> reasons;
-  const nlohmann::json policy = profile.value("termination_policy", nlohmann::json::object());
+  const nlohmann::json policy =
+      objectOrEmpty(objectOrEmpty(profile).value("termination_policy", nlohmann::json::object()));
   for (const std::string& reason : jsonStringArray(policy, "terminal_stop_reasons")) {
     appendUnique(reasons, reason);
   }
+  if (!reasons.empty()) {
+    return reasons;
+  }
 
-  const nlohmann::json rules = policy.value("alternative_rules", nlohmann::json::object());
+  const nlohmann::json rules = objectOrEmpty(policy.value("alternative_rules", nlohmann::json::object()));
   if (rules.is_object()) {
     for (auto it = rules.begin(); it != rules.end(); ++it) {
       if (it.value().is_object()) {
@@ -145,8 +156,10 @@ nlohmann::json collectConfiguredMetrics(const nlohmann::json& primary,
                                         const nlohmann::json& secondary,
                                         const nlohmann::json& profile,
                                         const std::string& section_key) {
-  const nlohmann::json health_ledger = profile.value("health_ledger", nlohmann::json::object());
-  const nlohmann::json metric_specs = health_ledger.value(section_key, nlohmann::json::array());
+  const nlohmann::json health_ledger =
+      objectOrEmpty(objectOrEmpty(profile).value("health_ledger", nlohmann::json::object()));
+  const nlohmann::json metric_specs =
+      objectOrEmpty(health_ledger).value(section_key, nlohmann::json::array());
   nlohmann::json out = nlohmann::json::object();
   if (!metric_specs.is_array()) {
     return out;
