@@ -77,6 +77,12 @@ std::string nowUtcIso() {
   return buffer;
 }
 
+std::int64_t steadyNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 std::string pathString(const fs::path& path) {
   return path.lexically_normal().string();
 }
@@ -2109,6 +2115,7 @@ class NativeWorkflowRunner::Impl {
                                      " node=" + node_id + " reason=" + admission.reason);
           continue;
         }
+        const std::int64_t execution_started_steady_ns = steadyNowNs();
         scheduler_events.push_back({
             {"timestamp_utc", nowUtcIso()},
             {"node_id", node_id},
@@ -2122,6 +2129,7 @@ class NativeWorkflowRunner::Impl {
             {"runtime_event_time_s", loop_event.event_time_s},
             {"runtime_event_time_ns", loop_event.event_time.nanoseconds},
             {"loop_iteration_index", iteration},
+            {"execution_started_steady_ns", execution_started_steady_ns},
             {"output_period_s", cadence.output_period_s},
             {"output_period_ns", cadence.output_period.nanoseconds},
             {"effective_delta_t_s", cadence.effective_delta_t_s},
@@ -2154,6 +2162,7 @@ class NativeWorkflowRunner::Impl {
               runtime_packets.push_back(packet);
             }
           }
+          const std::int64_t execution_finished_steady_ns = steadyNowNs();
           scheduler_events.push_back({
               {"timestamp_utc", nowUtcIso()},
               {"node_id", node_id},
@@ -2166,6 +2175,12 @@ class NativeWorkflowRunner::Impl {
               {"runtime_event_time_s", loop_event.event_time_s},
               {"runtime_event_time_ns", loop_event.event_time.nanoseconds},
               {"loop_iteration_index", iteration},
+              {"execution_started_steady_ns", execution_started_steady_ns},
+              {"execution_finished_steady_ns", execution_finished_steady_ns},
+              {"execution_elapsed_ms",
+               std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::nanoseconds(execution_finished_steady_ns - execution_started_steady_ns))
+                   .count()},
               {"output_period_s", cadence.output_period_s},
               {"output_period_ns", cadence.output_period.nanoseconds},
               {"effective_delta_t_s", cadence.effective_delta_t_s},
@@ -2173,6 +2188,7 @@ class NativeWorkflowRunner::Impl {
           });
           ready_executor.completeNode(admission);
         } catch (const std::exception& exc) {
+          const std::int64_t execution_finished_steady_ns = steadyNowNs();
           ready_executor.completeNode(admission);
           appendTrace(req.run_dir, "execute_node_failed iteration=" + std::to_string(iteration) +
                                      " node=" + node_id + " reason=" + exc.what());
@@ -2198,6 +2214,12 @@ class NativeWorkflowRunner::Impl {
               {"runtime_event_time_s", loop_event.event_time_s},
               {"runtime_event_time_ns", loop_event.event_time.nanoseconds},
               {"loop_iteration_index", iteration},
+              {"execution_started_steady_ns", execution_started_steady_ns},
+              {"execution_finished_steady_ns", execution_finished_steady_ns},
+              {"execution_elapsed_ms",
+               std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::nanoseconds(execution_finished_steady_ns - execution_started_steady_ns))
+                   .count()},
           });
           stop_requested = true;
           break;
