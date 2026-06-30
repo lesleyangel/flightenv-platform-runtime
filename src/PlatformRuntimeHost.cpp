@@ -1398,8 +1398,15 @@ void PlatformRuntimeHost::resolveDefaults() {
     if (env_object_root && *env_object_root) {
       options_.object_package_root = fs::path(env_object_root);
     } else {
+      env_object_root = std::getenv("FLIGHTENV_PLATFORM_OBJECT_ROOT");
+      if (env_object_root && *env_object_root) {
+        options_.object_package_root = fs::path(env_object_root);
+      }
+    }
+    if (options_.object_package_root.empty()) {
       throw std::runtime_error(
-          "object package root is required; pass --object-package-root or set FLIGHTENV_OBJECT_PACKAGE_ROOT");
+          "object package root is required; pass --object-package-root or set "
+          "FLIGHTENV_OBJECT_PACKAGE_ROOT/FLIGHTENV_PLATFORM_OBJECT_ROOT");
     }
   }
   options_.object_package_root = fs::absolute(options_.object_package_root);

@@ -92,7 +92,7 @@ function Get-StageName {
     param([string]$NodeId)
     if ($NodeId -match "\.state_transition\.") { return "State transition" }
     if ($NodeId -match "\.observation_equation\.") { return "Observation" }
-    if ($NodeId -match "\.filter_algorithm\.") { return "Filter" }
+    if ($NodeId -match "\.online_estimation\.") { return "Estimation" }
     if ($NodeId -match "\.posterior_field_reconstruction\.") { return "Posterior fields" }
     if ($NodeId -match "\.failure_qoi\.") { return "QoI" }
     if ($NodeId -match "^future_step\.") { return "Future prediction" }
@@ -104,7 +104,7 @@ function Get-StageColor {
     switch ($Stage) {
         "State transition" { return "#2563eb" }
         "Observation" { return "#0891b2" }
-        "Filter" { return "#7c3aed" }
+        "Estimation" { return "#7c3aed" }
         "Posterior fields" { return "#16a34a" }
         "QoI" { return "#dc2626" }
         "Future prediction" { return "#ea580c" }

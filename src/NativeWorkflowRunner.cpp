@@ -28,6 +28,7 @@
 #include "FlightEnvPlatformRuntime/RuntimeTimeScheduler.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeTypedBufferStore.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeZeroCopyPolicy.hpp"
+#include "FlightEnvPlatformRuntime/estimation/RuntimeEstimationService.hpp"
 #include "FlightEnvPlatformRuntime/time/RuntimeEventQueue.hpp"
 #include "FlightEnvPlatformRuntime/time/RuntimeInputAlignment.hpp"
 #include "FlightEnvPlatformRuntime/time/RuntimeMaterialization.hpp"
@@ -1939,6 +1940,32 @@ class NativeWorkflowRunner::Impl {
     const int max_iterations = req.prepare_only ? 1 : std::max(1, jsonInt(loop_policy, "max_iterations", req.max_iterations));
     const double base_dt_s = jsonDouble(loop_policy, "base_dt_s", 0.0);
     const double output_period_s = jsonDouble(loop_policy, "output_period_s", base_dt_s);
+    if (!req.prepare_only && nodes_.empty() &&
+        estimation_plan_.value("summary", json::object()).value("estimation_system_count", 0) > 0) {
+      appendTrace(req.run_dir, "runtime_estimation_service_begin");
+      estimation::RuntimeEstimationService service;
+      estimation::RuntimeEstimationRequest estimation_request;
+      estimation_request.run_dir = req.run_dir;
+      estimation_request.compiled_workflow_dir = options_.compiled_workflow;
+      estimation_request.run_id = req.run_id;
+      estimation_request.workflow_id = workflow_id_;
+      estimation_request.object_id = object_id_;
+      estimation_request.branch_id = req.branch_id;
+      estimation_request.timeline_id = req.timeline_id;
+      estimation_request.estimation_plan = estimation_plan_;
+      estimation_request.scheduler_plan = scheduler_plan_;
+      estimation_request.workflow_snapshot = workflow_snapshot_;
+      estimation_request.external_observations = external_observations;
+      estimation_request.max_frames = max_iterations;
+      const estimation::RuntimeEstimationResult estimation_result = service.runSerial(estimation_request);
+      appendTrace(req.run_dir, "runtime_estimation_service_end frame_count=" +
+                               std::to_string(estimation_result.frame_count));
+      return NativeWorkflowResult{
+          estimation_result.exit_code,
+          estimation_result.frame_count,
+          estimation_result.failed_frame_count,
+          estimation_result.summary};
+    }
 
     if (req.prepare_only) {
       for (const auto& node : nodes_) {
@@ -2383,6 +2410,7 @@ class NativeWorkflowRunner::Impl {
     uncertainty_plan_ = readJsonIfExists(options_.compiled_workflow / "uncertainty_plan.json");
     state_store_plan_ = readJsonIfExists(options_.compiled_workflow / "state_store_plan.json");
     data_plane_plan_ = readJsonIfExists(options_.compiled_workflow / "data_plane_plan.json");
+    estimation_plan_ = readJsonIfExists(options_.compiled_workflow / "estimation_plan.json");
     edge_binding_plan_ = readJson(options_.compiled_workflow / "edge_binding_plan.json");
     workflow_snapshot_ = readJsonIfExists(options_.compiled_workflow / "workflow_snapshot.json");
     operator_snapshot_ = readJsonIfExists(options_.compiled_workflow / "operator_snapshot.json");
@@ -3124,6 +3152,7 @@ class NativeWorkflowRunner::Impl {
   json uncertainty_plan_ = json::object();
   json state_store_plan_ = json::object();
   json data_plane_plan_ = json::object();
+  json estimation_plan_ = json::object();
   json edge_binding_plan_ = json::object();
   json workflow_snapshot_ = json::object();
   json operator_snapshot_ = json::object();
