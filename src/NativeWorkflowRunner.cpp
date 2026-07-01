@@ -18,6 +18,7 @@
 #include "FlightEnvPlatform/Runtime/ThreadSafePortStore.hpp"
 #include "FlightEnvPlatformRuntime/AdapterSession.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeAdapterInvoker.hpp"
+#include "FlightEnvPlatformRuntime/RuntimeDueTimeScheduler.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeEventLoop.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeEvidenceWriter.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeNodeEvidenceBuilder.hpp"
@@ -3173,8 +3174,11 @@ class NativeWorkflowRunner::Impl {
     evidence_writer.writeJson("adapter_backend_capability_report.json", backend_capability_report);
     evidence_writer.writeJson("edge_binding_plan.json", edge_binding_plan_);
     evidence_writer.writeJson("rate_transition_plan.json", rate_transition_plan_);
+    json scheduler_due_time_trace = json::object();
     if (!scheduler_table_.empty()) {
       evidence_writer.writeJson("scheduler_table.json", scheduler_table_);
+      scheduler_due_time_trace = RuntimeDueTimeScheduler(scheduler_table_).buildTrace();
+      evidence_writer.writeJson("scheduler_due_time_trace.json", scheduler_due_time_trace);
     }
     const json time_plan_summary =
         time_plan_.contains("summary") && time_plan_.at("summary").is_object()
@@ -3187,6 +3191,10 @@ class NativeWorkflowRunner::Impl {
     const json scheduler_table_summary =
         scheduler_table_.contains("summary") && scheduler_table_.at("summary").is_object()
             ? scheduler_table_.at("summary")
+            : json::object();
+    const json scheduler_due_time_trace_summary =
+        scheduler_due_time_trace.contains("summary") && scheduler_due_time_trace.at("summary").is_object()
+            ? scheduler_due_time_trace.at("summary")
             : json::object();
     evidence_writer.writeJson(
         "runtime_evidence.json",
@@ -3239,6 +3247,16 @@ class NativeWorkflowRunner::Impl {
                   scheduler_table_summary.value("runtime_transition_entry_count", 0)},
                  {"scheduler_table_profile_schedule_override_entry_count",
                   scheduler_table_summary.value("profile_schedule_override_entry_count", 0)},
+                 {"scheduler_due_time_trace_dispatch_event_count",
+                  scheduler_due_time_trace_summary.value("dispatch_event_count", 0)},
+                 {"scheduler_due_time_trace_held_not_due_event_count",
+                  scheduler_due_time_trace_summary.value("held_not_due_event_count", 0)},
+                 {"scheduler_due_time_trace_not_due_violation_count",
+                  scheduler_due_time_trace_summary.value("not_due_violation_count", 0)},
+                 {"scheduler_due_time_trace_dependency_violation_count",
+                  scheduler_due_time_trace_summary.value("dependency_violation_count", 0)},
+                 {"scheduler_due_time_trace_digest",
+                  scheduler_due_time_trace_summary.value("trace_digest", std::string())},
                  {"ready_queue_plan_node_count", pdk_scheduler.plan_nodes.size()},
                  {"worker_pool_size", pdk_executor.options.max_workers},
                  {"pdk_workflow_process_spawned", false},
@@ -3253,6 +3271,8 @@ class NativeWorkflowRunner::Impl {
                  {"edge_binding_plan", "edge_binding_plan.json"},
                  {"rate_transition_plan", "rate_transition_plan.json"},
                  {"scheduler_table", scheduler_table_.empty() ? "" : "scheduler_table.json"},
+                 {"scheduler_due_time_trace",
+                  scheduler_due_time_trace.empty() ? "" : "scheduler_due_time_trace.json"},
                  {"data_plane_manifest", "data_plane_manifest.json"},
                  {"state_checkpoint", "state_checkpoint.json"},
                  {"sensor_stream", "sensor_stream.json"}}}});
