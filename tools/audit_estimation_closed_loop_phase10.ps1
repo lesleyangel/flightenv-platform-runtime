@@ -1,5 +1,5 @@
 param(
-    [string]$Python = "python",
+    [string]$Python = "auto",
 
     [ValidateSet('Release', 'Debug')]
     [string]$Configuration = 'Release',
@@ -26,6 +26,8 @@ $runtimeRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $workspaceHome = [System.IO.Path]::GetFullPath((Join-Path $runtimeRoot '..'))
 $objectRoot = Join-Path $workspaceHome 'flightenv-object-reentry-vehicle'
 $pdkRoot = Join-Path $workspaceHome 'flightenv-platform-pdk'
+Import-Module (Join-Path $pdkRoot 'tools\PdkPython.psm1') -Force
+$Python = Resolve-PdkPython -Python $Python -PdkRoot $pdkRoot
 $projectPath = Join-Path $runtimeRoot 'tests\EstimationClosedLoopAudit\EstimationClosedLoopAudit.vcxproj'
 $workspaceModule = Join-Path $workspaceHome 'tools\FlightEnvWorkspaceConfig.psm1'
 $phaseRoot = Join-Path $workspaceHome '_local_artifacts\platform-runtime\temporal-multirate-phase10'

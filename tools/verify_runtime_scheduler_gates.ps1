@@ -1,5 +1,5 @@
 param(
-    [string]$Python = "python",
+    [string]$Python = "auto",
 
     [ValidateSet('Release', 'Debug')]
     [string]$Configuration = 'Release',
@@ -32,6 +32,8 @@ $runtimeRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $workspaceRoot = [System.IO.Path]::GetFullPath((Join-Path $runtimeRoot '..'))
 $objectRoot = Join-Path $workspaceRoot 'flightenv-object-reentry-vehicle'
 $pdkRoot = Join-Path $workspaceRoot 'flightenv-platform-pdk'
+Import-Module (Join-Path $pdkRoot 'tools\PdkPython.psm1') -Force
+$Python = Resolve-PdkPython -Python $Python -PdkRoot $pdkRoot
 $failures = [System.Collections.Generic.List[string]]::new()
 
 function Add-Failure {

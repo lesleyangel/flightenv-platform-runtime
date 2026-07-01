@@ -1,5 +1,5 @@
 param(
-    [string]$Python = 'python',
+    [string]$Python = 'auto',
 
     [ValidateSet('Release', 'Debug')]
     [string]$Configuration = 'Release',
@@ -36,6 +36,8 @@ $runtimeRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $workspaceRoot = [System.IO.Path]::GetFullPath((Join-Path $runtimeRoot '..'))
 $objectRoot = Join-Path $workspaceRoot 'flightenv-object-reentry-vehicle'
 $pdkRoot = Join-Path $workspaceRoot 'flightenv-platform-pdk'
+Import-Module (Join-Path $pdkRoot 'tools\PdkPython.psm1') -Force
+$Python = Resolve-PdkPython -Python $Python -PdkRoot $pdkRoot
 $compiledRoot = Join-Path $workspaceRoot '_local_artifacts\platform-pdk\compiled-workflows'
 $compiledOnline = Join-Path $compiledRoot 'reentry.online_filtering_external_input.v1'
 $compiledFuture = Join-Path $compiledRoot 'reentry.posterior_future_prediction.v1'

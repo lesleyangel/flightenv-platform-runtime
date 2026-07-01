@@ -1,5 +1,5 @@
 param(
-    [string]$Python = "python",
+    [string]$Python = "auto",
 
     [ValidateSet('Release', 'Debug')]
     [string]$Configuration = 'Release',
@@ -180,6 +180,9 @@ function Invoke-SmokeAndAudit {
 $RuntimeRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $WorkspaceRoot = [System.IO.Path]::GetFullPath((Join-Path $RuntimeRoot '..'))
 $ObjectRoot = Join-Path $WorkspaceRoot 'flightenv-object-reentry-vehicle'
+$PdkRoot = Join-Path $WorkspaceRoot 'flightenv-platform-pdk'
+Import-Module (Join-Path $PdkRoot 'tools\PdkPython.psm1') -Force
+$Python = Resolve-PdkPython -Python $Python -PdkRoot $PdkRoot
 $ReportRoot = Join-Path $WorkspaceRoot '_local_artifacts\platform-runtime\temporal-multirate-phase7'
 $ReportPath = Join-Path $ReportRoot 'phase7_due_time_scheduler_audit.json'
 $ObservationStream = Resolve-ObservationStream

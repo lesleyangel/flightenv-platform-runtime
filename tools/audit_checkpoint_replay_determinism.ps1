@@ -1,5 +1,5 @@
 param(
-    [string]$Python = "python",
+    [string]$Python = "auto",
 
     [ValidateSet('Release', 'Debug')]
     [string]$Configuration = 'Release',
@@ -34,6 +34,9 @@ try {
 
 $runtimeRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $workspaceRoot = [System.IO.Path]::GetFullPath((Join-Path $runtimeRoot '..'))
+$pdkRoot = Join-Path $workspaceRoot 'flightenv-platform-pdk'
+Import-Module (Join-Path $pdkRoot 'tools\PdkPython.psm1') -Force
+$Python = Resolve-PdkPython -Python $Python -PdkRoot $pdkRoot
 $reportRoot = Join-Path $workspaceRoot '_local_artifacts\platform-runtime\scheduler-acceptance'
 $reportPath = Join-Path $reportRoot 'checkpoint_replay_determinism_audit.json'
 $smokeScript = Join-Path $runtimeRoot 'tools\run_cpp_runtime_host_smoke.ps1'
