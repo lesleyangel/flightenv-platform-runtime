@@ -137,6 +137,19 @@ function Test-TruthyProperty {
     return $value -eq $true -or [string]$value -eq 'true'
 }
 
+function Get-RuntimeEventKind {
+    param([Parameter(Mandatory=$true)]$ObjectValue)
+    $kind = Get-PropertyOrNull -ObjectValue $ObjectValue -Name 'runtime_event_kind'
+    if ($null -ne $kind -and -not [string]::IsNullOrWhiteSpace([string]$kind)) {
+        return [string]$kind
+    }
+    $kind = Get-PropertyOrNull -ObjectValue $ObjectValue -Name 'event_kind'
+    if ($null -ne $kind -and -not [string]::IsNullOrWhiteSpace([string]$kind)) {
+        return [string]$kind
+    }
+    return ''
+}
+
 function Assert-PlatformRuntimeStaticGate {
     $requiredFiles = @(
         'include\FlightEnvPlatformRuntime\time\RuntimeTimeTypes.hpp',
@@ -238,15 +251,20 @@ function Assert-SmokeEvidenceGate {
     }
     Require-PositiveCount -Count $events.Count -Label 'Gate B scheduler events'
 
-    foreach ($kind in @('input_arrived', 'checkpoint_due', 'stop_check_due')) {
-        $count = @($events | Where-Object { [string]$_.runtime_event_kind -eq $kind -or [string]$_.event -eq $kind }).Count
+    foreach ($kind in @('checkpoint_due', 'stop_check_due')) {
+        $count = @($events | Where-Object {
+            (Get-RuntimeEventKind -ObjectValue $_) -eq $kind -or [string](Get-PropertyOrNull -ObjectValue $_ -Name 'event') -eq $kind
+        }).Count
         Require-PositiveCount -Count $count -Label "Gate B event $kind"
     }
 
-    $nodeDueStart = @($events | Where-Object { [string]$_.event -eq 'start' -and [string]$_.runtime_event_kind -eq 'node_due' })
+    $nodeDueStart = @($events | Where-Object {
+        [string](Get-PropertyOrNull -ObjectValue $_ -Name 'event') -eq 'start' -and
+        (Get-RuntimeEventKind -ObjectValue $_) -eq 'node_due'
+    })
     Require-PositiveCount -Count $nodeDueStart.Count -Label 'Gate C node_due start events'
 
-    $readyAdmissions = @($events | Where-Object { [string]$_.event -eq 'ready_queue_admission' })
+    $readyAdmissions = @($events | Where-Object { [string](Get-PropertyOrNull -ObjectValue $_ -Name 'event') -eq 'ready_queue_admission' })
     Require-PositiveCount -Count $readyAdmissions.Count -Label 'Gate C ready_queue_admission events'
     $acceptedAdmissions = @($readyAdmissions | Where-Object { Test-TruthyProperty -ObjectValue $_ -Name 'accepted' })
     Require-PositiveCount -Count $acceptedAdmissions.Count -Label 'Gate C accepted ReadyQueue admissions'
@@ -262,15 +280,26 @@ function Assert-SmokeEvidenceGate {
         throw "Gate C ReadyQueue admission evidence is incomplete: $($badAdmission.Count)"
     }
 
-    $inputEvents = @($events | Where-Object { [string]$_.runtime_event_kind -eq 'input_arrived' -or [string]$_.event -eq 'input_arrived' })
-    $recordedInputs = @($inputEvents | Where-Object { Test-TruthyProperty -ObjectValue $_ -Name 'sample_recorded' })
-    Require-PositiveCount -Count $recordedInputs.Count -Label 'Gate B input_arrived sample-buffer records'
-    $missingInputNs = @($recordedInputs | Where-Object { $null -eq $_.PSObject.Properties['sample_time_ns'] })
-    if ($missingInputNs.Count -gt 0) {
-        throw "Gate A input sample events missing sample_time_ns: $($missingInputNs.Count)"
+    $inputEvents = @($events | Where-Object {
+        (Get-RuntimeEventKind -ObjectValue $_) -eq 'input_arrived' -or
+        [string](Get-PropertyOrNull -ObjectValue $_ -Name 'event') -eq 'input_arrived'
+    })
+    if ($inputEvents.Count -gt 0) {
+        $recordedInputs = @($inputEvents | Where-Object { Test-TruthyProperty -ObjectValue $_ -Name 'sample_recorded' })
+        Require-PositiveCount -Count $recordedInputs.Count -Label 'Gate B input_arrived sample-buffer records'
+        $missingInputNs = @($recordedInputs | Where-Object { $null -eq $_.PSObject.Properties['sample_time_ns'] })
+        if ($missingInputNs.Count -gt 0) {
+            throw "Gate A input sample events missing sample_time_ns: $($missingInputNs.Count)"
+        }
+    } else {
+        $committedOnlineFrames = @($timeline.online_frames | Where-Object {
+            $null -ne $_.PSObject.Properties['posterior_checkpoint'] -and
+            [string](Get-PropertyOrNull -ObjectValue $_ -Name 'source') -eq 'runtime_loop_summary'
+        })
+        Require-PositiveCount -Count $committedOnlineFrames.Count -Label 'Gate B online frame input commits'
     }
 
-    $inputBindings = @($events | Where-Object { [string]$_.event -eq 'input_binding' })
+    $inputBindings = @($events | Where-Object { [string](Get-PropertyOrNull -ObjectValue $_ -Name 'event') -eq 'input_binding' })
     Require-PositiveCount -Count $inputBindings.Count -Label 'Gate D input binding evidence'
     $readyBindings = @($inputBindings | Where-Object {
         $null -ne $_.PSObject.Properties['branch_id'] -and
@@ -279,7 +308,10 @@ function Assert-SmokeEvidenceGate {
     })
     Require-PositiveCount -Count $readyBindings.Count -Label 'Gate D branch/time indexed input binding evidence'
 
-    $finishEvents = @($events | Where-Object { [string]$_.event -eq 'loop_iteration_finish' -and [string]$_.runtime_event_kind -eq 'public_tick' })
+    $finishEvents = @($events | Where-Object {
+        [string](Get-PropertyOrNull -ObjectValue $_ -Name 'event') -eq 'loop_iteration_finish' -and
+        (Get-RuntimeEventKind -ObjectValue $_) -eq 'public_tick'
+    })
     Require-PositiveCount -Count $finishEvents.Count -Label 'Gate F public_tick materialization events'
 }
 

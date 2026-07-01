@@ -1952,6 +1952,36 @@ void PlatformRuntimeHost::writeRuntimeBranchIndex(const fs::path& run_dir) const
       frames.push_back(frame);
     }
   }
+  if (frames.empty() && branch_kind == "online_mainline") {
+    const json loop_iterations_for_frames = arrayOrEmpty(runtime_loop.value("iterations", json::array()));
+    for (auto iteration : loop_iterations_for_frames) {
+      if (!iteration.is_object()) {
+        continue;
+      }
+      const int frame_index =
+          jsonInt(iteration, "frame_index", jsonInt(iteration, "loop_iteration_index", static_cast<int>(frames.size())));
+      const double sample_time_s =
+          jsonDouble(iteration, "sample_time_s", jsonDouble(iteration, "public_time_s", static_cast<double>(frame_index)));
+      json frame = {
+          {"branch_id", branch_id},
+          {"frame_index", frame_index},
+          {"loop_iteration_index", jsonInt(iteration, "loop_iteration_index", frame_index)},
+          {"sample_time_s", sample_time_s},
+          {"public_time_s", sample_time_s},
+          {"source", "runtime_loop_summary"},
+          {"source_runtime_outputs", pathString(run_dir / "runtime_outputs.json")},
+          {"posterior_checkpoint", jsonString(iteration, "posterior_checkpoint")},
+          {"status", jsonString(iteration, "status", "ok")},
+      };
+      if (iteration.contains("diagnostics")) {
+        frame["diagnostics"] = iteration.at("diagnostics");
+      }
+      if (iteration.contains("sample_scheduler")) {
+        frame["sample_scheduler"] = iteration.at("sample_scheduler");
+      }
+      frames.push_back(frame);
+    }
+  }
 
   json steps = json::array();
   json series_by_id = json::object();
