@@ -153,19 +153,23 @@ $summaryPath = Join-Path $chainDir 'mainline_summary.json'
 if (-not (Test-Path -LiteralPath $summaryPath -PathType Leaf)) {
     throw "mainline summary not generated: $summaryPath"
 }
+$timelinePath = Join-Path $chainDir 'run_timeline_index.json'
 $deadline = (Get-Date).AddSeconds($BranchWaitTimeoutSeconds)
 do {
     $summary = Get-Content -LiteralPath $summaryPath -Encoding UTF8 -Raw | ConvertFrom-Json
     $prediction = $summary.prediction
-    $running = 0
     $runCount = 0
-    if ($null -ne $prediction.PSObject.Properties['running_branch_count']) {
-        $running = [int]$prediction.running_branch_count
-    }
     if ($null -ne $prediction.PSObject.Properties['run_count']) {
         $runCount = [int]$prediction.run_count
     }
-    if ($runCount -gt 0 -and $running -eq 0) {
+    $futureArtifactCount = 0
+    $futureQoiCount = 0
+    if (Test-Path -LiteralPath $timelinePath -PathType Leaf) {
+        $timelineProbe = Get-Content -LiteralPath $timelinePath -Encoding UTF8 -Raw | ConvertFrom-Json
+        $futureArtifactCount = @($timelineProbe.artifact_refs | Where-Object { [string]$_.branch_id -like 'predict.*' }).Count
+        $futureQoiCount = @($timelineProbe.qoi_refs | Where-Object { [string]$_.branch_id -like 'predict.*' }).Count
+    }
+    if ($runCount -gt 0 -and $futureArtifactCount -gt 0 -and $futureQoiCount -gt 0) {
         break
     }
     Start-Sleep -Milliseconds 500
@@ -199,7 +203,6 @@ function Assert-NearlyEqual {
     }
 }
 
-$timelinePath = Join-Path $chainDir 'run_timeline_index.json'
 if (-not (Test-Path -LiteralPath $timelinePath -PathType Leaf)) {
     throw "run timeline index not generated: $timelinePath"
 }

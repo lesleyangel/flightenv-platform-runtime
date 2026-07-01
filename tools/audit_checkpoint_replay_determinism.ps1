@@ -140,8 +140,8 @@ function Normalize-Shape {
 }
 
 function Get-StableHash {
-    param([Parameter(Mandatory=$true)][object]$Value)
-    $json = $Value | ConvertTo-Json -Depth 96 -Compress
+    param([object]$Value)
+    $json = if ($null -eq $Value) { 'null' } else { $Value | ConvertTo-Json -Depth 96 -Compress }
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
