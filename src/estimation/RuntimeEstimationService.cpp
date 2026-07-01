@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <optional>
 #include <stdexcept>
 
 namespace FlightEnvPlatformRuntime::estimation {
@@ -80,6 +81,7 @@ nlohmann::json frameEvidence(const PosteriorFrame& frame) {
       {"commit_barrier", frame.committed ? "posterior_commit" : "uncommitted"},
       {"state_mean", vectorJson(frame.state_mean)},
       {"covariance_diag", vectorJson(frame.covariance_diag)},
+      {"estimator_state_available", frame.estimator_state.is_object() && !frame.estimator_state.empty()},
       {"diagnostics", frame.diagnostics},
   };
 }
@@ -148,6 +150,14 @@ int jsonInt(const nlohmann::json& value, const std::string& key, int fallback = 
     return static_cast<int>(item.get<double>());
   }
   return fallback;
+}
+
+double jsonDouble(const nlohmann::json& value, const std::string& key, double fallback = 0.0) {
+  if (!value.is_object() || !value.contains(key) || !value.at(key).is_number()) {
+    return fallback;
+  }
+  const double parsed = value.at(key).get<double>();
+  return std::isfinite(parsed) ? parsed : fallback;
 }
 
 bool shouldTriggerBranch(
@@ -242,7 +252,188 @@ nlohmann::json branchTriggerEvent(
       {"seed_policy", policy.value("seed_policy", std::string("latest_checkpoint"))},
       {"cause_event_id", frame.commit_id.empty() ? "posterior_commit." + std::to_string(frame.frame_index) : frame.commit_id},
       {"status", target_workflow_id.empty() ? "declared_without_target" : "ready_to_start"},
+      {"forecast_state_access", "committed_checkpoint_read_only"},
+      {"forecast_mutates_online_posterior", false},
   };
+}
+
+std::vector<double> doubleVectorFromJson(const nlohmann::json& values) {
+  std::vector<double> out;
+  if (!values.is_array()) {
+    return out;
+  }
+  out.reserve(values.size());
+  for (const auto& item : values) {
+    if (!item.is_number()) {
+      out.push_back(0.0);
+      continue;
+    }
+    const double value = item.get<double>();
+    out.push_back(std::isfinite(value) ? value : 0.0);
+  }
+  return out;
+}
+
+std::vector<std::string> stringVectorFromJson(const nlohmann::json& values) {
+  std::vector<std::string> out;
+  if (!values.is_array()) {
+    return out;
+  }
+  out.reserve(values.size());
+  for (const auto& item : values) {
+    out.push_back(item.is_string() ? item.get<std::string>() : std::string());
+  }
+  return out;
+}
+
+std::vector<std::string> defaultLabels(std::size_t state_dim) {
+  std::vector<std::string> labels;
+  labels.reserve(state_dim);
+  for (std::size_t i = 0; i < state_dim; ++i) {
+    labels.push_back("state_" + std::to_string(i));
+  }
+  return labels;
+}
+
+std::size_t resolveStateDim(const RuntimeObservationInbox& inbox) {
+  for (const RuntimeObservationFrame& frame : inbox.frames()) {
+    if (!frame.values.empty()) {
+      return frame.values.size();
+    }
+  }
+  return 1;
+}
+
+double resolveLateObservationTolerance(const nlohmann::json& system) {
+  const nlohmann::json diagnostics = system.value("diagnostics_policy", nlohmann::json::object());
+  if (diagnostics.is_object() && diagnostics.contains("late_observation_tolerance_s") &&
+      diagnostics.at("late_observation_tolerance_s").is_number()) {
+    return std::max(0.0, diagnostics.at("late_observation_tolerance_s").get<double>());
+  }
+  return 0.0;
+}
+
+nlohmann::json observationTimingEvidence(
+    const RuntimeObservationFrame& observation,
+    double late_tolerance_s,
+    double previous_sample_time_s,
+    bool has_previous_sample_time) {
+  const bool late_by_arrival =
+      observation.has_arrival_time &&
+      observation.arrival_time_s > observation.sample_time_s + late_tolerance_s;
+  const bool late = observation.explicit_late_observation || late_by_arrival;
+  const bool missing = observation.missing_observation;
+  const double sample_delta_s = has_previous_sample_time
+                                    ? observation.sample_time_s - previous_sample_time_s
+                                    : 0.0;
+  return {
+      {"event", "observation_timing"},
+      {"event_kind", "observation_timing"},
+      {"runtime_event_kind", "observation_timing"},
+      {"frame_index", observation.frame_index},
+      {"sample_time_s", observation.sample_time_s},
+      {"arrival_time_s", observation.arrival_time_s},
+      {"has_arrival_time", observation.has_arrival_time},
+      {"late_observation", late},
+      {"late_by_arrival_time", late_by_arrival},
+      {"late_observation_declared", observation.explicit_late_observation},
+      {"missing_observation", missing},
+      {"observation_status", missing ? "missing" : (late ? "late" : "available")},
+      {"late_tolerance_s", late_tolerance_s},
+      {"observation_age_s", observation.has_arrival_time ? observation.arrival_time_s - observation.sample_time_s : 0.0},
+      {"sample_delta_s", sample_delta_s},
+      {"has_previous_sample_time", has_previous_sample_time},
+      {"value_count", observation.values.size()},
+      {"source_summary", observation.source_summary},
+  };
+}
+
+void attachObservationTiming(nlohmann::json& event, const nlohmann::json& timing) {
+  event["observation_status"] = timing.value("observation_status", std::string("available"));
+  event["missing_observation"] = timing.value("missing_observation", false);
+  event["late_observation"] = timing.value("late_observation", false);
+  event["arrival_time_s"] = timing.value("arrival_time_s", 0.0);
+  event["observation_age_s"] = timing.value("observation_age_s", 0.0);
+  event["sample_delta_s"] = timing.value("sample_delta_s", 0.0);
+}
+
+std::optional<PosteriorFrame> restorePosteriorFrame(
+    const RuntimeEstimationRequest& request,
+    IEstimatorMethod& method) {
+  const nlohmann::json checkpoint_doc = request.resume_state_checkpoint;
+  if (!checkpoint_doc.is_object()) {
+    return std::nullopt;
+  }
+  nlohmann::json selected = nlohmann::json::object();
+  const nlohmann::json checkpoints = checkpoint_doc.value("checkpoints", nlohmann::json::array());
+  if (checkpoints.is_array()) {
+    for (const auto& item : checkpoints) {
+      if (!item.is_object() || !item.value("committed", false)) {
+        continue;
+      }
+      if (!request.resume_checkpoint_id.empty() &&
+          item.value("checkpoint_id", std::string()) != request.resume_checkpoint_id) {
+        continue;
+      }
+      selected = item;
+    }
+  } else if (checkpoint_doc.contains("checkpoint_id")) {
+    selected = checkpoint_doc;
+  }
+  if (!selected.is_object() || selected.empty()) {
+    return std::nullopt;
+  }
+  PosteriorFrame frame;
+  frame.frame_index = jsonInt(selected, "frame_index", 0);
+  frame.sample_time_s = jsonDouble(selected, "sample_time_s", 0.0);
+  frame.checkpoint_id = jsonString(selected, "checkpoint_id");
+  frame.commit_id = jsonString(selected, "commit_id");
+  frame.committed = selected.value("committed", true);
+  frame.value_labels = stringVectorFromJson(selected.value("labels", nlohmann::json::array()));
+  frame.state_mean = doubleVectorFromJson(selected.value("state_mean", nlohmann::json::array()));
+  frame.covariance_diag = doubleVectorFromJson(selected.value("covariance_diag", nlohmann::json::array()));
+  frame.estimator_state = selected.value("estimator_state", nlohmann::json::object());
+  frame.diagnostics = selected.value("diagnostics", nlohmann::json::object());
+  if (!frame.estimator_state.empty()) {
+    method.restoreState(frame.estimator_state);
+  }
+  return frame;
+}
+
+PosteriorFrame predictOnlyPosterior(
+    const RuntimeObservationFrame& observation,
+    const PosteriorFrame* previous,
+    std::size_t state_dim,
+    const std::string& method_kind,
+    const nlohmann::json& estimator_state) {
+  PosteriorFrame posterior;
+  posterior.frame_index = observation.frame_index;
+  posterior.sample_time_s = observation.sample_time_s;
+  posterior.checkpoint_id = "posterior." + method_kind + ".frame_" +
+                            std::to_string(observation.frame_index) + ".predict_only";
+  posterior.value_labels = previous && !previous->value_labels.empty()
+                               ? previous->value_labels
+                               : defaultLabels(state_dim);
+  posterior.state_mean = previous && !previous->state_mean.empty()
+                             ? previous->state_mean
+                             : std::vector<double>(state_dim, 0.0);
+  posterior.covariance_diag = previous && !previous->covariance_diag.empty()
+                                  ? previous->covariance_diag
+                                  : std::vector<double>(state_dim, 1.0);
+  posterior.state_mean.resize(state_dim, 0.0);
+  posterior.covariance_diag.resize(state_dim, 1.0);
+  for (double& value : posterior.covariance_diag) {
+    value = std::max(1.0e-9, value + 1.0e-6);
+  }
+  posterior.estimator_state = estimator_state;
+  posterior.diagnostics = {
+      {"predict_only", true},
+      {"missing_observation", true},
+      {"posterior_checkpoint", posterior.checkpoint_id},
+      {"previous_checkpoint", previous ? previous->checkpoint_id : std::string()},
+      {"state_dim", state_dim},
+  };
+  return posterior;
 }
 
 RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, const std::string& execution_mode) {
@@ -263,9 +454,11 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
   if (method_kind.empty()) {
     throw std::runtime_error("estimation method.kind is missing");
   }
-  const std::size_t state_dim = std::max<std::size_t>(1, inbox.frames().front().values.size());
+  const std::size_t state_dim = std::max<std::size_t>(1, resolveStateDim(inbox));
   std::unique_ptr<IEstimatorMethod> method = EstimatorMethodRegistry::create(method_kind);
   method->configure(method_config, state_dim);
+  const std::optional<PosteriorFrame> resumed_frame = restorePosteriorFrame(request, *method);
+  const bool resumed_from_checkpoint = resumed_frame.has_value();
 
   SampleSetStore store;
   SampleScheduler sample_scheduler;
@@ -276,11 +469,20 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
   nlohmann::json branch_events = nlohmann::json::array();
   nlohmann::json filter_phase_events = nlohmann::json::array();
   nlohmann::json commit_log = nlohmann::json::array();
+  nlohmann::json observation_timing_events = nlohmann::json::array();
   const nlohmann::json workflow = workflowFromSnapshot(request.workflow_snapshot);
   const nlohmann::json branching_policy = workflow.value("branching_policy", nlohmann::json::object());
   const std::string stage_id = jsonString(system, "compiled_stage_id", "online_current.online_estimation");
   const nlohmann::json profile_schedule_overrides =
       system.value("profile_schedule_overrides", nlohmann::json::array());
+  const double late_observation_tolerance_s = resolveLateObservationTolerance(system);
+  int missing_observation_count = 0;
+  int late_observation_count = 0;
+  int predict_only_frame_count = 0;
+  int update_frame_count = 0;
+  int variable_sample_delta_count = 0;
+  bool has_previous_sample_time = resumed_from_checkpoint;
+  double previous_sample_time_s = resumed_from_checkpoint ? resumed_frame->sample_time_s : 0.0;
   scheduler_events.push_back({
       {"timestamp_utc", RuntimeClock::nowUtcIso()},
       {"event", "estimation_session_begin"},
@@ -289,18 +491,68 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
       {"method", method_kind},
       {"frame_count", inbox.size()},
       {"execution_mode", execution_mode},
+      {"resumed_from_checkpoint", resumed_from_checkpoint},
   });
+  if (resumed_from_checkpoint) {
+    scheduler_events.push_back({
+        {"timestamp_utc", RuntimeClock::nowUtcIso()},
+        {"event", "filter_resume_checkpoint"},
+        {"event_kind", "filter_resume_checkpoint"},
+        {"runtime_event_kind", "filter_resume_checkpoint"},
+        {"stage_id", stage_id},
+        {"status", "restored"},
+        {"checkpoint_id", resumed_frame->checkpoint_id},
+        {"posterior_commit_id", resumed_frame->commit_id},
+        {"frame_index", resumed_frame->frame_index},
+        {"sample_time_s", resumed_frame->sample_time_s},
+        {"committed", resumed_frame->committed},
+        {"estimator_state_restored", resumed_frame->estimator_state.is_object() && !resumed_frame->estimator_state.empty()},
+        {"source_state_visibility", "committed_only"},
+    });
+  }
 
   for (const RuntimeObservationFrame& observation : inbox.frames()) {
     nlohmann::json frame_phase_events = nlohmann::json::array();
+    nlohmann::json observation_timing = observationTimingEvidence(
+        observation,
+        late_observation_tolerance_s,
+        previous_sample_time_s,
+        has_previous_sample_time);
+    observation_timing["timestamp_utc"] = RuntimeClock::nowUtcIso();
+    observation_timing["stage_id"] = stage_id;
+    observation_timing_events.push_back(observation_timing);
+    scheduler_events.push_back(observation_timing);
+    const bool missing_observation = observation_timing.value("missing_observation", false);
+    const bool late_observation = observation_timing.value("late_observation", false);
+    if (missing_observation) {
+      ++missing_observation_count;
+    }
+    if (late_observation) {
+      ++late_observation_count;
+    }
+    const double current_sample_delta_s = observation_timing.value("sample_delta_s", 0.0);
+    if (has_previous_sample_time && std::abs(current_sample_delta_s) > 1.0e-12) {
+      if (observation_timing_events.size() > 2) {
+        const auto& previous_timing = observation_timing_events.at(observation_timing_events.size() - 2);
+        const double previous_delta = previous_timing.value("sample_delta_s", current_sample_delta_s);
+        if (std::abs(previous_delta) > 1.0e-12 &&
+            std::abs(previous_delta - current_sample_delta_s) > 1.0e-9) {
+          ++variable_sample_delta_count;
+        }
+      }
+    }
     scheduler_events.push_back({
         {"timestamp_utc", RuntimeClock::nowUtcIso()},
         {"event", "estimation_frame_begin"},
         {"stage_id", stage_id},
         {"frame_index", observation.frame_index},
         {"sample_time_s", observation.sample_time_s},
+        {"observation_timing", observation_timing},
     });
     const PosteriorFrame* previous_frame = store.latest();
+    if (previous_frame == nullptr && resumed_from_checkpoint) {
+      previous_frame = &(*resumed_frame);
+    }
     const std::string previous_checkpoint =
         previous_frame == nullptr ? std::string() : previous_frame->checkpoint_id;
     RuntimeSampleSchedulingRequest sample_request;
@@ -340,14 +592,29 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
         previous_checkpoint,
         "",
         "");
+    attachObservationTiming(predict_event, observation_timing);
     predict_event["sample_scheduler"] = compactSampleScheduleDiagnostics(sample_schedule);
     scheduler_events.push_back(predict_event);
     filter_phase_events.push_back(predict_event);
     frame_phase_events.push_back(predict_event);
-    EstimatorStepRequest step_request;
-    step_request.observation = observation;
-    step_request.previous = previous_frame;
-    EstimatorStepResult step_result = method->step(step_request);
+    EstimatorStepResult step_result;
+    if (missing_observation) {
+      ++predict_only_frame_count;
+      step_result.posterior = predictOnlyPosterior(
+          observation,
+          previous_frame,
+          state_dim,
+          method_kind,
+          method->snapshotState());
+      step_result.evidence = step_result.posterior.diagnostics;
+    } else {
+      ++update_frame_count;
+      EstimatorStepRequest step_request;
+      step_request.observation = observation;
+      step_request.previous = previous_frame;
+      step_result = method->step(step_request);
+      step_result.posterior.estimator_state = method->snapshotState();
+    }
     step_result.posterior.commit_id = posteriorCommitId(request, observation.frame_index);
     step_result.posterior.committed = false;
     step_result.posterior.diagnostics["sample_scheduler"] =
@@ -355,9 +622,15 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
     step_result.posterior.diagnostics["posterior_commit_id"] = step_result.posterior.commit_id;
     step_result.posterior.diagnostics["posterior_committed"] = true;
     step_result.posterior.diagnostics["filter_execution_mode"] = execution_mode;
+    step_result.posterior.diagnostics["missing_observation"] = missing_observation;
+    step_result.posterior.diagnostics["late_observation"] = late_observation;
+    step_result.posterior.diagnostics["observation_status"] =
+        observation_timing.value("observation_status", std::string("available"));
+    step_result.posterior.diagnostics["predict_only"] = missing_observation;
+    step_result.posterior.diagnostics["observation_timing"] = observation_timing;
     nlohmann::json update_event = filterPhaseEvent(
         "filter_update",
-        "completed",
+        missing_observation ? "skipped" : "completed",
         stage_id,
         observation,
         request.branch_id,
@@ -365,7 +638,12 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
         previous_checkpoint,
         step_result.posterior.checkpoint_id,
         "");
+    attachObservationTiming(update_event, observation_timing);
     update_event["diagnostics"] = step_result.posterior.diagnostics;
+    if (missing_observation) {
+      update_event["reason"] = "missing_observation";
+      update_event["predict_only"] = true;
+    }
     scheduler_events.push_back(update_event);
     filter_phase_events.push_back(update_event);
     frame_phase_events.push_back(update_event);
@@ -381,8 +659,12 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
         previous_checkpoint,
         step_result.posterior.checkpoint_id,
         step_result.posterior.commit_id);
+    attachObservationTiming(commit_event, observation_timing);
     commit_event["checkpoint_id"] = step_result.posterior.checkpoint_id;
     commit_event["committed"] = true;
+    commit_event["predict_only"] = missing_observation;
+    commit_event["estimator_state_checkpointed"] =
+        step_result.posterior.estimator_state.is_object() && !step_result.posterior.estimator_state.empty();
     scheduler_events.push_back(commit_event);
     filter_phase_events.push_back(commit_event);
     frame_phase_events.push_back(commit_event);
@@ -393,6 +675,10 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
         {"posterior_commit_id", step_result.posterior.commit_id},
         {"posterior_committed", true},
         {"commit_barrier", "posterior_commit"},
+        {"predict_only", missing_observation},
+        {"missing_observation", missing_observation},
+        {"late_observation", late_observation},
+        {"observation_status", observation_timing.value("observation_status", std::string("available"))},
     });
     frame_evidence.push_back(frameEvidence(step_result.posterior));
     const int processed_frame_count = static_cast<int>(store.frames().size());
@@ -411,6 +697,9 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
         {"posterior_commit_id", step_result.posterior.commit_id},
         {"posterior_committed", step_result.posterior.committed},
         {"commit_barrier", "posterior_commit"},
+        {"predict_only", missing_observation},
+        {"missing_observation", missing_observation},
+        {"late_observation", late_observation},
         {"filter_phase_events", frame_phase_events},
         {"diagnostics", step_result.posterior.diagnostics},
         {"sample_scheduler", compactSampleScheduleDiagnostics(sample_schedule)},
@@ -423,7 +712,10 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
         {"sample_time_s", observation.sample_time_s},
         {"status", "ok"},
         {"diagnostics", step_result.posterior.diagnostics},
+        {"observation_timing", observation_timing},
     });
+    previous_sample_time_s = observation.sample_time_s;
+    has_previous_sample_time = true;
   }
 
   const PosteriorFrame* latest = store.latest();
@@ -475,9 +767,24 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
             profile_schedule_overrides.is_array() ? profile_schedule_overrides.size() : 0},
            {"state_dim", state_dim},
            {"failed_frame_count", 0},
+           {"missing_observation_count", missing_observation_count},
+           {"late_observation_count", late_observation_count},
+           {"predict_only_frame_count", predict_only_frame_count},
+           {"update_frame_count", update_frame_count},
+           {"variable_sample_delta_count", variable_sample_delta_count},
+           {"resumed_from_checkpoint", resumed_from_checkpoint},
+           {"resume_checkpoint_id", resumed_from_checkpoint ? resumed_frame->checkpoint_id : std::string()},
            {"latest_checkpoint", latest->checkpoint_id},
            {"latest_commit_id", latest->commit_id},
            {"latest_diagnostics", latest->diagnostics},
+       }},
+      {"observation_timing",
+       {
+           {"late_observation_tolerance_s", late_observation_tolerance_s},
+           {"missing_observation_count", missing_observation_count},
+           {"late_observation_count", late_observation_count},
+           {"variable_sample_delta_count", variable_sample_delta_count},
+           {"events", observation_timing_events},
        }},
       {"filter_commit",
        {
@@ -486,8 +793,19 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
            {"commit_barrier", "posterior_commit"},
            {"source_state_visibility", "committed_only"},
            {"committed_frame_count", commit_log.size()},
+           {"predict_only_frame_count", predict_only_frame_count},
+           {"update_frame_count", update_frame_count},
            {"events", filter_phase_events},
            {"commit_log", commit_log},
+       }},
+      {"checkpoint_resume",
+       {
+           {"resumed_from_checkpoint", resumed_from_checkpoint},
+           {"checkpoint_id", resumed_from_checkpoint ? resumed_frame->checkpoint_id : std::string()},
+           {"posterior_commit_id", resumed_from_checkpoint ? resumed_frame->commit_id : std::string()},
+           {"estimator_state_restored",
+            resumed_from_checkpoint && resumed_frame->estimator_state.is_object() && !resumed_frame->estimator_state.empty()},
+           {"source_state_visibility", "committed_only"},
        }},
       {"sample_scheduler",
        {
@@ -569,7 +887,15 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
                      {{"phase_model", "predict_update_commit"},
                       {"commit_barrier", "posterior_commit"},
                       {"source_state_visibility", "committed_only"},
-                      {"committed_frame_count", commit_log.size()}}},
+                      {"committed_frame_count", commit_log.size()},
+                      {"predict_only_frame_count", predict_only_frame_count},
+                      {"update_frame_count", update_frame_count}}},
+                    {"checkpoint_resume",
+                     {{"resumed_from_checkpoint", resumed_from_checkpoint},
+                      {"checkpoint_id", resumed_from_checkpoint ? resumed_frame->checkpoint_id : std::string()},
+                      {"posterior_commit_id", resumed_from_checkpoint ? resumed_frame->commit_id : std::string()},
+                      {"estimator_state_restored",
+                       resumed_from_checkpoint && resumed_frame->estimator_state.is_object() && !resumed_frame->estimator_state.empty()}}},
                     {"compiled_workflow_dir", request.compiled_workflow_dir.string()},
                     {"summary",
                      {{"node_count", 1},
@@ -579,6 +905,12 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
                       {"estimation_method", method_kind},
                       {"sample_scheduler_frame_count", sample_scheduler_frames.size()},
                       {"committed_frame_count", commit_log.size()},
+                      {"missing_observation_count", missing_observation_count},
+                      {"late_observation_count", late_observation_count},
+                      {"predict_only_frame_count", predict_only_frame_count},
+                      {"update_frame_count", update_frame_count},
+                      {"variable_sample_delta_count", variable_sample_delta_count},
+                      {"resumed_from_checkpoint", resumed_from_checkpoint},
                       {"estimation_profile_schedule_override_count",
                        profile_schedule_overrides.is_array() ? profile_schedule_overrides.size() : 0},
                       {"triggered_branch_count", branch_events.size()},
@@ -609,6 +941,10 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
       {"latest_checkpoint", latest->checkpoint_id},
       {"latest_commit_id", latest->commit_id},
       {"committed_frame_count", commit_log.size()},
+      {"missing_observation_count", missing_observation_count},
+      {"late_observation_count", late_observation_count},
+      {"predict_only_frame_count", predict_only_frame_count},
+      {"resumed_from_checkpoint", resumed_from_checkpoint},
   };
   return result;
 }

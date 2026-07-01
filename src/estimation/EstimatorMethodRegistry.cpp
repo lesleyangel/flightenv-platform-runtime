@@ -55,6 +55,52 @@ nlohmann::json vectorJson(const std::vector<double>& values) {
   return out;
 }
 
+std::vector<double> doubleVectorFromJson(const nlohmann::json& values, std::size_t fallback_size, double fallback = 0.0) {
+  std::vector<double> out(fallback_size, fallback);
+  if (!values.is_array()) {
+    return out;
+  }
+  out.clear();
+  out.reserve(values.size());
+  for (const auto& item : values) {
+    if (!item.is_number()) {
+      out.push_back(fallback);
+      continue;
+    }
+    const double value = item.get<double>();
+    out.push_back(std::isfinite(value) ? value : fallback);
+  }
+  return out;
+}
+
+nlohmann::json matrixJson(const std::vector<std::vector<double>>& values) {
+  nlohmann::json out = nlohmann::json::array();
+  for (const auto& row : values) {
+    out.push_back(vectorJson(row));
+  }
+  return out;
+}
+
+std::vector<std::vector<double>> matrixFromJson(
+    const nlohmann::json& values,
+    std::size_t expected_cols) {
+  std::vector<std::vector<double>> out;
+  if (!values.is_array()) {
+    return out;
+  }
+  out.reserve(values.size());
+  for (const auto& row : values) {
+    std::vector<double> parsed = doubleVectorFromJson(row, expected_cols, 0.0);
+    if (parsed.size() < expected_cols) {
+      parsed.resize(expected_cols, 0.0);
+    } else if (parsed.size() > expected_cols) {
+      parsed.resize(expected_cols);
+    }
+    out.push_back(std::move(parsed));
+  }
+  return out;
+}
+
 std::vector<double> resizedDiagConfig(
     const nlohmann::json& method_config,
     const std::string& key,
@@ -159,6 +205,49 @@ class ParticleFilterMethod final : public IEstimatorMethod {
         {"posterior_checkpoint", posterior.checkpoint_id},
     };
     return {posterior, posterior.diagnostics};
+  }
+
+  nlohmann::json snapshotState() const override {
+    return {
+        {"method_kind", kind()},
+        {"state_dim", state_dim_},
+        {"particle_count", particle_count_},
+        {"ess_threshold_ratio", ess_threshold_ratio_},
+        {"resampling", resampling_},
+        {"resampling_count", resampling_count_},
+        {"particles", matrixJson(particles_)},
+        {"weights", vectorJson(weights_)},
+        {"initialized", !particles_.empty()},
+    };
+  }
+
+  void restoreState(const nlohmann::json& state) override {
+    if (!state.is_object()) {
+      return;
+    }
+    const std::size_t restored_dim = static_cast<std::size_t>(std::max(1, state.value("state_dim", static_cast<int>(state_dim_))));
+    state_dim_ = restored_dim;
+    particle_count_ = std::max(1, state.value("particle_count", particle_count_));
+    ess_threshold_ratio_ = state.value("ess_threshold_ratio", ess_threshold_ratio_);
+    resampling_ = state.value("resampling", resampling_);
+    resampling_count_ = state.value("resampling_count", resampling_count_);
+    particles_ = matrixFromJson(state.value("particles", nlohmann::json::array()), state_dim_);
+    weights_ = doubleVectorFromJson(state.value("weights", nlohmann::json::array()), particles_.size(), 0.0);
+    if (particles_.empty() || weights_.size() != particles_.size()) {
+      particles_.clear();
+      weights_.clear();
+      return;
+    }
+    particle_count_ = static_cast<int>(particles_.size());
+    double weight_sum = std::accumulate(weights_.begin(), weights_.end(), 0.0);
+    if (weight_sum <= 0.0 || !std::isfinite(weight_sum)) {
+      const double uniform = 1.0 / static_cast<double>(particle_count_);
+      std::fill(weights_.begin(), weights_.end(), uniform);
+    } else {
+      for (double& weight : weights_) {
+        weight /= weight_sum;
+      }
+    }
   }
 
  private:
@@ -275,6 +364,38 @@ class BlackboxUnscentedKalmanMethod final : public IEstimatorMethod {
     return {posterior, posterior.diagnostics};
   }
 
+  nlohmann::json snapshotState() const override {
+    return {
+        {"method_kind", kind()},
+        {"state_dim", state_dim_},
+        {"alpha", alpha_},
+        {"beta", beta_},
+        {"kappa", kappa_},
+        {"covariance_jitter", covariance_jitter_},
+        {"initialized", initialized_},
+        {"jitter_count", jitter_count_},
+        {"mean", vectorJson(mean_)},
+        {"covariance_diag", vectorJson(covariance_diag_)},
+    };
+  }
+
+  void restoreState(const nlohmann::json& state) override {
+    if (!state.is_object()) {
+      return;
+    }
+    state_dim_ = static_cast<std::size_t>(std::max(1, state.value("state_dim", static_cast<int>(state_dim_))));
+    alpha_ = state.value("alpha", alpha_);
+    beta_ = state.value("beta", beta_);
+    kappa_ = state.value("kappa", kappa_);
+    covariance_jitter_ = state.value("covariance_jitter", covariance_jitter_);
+    initialized_ = state.value("initialized", initialized_);
+    jitter_count_ = state.value("jitter_count", jitter_count_);
+    mean_ = doubleVectorFromJson(state.value("mean", nlohmann::json::array()), state_dim_, 0.0);
+    covariance_diag_ = doubleVectorFromJson(state.value("covariance_diag", nlohmann::json::array()), state_dim_, 1.0);
+    mean_.resize(state_dim_, 0.0);
+    covariance_diag_.resize(state_dim_, 1.0);
+  }
+
  private:
   std::vector<std::vector<double>> buildSigmaPoints() const {
     std::vector<std::vector<double>> points;
@@ -373,6 +494,40 @@ class ExtendedKalmanMethod final : public IEstimatorMethod {
     return {posterior, posterior.diagnostics};
   }
 
+  nlohmann::json snapshotState() const override {
+    return {
+        {"method_kind", kind()},
+        {"state_dim", state_dim_},
+        {"linearization", linearization_},
+        {"jacobian_provider", jacobian_provider_},
+        {"innovation_gate_sigma", innovation_gate_sigma_},
+        {"initialized", initialized_},
+        {"mean", vectorJson(mean_)},
+        {"covariance_diag", vectorJson(covariance_diag_)},
+        {"process_noise_diag", vectorJson(process_noise_diag_)},
+        {"measurement_noise_diag", vectorJson(measurement_noise_diag_)},
+    };
+  }
+
+  void restoreState(const nlohmann::json& state) override {
+    if (!state.is_object()) {
+      return;
+    }
+    state_dim_ = static_cast<std::size_t>(std::max(1, state.value("state_dim", static_cast<int>(state_dim_))));
+    linearization_ = state.value("linearization", linearization_);
+    jacobian_provider_ = state.value("jacobian_provider", jacobian_provider_);
+    innovation_gate_sigma_ = state.value("innovation_gate_sigma", innovation_gate_sigma_);
+    initialized_ = state.value("initialized", initialized_);
+    mean_ = doubleVectorFromJson(state.value("mean", nlohmann::json::array()), state_dim_, 0.0);
+    covariance_diag_ = doubleVectorFromJson(state.value("covariance_diag", nlohmann::json::array()), state_dim_, 1.0);
+    process_noise_diag_ = doubleVectorFromJson(state.value("process_noise_diag", nlohmann::json::array()), state_dim_, 1.0e-3);
+    measurement_noise_diag_ = doubleVectorFromJson(state.value("measurement_noise_diag", nlohmann::json::array()), state_dim_, 1.0);
+    mean_.resize(state_dim_, 0.0);
+    covariance_diag_.resize(state_dim_, 1.0);
+    process_noise_diag_.resize(state_dim_, 1.0e-3);
+    measurement_noise_diag_.resize(state_dim_, 1.0);
+  }
+
  private:
   std::size_t state_dim_ = 1;
   std::string linearization_ = "finite_difference";
@@ -446,6 +601,36 @@ class EnsembleKalmanMethod final : public IEstimatorMethod {
         {"method_skeleton", true},
     };
     return {posterior, posterior.diagnostics};
+  }
+
+  nlohmann::json snapshotState() const override {
+    return {
+        {"method_kind", kind()},
+        {"state_dim", state_dim_},
+        {"ensemble_size", ensemble_size_},
+        {"inflation_factor", inflation_factor_},
+        {"localization", localization_},
+        {"initialized", initialized_},
+        {"ensemble_mean", vectorJson(ensemble_mean_)},
+        {"ensemble", matrixJson(ensemble_)},
+    };
+  }
+
+  void restoreState(const nlohmann::json& state) override {
+    if (!state.is_object()) {
+      return;
+    }
+    state_dim_ = static_cast<std::size_t>(std::max(1, state.value("state_dim", static_cast<int>(state_dim_))));
+    ensemble_size_ = std::max(1, state.value("ensemble_size", ensemble_size_));
+    inflation_factor_ = std::max(kMinVariance, state.value("inflation_factor", inflation_factor_));
+    localization_ = state.value("localization", localization_);
+    initialized_ = state.value("initialized", initialized_);
+    ensemble_mean_ = doubleVectorFromJson(state.value("ensemble_mean", nlohmann::json::array()), state_dim_, 0.0);
+    ensemble_ = matrixFromJson(state.value("ensemble", nlohmann::json::array()), state_dim_);
+    if (!ensemble_.empty()) {
+      ensemble_size_ = static_cast<int>(ensemble_.size());
+    }
+    ensemble_mean_.resize(state_dim_, 0.0);
   }
 
  private:

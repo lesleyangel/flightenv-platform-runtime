@@ -20,6 +20,11 @@ namespace FlightEnvPlatformRuntime::estimation {
 struct RuntimeObservationFrame {
   int frame_index = 0;
   double sample_time_s = 0.0;
+  double arrival_time_s = 0.0;
+  bool has_arrival_time = false;
+  bool missing_observation = false;
+  bool explicit_late_observation = false;
+  std::string observation_status = "available";
   nlohmann::json payload = nlohmann::json::object();
   nlohmann::json source_summary = nlohmann::json::object();
   std::vector<std::string> value_labels;

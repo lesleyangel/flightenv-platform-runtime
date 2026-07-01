@@ -1959,6 +1959,13 @@ class NativeWorkflowRunner::Impl {
       estimation_request.scheduler_plan = scheduler_plan_;
       estimation_request.workflow_snapshot = workflow_snapshot_;
       estimation_request.external_observations = external_observations;
+      if (!req.seed_runtime_outputs.empty()) {
+        const fs::path seed_path = fs::absolute(req.seed_runtime_outputs);
+        const fs::path candidate_checkpoint =
+            fs::is_directory(seed_path) ? seed_path / "state_checkpoint.json"
+                                        : seed_path.parent_path() / "state_checkpoint.json";
+        estimation_request.resume_state_checkpoint = readJsonIfExists(candidate_checkpoint);
+      }
       estimation_request.max_frames = max_iterations;
       const estimation::RuntimeEstimationResult estimation_result = service.runScheduled(estimation_request);
       appendTrace(req.run_dir, "runtime_estimation_service_end frame_count=" +

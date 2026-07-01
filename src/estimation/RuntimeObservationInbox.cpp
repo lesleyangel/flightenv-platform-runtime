@@ -27,6 +27,24 @@ int jsonInt(const nlohmann::json& value, const std::string& key, int fallback) {
   return fallback;
 }
 
+bool jsonBool(const nlohmann::json& value, const std::string& key, bool fallback) {
+  if (!value.is_object() || !value.contains(key) || !value.at(key).is_boolean()) {
+    return fallback;
+  }
+  return value.at(key).get<bool>();
+}
+
+bool hasNumber(const nlohmann::json& value, const std::string& key) {
+  return value.is_object() && value.contains(key) && value.at(key).is_number();
+}
+
+std::string jsonString(const nlohmann::json& value, const std::string& key, const std::string& fallback) {
+  if (!value.is_object() || !value.contains(key) || !value.at(key).is_string()) {
+    return fallback;
+  }
+  return value.at(key).get<std::string>();
+}
+
 nlohmann::json framePayload(const nlohmann::json& item) {
   if (item.is_object() && item.contains("frame") && item.at("frame").is_object()) {
     return item.at("frame");
@@ -103,14 +121,29 @@ RuntimeObservationInbox RuntimeObservationInbox::fromJsonStream(const nlohmann::
     RuntimeObservationFrame frame;
     frame.frame_index = jsonInt(payload, "frame_index", i);
     frame.sample_time_s = jsonNumber(payload, "sample_time_s", jsonNumber(payload, "time_s", static_cast<double>(i)));
+    frame.has_arrival_time = hasNumber(payload, "arrival_time_s");
+    frame.arrival_time_s = frame.has_arrival_time
+                               ? jsonNumber(payload, "arrival_time_s", frame.sample_time_s)
+                               : frame.sample_time_s;
+    frame.observation_status = jsonString(payload, "observation_status", "available");
+    frame.missing_observation = jsonBool(payload, "missing_observation", false) ||
+                                frame.observation_status == "missing" ||
+                                frame.observation_status == "unavailable";
+    frame.explicit_late_observation = jsonBool(payload, "late_observation", false) ||
+                                      frame.observation_status == "late";
     frame.payload = payload;
     frame.source_summary = {
         {"source", payload.value("source", std::string("external_observation_stream"))},
         {"sensor_count", jsonInt(payload, "sensor_count", 0)},
         {"has_selected_state", payload.is_object() && payload.contains("selected_state")},
+        {"observation_status", frame.observation_status},
+        {"missing_observation", frame.missing_observation},
+        {"late_observation_declared", frame.explicit_late_observation},
+        {"has_arrival_time", frame.has_arrival_time},
+        {"arrival_time_s", frame.arrival_time_s},
     };
     extractObservationVector(payload, frame.value_labels, frame.values);
-    if (!frame.values.empty()) {
+    if (!frame.values.empty() || frame.missing_observation) {
       inbox.frames_.push_back(std::move(frame));
     }
   }

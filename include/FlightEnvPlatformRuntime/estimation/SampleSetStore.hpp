@@ -26,6 +26,7 @@ struct PosteriorFrame {
   std::vector<std::string> value_labels;
   std::vector<double> state_mean;
   std::vector<double> covariance_diag;
+  nlohmann::json estimator_state = nlohmann::json::object();
   nlohmann::json diagnostics = nlohmann::json::object();
 };
 

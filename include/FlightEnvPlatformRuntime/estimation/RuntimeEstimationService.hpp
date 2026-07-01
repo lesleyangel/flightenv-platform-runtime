@@ -28,6 +28,8 @@ struct RuntimeEstimationRequest {
   nlohmann::json scheduler_plan = nlohmann::json::object();
   nlohmann::json workflow_snapshot = nlohmann::json::object();
   nlohmann::json external_observations = nlohmann::json::array();
+  nlohmann::json resume_state_checkpoint = nlohmann::json::object();
+  std::string resume_checkpoint_id;
   int max_frames = 0;
 };
 
