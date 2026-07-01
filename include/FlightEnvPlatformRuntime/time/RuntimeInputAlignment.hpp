@@ -25,10 +25,13 @@ namespace FlightEnvPlatformRuntime {
  */
 enum class RuntimeAlignmentStrategy {
   Exact,           ///< 按精确容差语义要求目标时间上存在样本。
+  LatestBefore,    ///< 使用目标时间或之前的最新样本，不做外推。
   HoldLast,        ///< 在陈旧时间边界内使用目标时间或之前的最新样本。
   Nearest,         ///< 在间隔边界内使用最接近目标时间的样本。
   Linear,          ///< 对标量样本插值，或创建 tensor 插值引用。
+  Window,          ///< 传递派发窗口内的样本序列。
   IntegrateWindow, ///< 聚合派发窗口内的样本。
+  PredictTo,       ///< 要求模型把旧样本预测到目标时间；无模型时生成阻塞证据。
   Independent,     ///< 声明节点输入不依赖上游样本。
   Unsupported,     ///< 解析后的策略不受运行时支持。
 };

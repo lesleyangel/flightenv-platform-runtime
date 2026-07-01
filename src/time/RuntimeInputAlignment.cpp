@@ -51,10 +51,15 @@ RuntimeAlignmentStrategy parseStrategy(const nlohmann::json& raw) {
   if (strategy == "direct" || strategy == "exact" || strategy == "exact_or_substep") {
     return RuntimeAlignmentStrategy::Exact;
   }
-  if (strategy == "hold_last") return RuntimeAlignmentStrategy::HoldLast;
+  if (strategy == "latest_before") return RuntimeAlignmentStrategy::LatestBefore;
+  if (strategy == "hold_last" || strategy == "hold" || strategy == "zero_order_hold") {
+    return RuntimeAlignmentStrategy::HoldLast;
+  }
   if (strategy == "nearest") return RuntimeAlignmentStrategy::Nearest;
   if (strategy == "interpolate" || strategy == "linear") return RuntimeAlignmentStrategy::Linear;
+  if (strategy == "window") return RuntimeAlignmentStrategy::Window;
   if (strategy == "aggregate" || strategy == "integrate_window") return RuntimeAlignmentStrategy::IntegrateWindow;
+  if (strategy == "predict_to" || strategy == "model_predict") return RuntimeAlignmentStrategy::PredictTo;
   if (strategy == "independent") return RuntimeAlignmentStrategy::Independent;
   return RuntimeAlignmentStrategy::Unsupported;
 }
@@ -62,10 +67,13 @@ RuntimeAlignmentStrategy parseStrategy(const nlohmann::json& raw) {
 std::string strategyName(RuntimeAlignmentStrategy strategy) {
   switch (strategy) {
     case RuntimeAlignmentStrategy::Exact: return "exact";
+    case RuntimeAlignmentStrategy::LatestBefore: return "latest_before";
     case RuntimeAlignmentStrategy::HoldLast: return "hold_last";
     case RuntimeAlignmentStrategy::Nearest: return "nearest";
     case RuntimeAlignmentStrategy::Linear: return "linear";
+    case RuntimeAlignmentStrategy::Window: return "window";
     case RuntimeAlignmentStrategy::IntegrateWindow: return "integrate_window";
+    case RuntimeAlignmentStrategy::PredictTo: return "predict_to";
     case RuntimeAlignmentStrategy::Independent: return "independent";
     case RuntimeAlignmentStrategy::Unsupported: return "unsupported";
   }
@@ -89,6 +97,31 @@ nlohmann::json scalarLike(const nlohmann::json& original, double value) {
     return patched;
   }
   return value;
+}
+
+nlohmann::json sampleValueWithTime(const RuntimePortSample& sample) {
+  return {
+      {"time_s", sample.time_s},
+      {"time_ns", sample.time_ns},
+      {"iteration_index", sample.iteration_index},
+      {"value", sample.value},
+      {"sample", sample.evidence()},
+  };
+}
+
+nlohmann::json staleDetail(
+    const RuntimePortSample& sample,
+    double target_time_s,
+    double max_age_s,
+    const std::string& reason) {
+  return {
+      {"reason", reason},
+      {"source_sample", sample.evidence()},
+      {"target_time_s", target_time_s},
+      {"source_time_s", sample.time_s},
+      {"stale_age_s", std::max(0.0, target_time_s - sample.time_s)},
+      {"max_age_s", max_age_s},
+  };
 }
 
 double targetTimeS(const nlohmann::json& time_info) {
@@ -201,18 +234,55 @@ RuntimeAlignedInput alignOne(
     result.source_time_s = sample->time_s;
     result.sample_count = 1;
     result.value = sample->value;
+    result.alignment_detail = {
+        {"source_sample", sample->evidence()},
+    };
+  };
+
+  auto assignLatestBefore = [&](double max_age_s, const std::string& ok_status) {
+    const auto sample = sample_buffer.latestBeforeOrAt(channel, target_time_s, max_age_s);
+    if (sample.has_value()) {
+      assignSample(sample, ok_status);
+      return;
+    }
+    const auto stale_candidate = sample_buffer.latestBeforeOrAt(channel, target_time_s, -1.0);
+    if (stale_candidate.has_value() && max_age_s >= 0.0) {
+      result.status = "stale_input";
+      result.source_time_s = stale_candidate->time_s;
+      result.sample_count = 1;
+      result.alignment_detail = staleDetail(*stale_candidate, target_time_s, max_age_s, "max_age_exceeded");
+      return;
+    }
+    result.status = "no_matching_sample";
   };
 
   if (policy.strategy == RuntimeAlignmentStrategy::Exact) {
     assignSample(sample_buffer.latestBeforeOrAt(channel, target_time_s, 1.0e-9), "exact");
     return result;
   }
+  if (policy.strategy == RuntimeAlignmentStrategy::LatestBefore) {
+    assignLatestBefore(policy.max_staleness_s, "latest_before");
+    return result;
+  }
   if (policy.strategy == RuntimeAlignmentStrategy::HoldLast) {
-    assignSample(sample_buffer.latestBeforeOrAt(channel, target_time_s, policy.max_staleness_s), "hold_last");
+    assignLatestBefore(policy.max_staleness_s, "hold_last");
     return result;
   }
   if (policy.strategy == RuntimeAlignmentStrategy::Nearest) {
     assignSample(sample_buffer.nearest(channel, target_time_s, policy.max_gap_s), "nearest");
+    if (!result.available && policy.max_gap_s >= 0.0) {
+      const auto unbounded = sample_buffer.nearest(channel, target_time_s, -1.0);
+      if (unbounded.has_value()) {
+        result.status = "stale_input";
+        result.source_time_s = unbounded->time_s;
+        result.sample_count = 1;
+        result.alignment_detail = staleDetail(
+            *unbounded,
+            target_time_s,
+            policy.max_gap_s,
+            "max_gap_exceeded");
+      }
+    }
     return result;
   }
   if (policy.strategy == RuntimeAlignmentStrategy::Linear) {
@@ -254,6 +324,34 @@ RuntimeAlignedInput alignOne(
     result.source_time_s = target_time_s;
     result.sample_count = 2;
     result.value = scalarLike(bracket.first->value, *lhs_value + (*rhs_value - *lhs_value) * alpha);
+    return result;
+  }
+  if (policy.strategy == RuntimeAlignmentStrategy::Window) {
+    const std::vector<RuntimePortSample> samples = sample_buffer.window(channel, window_start_s, target_time_s);
+    result.sample_count = static_cast<int>(samples.size());
+    if (samples.empty()) {
+      result.status = "insufficient_samples";
+      return result;
+    }
+    nlohmann::json sample_values = nlohmann::json::array();
+    for (const auto& sample : samples) {
+      sample_values.push_back(sampleValueWithTime(sample));
+    }
+    result.available = true;
+    result.status = "window";
+    result.source_time_s = target_time_s;
+    result.value = {
+        {"representation", "runtime_window_samples"},
+        {"window_start_s", window_start_s},
+        {"window_end_s", target_time_s},
+        {"sample_count", samples.size()},
+        {"samples", sample_values},
+    };
+    result.alignment_detail = {
+        {"window_start_s", window_start_s},
+        {"window_end_s", target_time_s},
+        {"sample_count", samples.size()},
+    };
     return result;
   }
   if (policy.strategy == RuntimeAlignmentStrategy::IntegrateWindow) {
@@ -313,6 +411,30 @@ RuntimeAlignedInput alignOne(
     result.value = integral;
     return result;
   }
+  if (policy.strategy == RuntimeAlignmentStrategy::PredictTo) {
+    const auto sample = sample_buffer.latestBeforeOrAt(channel, target_time_s, policy.max_staleness_s);
+    if (!sample.has_value()) {
+      assignLatestBefore(policy.max_staleness_s, "predict_to_source");
+      if (result.available) {
+        result.available = false;
+        result.status = "predict_to_requires_model";
+      }
+      return result;
+    }
+    result.available = false;
+    result.status = "predict_to_requires_model";
+    result.source_time_s = sample->time_s;
+    result.sample_count = 1;
+    result.alignment_detail = {
+        {"reason", "predict_to_requires_model"},
+        {"source_sample", sample->evidence()},
+        {"target_time_s", target_time_s},
+        {"source_time_s", sample->time_s},
+        {"prediction_horizon_s", std::max(0.0, target_time_s - sample->time_s)},
+        {"prediction_required", true},
+    };
+    return result;
+  }
 
   result.status = "unsupported_strategy";
   return result;
@@ -321,6 +443,19 @@ RuntimeAlignedInput alignOne(
 }  // namespace
 
 nlohmann::json RuntimeAlignedInput::evidence() const {
+  nlohmann::json valid_until = nullptr;
+  if (policy.max_age_s >= 0.0 && sample_count > 0) {
+    valid_until = source_time_s + policy.max_age_s;
+  }
+  const nlohmann::json source_sample = alignment_detail.value("source_sample", nlohmann::json::object());
+  std::string producer_event_id = jsonString(alignment_detail, "producer_event_id");
+  if (producer_event_id.empty()) {
+    producer_event_id = jsonString(source_sample, "producer_event_id");
+  }
+  const bool stale =
+      status == "stale_input" ||
+      (available && policy.max_age_s >= 0.0 && sample_count > 0 &&
+       target_time_s - source_time_s > policy.max_age_s);
   return {
       {"transition_id", policy.transition_id},
       {"binding_id", policy.binding_id},
@@ -342,11 +477,22 @@ nlohmann::json RuntimeAlignedInput::evidence() const {
       {"tensor_interpolation", policy.tensor_interpolation},
       {"available", available},
       {"status", status},
+      {"stale", stale},
       {"target_time_s", target_time_s},
       {"source_time_s", source_time_s},
       {"window_start_s", window_start_s},
       {"window_end_s", window_end_s},
       {"sample_count", sample_count},
+      {"temporal_port_contract",
+       {
+           {"target_time_s", target_time_s},
+           {"sample_time_s", source_time_s},
+           {"valid_from_s", source_time_s},
+           {"valid_until_s", valid_until},
+           {"max_age_s", policy.max_age_s},
+           {"stale", stale},
+           {"producer_event_id", producer_event_id},
+       }},
       {"alignment_detail", alignment_detail},
   };
 }
