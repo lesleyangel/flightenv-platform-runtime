@@ -52,6 +52,9 @@ struct RuntimeInputAlignmentPolicy {
   std::string upstream_node_id; ///< 产生样本的源节点 id。
   std::string source_port_id;   ///< 可选源端口 id；为空时选择节点级通道。
   std::string target_port_id;   ///< 对齐后要填充的可选目标输入端口 id。
+  std::string runtime_transition_node_id; ///< 非空时，目标消费平台 synthetic transition 节点输出。
+  std::string physical_source_node_id;    ///< rate transition 原始上游节点 id，用于 evidence。
+  std::string physical_source_port_id;    ///< rate transition 原始上游端口 id，用于 evidence。
   RuntimeAlignmentStrategy strategy = RuntimeAlignmentStrategy::Exact; ///< 归一化后的运行时策略。
   std::string raw_alignment;    ///< 编译后元数据中的原始 `alignment` 值。
   std::string raw_input_resampling; ///< 编译后元数据中的原始 `input_resampling` 值。

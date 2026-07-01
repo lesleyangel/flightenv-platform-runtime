@@ -115,6 +115,7 @@
     <ClCompile Include="..\src\RuntimeNodeEvidenceBuilder.cpp" />
     <ClCompile Include="..\src\RuntimePortBindingResolver.cpp" />
     <ClCompile Include="..\src\RuntimePortPacketWriter.cpp" />
+    <ClCompile Include="..\src\RuntimeRateTransitionExecutor.cpp" />
     <ClCompile Include="..\src\RuntimePortStoreView.cpp" />
     <ClCompile Include="..\src\RuntimeProfileUtils.cpp" />
     <ClCompile Include="..\src\RuntimePublicFrameBuilder.cpp" />
@@ -149,6 +150,7 @@
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeNodeEvidenceBuilder.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimePortBindingResolver.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimePortPacketWriter.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeRateTransitionExecutor.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimePortStoreView.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeProfileUtils.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimePublicFrameBuilder.hpp" />

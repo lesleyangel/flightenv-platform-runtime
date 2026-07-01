@@ -24,6 +24,7 @@
 #include "FlightEnvPlatformRuntime/RuntimeNodeEvidenceBuilder.hpp"
 #include "FlightEnvPlatformRuntime/RuntimePortBindingResolver.hpp"
 #include "FlightEnvPlatformRuntime/RuntimePortPacketWriter.hpp"
+#include "FlightEnvPlatformRuntime/RuntimeRateTransitionExecutor.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeReadyQueueExecutor.hpp"
 #include "FlightEnvPlatformRuntime/RuntimePublicFrameBuilder.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeTimeScheduler.hpp"
@@ -1924,6 +1925,7 @@ class NativeWorkflowRunner::Impl {
     json output_artifacts = json::array();
     json loop_iterations = json::array();
     json runtime_packets = json::array();
+    json runtime_rate_transition_nodes = json::array();
     json outputs = json::object();
     RuntimeTimeScheduler time_scheduler(time_plan_);
     int failed_nodes = 0;
@@ -1978,7 +1980,8 @@ class NativeWorkflowRunner::Impl {
         appendTrace(req.run_dir, "prepare_node_end node=" + jsonString(node, "node_id"));
       }
       writeArtifacts(req, lifecycle_events, scheduler_events, node_snapshots, uncertainty_nodes, checkpoints,
-                     data_plane_entries, input_artifacts, output_artifacts, loop_iterations, runtime_packets, outputs,
+                     data_plane_entries, input_artifacts, output_artifacts, loop_iterations,
+                     runtime_packets, runtime_rate_transition_nodes, outputs,
                      previous_seed, external_observations, port_store, pdk_scheduler, pdk_executor,
                      ready_executor,
                      0, failed_nodes, true);
@@ -2111,6 +2114,28 @@ class NativeWorkflowRunner::Impl {
         const RuntimeNodeDispatch cadence =
             time_scheduler.planEventDispatch(node, loop_event, base_dt_s, output_period_s);
         const json time_info = cadence.time_info;
+        const RuntimeRateTransitionExecutionResult transition_execution =
+            RuntimeRateTransitionExecutor::executeForTarget({
+                req.run_id,
+                object_id_,
+                req.branch_id,
+                req.timeline_id,
+                node_id,
+                node,
+                time_info,
+                iteration,
+                &port_sample_buffer,
+                &port_store,
+            });
+        if (transition_execution.hasEvidence()) {
+          for (const auto& event : transition_execution.events) {
+            scheduler_events.push_back(event);
+            runtime_rate_transition_nodes.push_back(event);
+          }
+          for (const auto& packet : transition_execution.packets) {
+            runtime_packets.push_back(packet);
+          }
+        }
         const RuntimeInputAlignmentResult input_alignment =
             RuntimeInputAlignment::alignNodeInputs(node, time_info, port_sample_buffer);
         RuntimeInputAlignment::applyAlignedInputs(input_alignment, upstream);
@@ -2326,7 +2351,8 @@ class NativeWorkflowRunner::Impl {
     }
 
     writeArtifacts(req, lifecycle_events, scheduler_events, node_snapshots, uncertainty_nodes, checkpoints,
-                   data_plane_entries, input_artifacts, output_artifacts, loop_iterations, runtime_packets, outputs,
+                   data_plane_entries, input_artifacts, output_artifacts, loop_iterations,
+                   runtime_packets, runtime_rate_transition_nodes, outputs,
                    previous_seed, external_observations, port_store, pdk_scheduler, pdk_executor,
                    ready_executor,
                    iteration_count, failed_nodes, false);
@@ -3016,6 +3042,7 @@ class NativeWorkflowRunner::Impl {
       const json& output_artifacts,
       const json& loop_iterations,
       const json& runtime_packets,
+      const json& runtime_rate_transition_nodes,
       const json& outputs,
       const json& seed,
       const json& external_observations,
@@ -3135,6 +3162,34 @@ class NativeWorkflowRunner::Impl {
                {"producer", "ThreadSafePortStore"},
                {"summary", portStoreEvidence(port_store)},
                {"packets", port_store_packets}});
+    int runtime_rate_transition_executed_count = 0;
+    int runtime_rate_transition_blocked_count = 0;
+    if (runtime_rate_transition_nodes.is_array()) {
+      for (const auto& item : runtime_rate_transition_nodes) {
+        if (!item.is_object()) {
+          continue;
+        }
+        if (jsonString(item, "status") == "executed") {
+          ++runtime_rate_transition_executed_count;
+        } else if (jsonString(item, "status") == "blocked") {
+          ++runtime_rate_transition_blocked_count;
+        }
+      }
+    }
+    evidence_writer.writeJson(
+        "runtime_rate_transition_nodes.json",
+        {{"schema_version", "flightenv.platform.runtime_rate_transition_nodes.v1"},
+               {"run_id", req.run_id},
+               {"workflow_id", workflow_id_},
+               {"object_id", object_id_},
+               {"branch_id", req.branch_id},
+               {"timeline_id", req.timeline_id},
+               {"generated_at_utc", nowUtcIso()},
+               {"nodes", runtime_rate_transition_nodes},
+               {"summary",
+                {{"event_count", runtime_rate_transition_nodes.size()},
+                 {"executed_count", runtime_rate_transition_executed_count},
+                 {"blocked_count", runtime_rate_transition_blocked_count}}}});
     evidence_writer.writeJson(
         "data_plane_manifest.json",
         {{"schema_version", "flightenv.platform.data_plane_manifest.v1"},
@@ -3225,6 +3280,9 @@ class NativeWorkflowRunner::Impl {
                  {"typed_buffer_store", typed_buffer_store_summary},
                  {"runtime_packet_count", port_store_packets.size()},
                  {"port_store_node_output_count", portStoreEvidence(port_store).value("node_output_count", 0)},
+                 {"runtime_rate_transition_node_event_count", runtime_rate_transition_nodes.size()},
+                 {"runtime_rate_transition_node_executed_count", runtime_rate_transition_executed_count},
+                 {"runtime_rate_transition_node_blocked_count", runtime_rate_transition_blocked_count},
                  {"edge_binding_count", edge_binding_plan_.value("summary", json::object()).value("binding_count", 0)},
                  {"rate_transition_count",
                   rate_transition_plan_.value("summary", json::object()).value("transition_count", 0)},
@@ -3268,6 +3326,7 @@ class NativeWorkflowRunner::Impl {
                  {"runtime_node_snapshot", "runtime_node_snapshot.json"},
                  {"runtime_outputs", "runtime_outputs.json"},
                  {"runtime_loop_summary", "runtime_loop_summary.json"},
+                 {"runtime_rate_transition_nodes", "runtime_rate_transition_nodes.json"},
                  {"edge_binding_plan", "edge_binding_plan.json"},
                  {"rate_transition_plan", "rate_transition_plan.json"},
                  {"scheduler_table", scheduler_table_.empty() ? "" : "scheduler_table.json"},

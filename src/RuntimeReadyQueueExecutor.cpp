@@ -135,8 +135,10 @@ nlohmann::json rateTransitionEvidence(const nlohmann::json& binding) {
   nlohmann::json evidence = {
       {"transition_id", jsonString(transition, "transition_id")},
       {"binding_id", jsonString(transition, "binding_id")},
+      {"transition_node_id", jsonString(transition, "transition_node_id")},
       {"rate_relation", jsonString(transition, "rate_relation")},
       {"strategy", jsonString(transition, "strategy")},
+      {"insertion_mode", jsonString(transition, "insertion_mode")},
       {"source_period_s", transition.value("source_period_s", -1.0)},
       {"target_period_s", transition.value("target_period_s", -1.0)},
       {"requires_runtime_transition", jsonBool(transition, "requires_runtime_transition", false)},

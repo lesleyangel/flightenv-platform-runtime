@@ -155,13 +155,23 @@ RuntimeInputAlignmentPolicy parsePolicy(const nlohmann::json& raw) {
   policy.source_period_s = jsonDouble(raw, "source_period_s", -1.0);
   policy.target_period_s = jsonDouble(raw, "target_period_s", -1.0);
   policy.max_age_s = jsonDouble(raw, "max_age_s", -1.0);
-  policy.upstream_node_id = jsonString(raw, "upstream_node_id", jsonString(raw, "source_node_id"));
-  policy.source_port_id = jsonString(raw, "source_port_id");
   policy.target_port_id = jsonString(raw, "target_port_id");
+  policy.physical_source_node_id = jsonString(raw, "upstream_node_id", jsonString(raw, "source_node_id"));
+  policy.physical_source_port_id = jsonString(raw, "source_port_id");
+  policy.runtime_transition_node_id = jsonString(raw, "transition_node_id");
+  if (policy.requires_runtime_transition && !policy.runtime_transition_node_id.empty()) {
+    policy.upstream_node_id = policy.runtime_transition_node_id;
+    policy.source_port_id = policy.target_port_id;
+  } else {
+    policy.upstream_node_id = policy.physical_source_node_id;
+    policy.source_port_id = policy.physical_source_port_id;
+  }
   policy.raw_alignment = jsonString(raw, "alignment", "exact");
   policy.raw_input_resampling = jsonString(raw, "input_resampling", "none");
   policy.tensor_interpolation = jsonString(raw, "tensor_interpolation", "nearest");
-  policy.strategy = parseStrategy(raw);
+  policy.strategy = policy.requires_runtime_transition && !policy.runtime_transition_node_id.empty()
+                        ? RuntimeAlignmentStrategy::LatestBefore
+                        : parseStrategy(raw);
   policy.max_staleness_s = jsonDouble(raw, "max_staleness_s", policy.max_age_s);
   policy.max_gap_s = jsonDouble(raw, "max_gap_s", policy.max_age_s);
   return policy;
@@ -462,6 +472,9 @@ nlohmann::json RuntimeAlignedInput::evidence() const {
       {"upstream_node_id", policy.upstream_node_id},
       {"source_port_id", policy.source_port_id},
       {"target_port_id", policy.target_port_id},
+      {"runtime_transition_node_id", policy.runtime_transition_node_id},
+      {"physical_source_node_id", policy.physical_source_node_id},
+      {"physical_source_port_id", policy.physical_source_port_id},
       {"strategy", strategyName(policy.strategy)},
       {"raw_strategy", policy.raw_strategy},
       {"raw_alignment", policy.raw_alignment},
