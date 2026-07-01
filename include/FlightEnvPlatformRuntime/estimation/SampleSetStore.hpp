@@ -21,6 +21,8 @@ struct PosteriorFrame {
   int frame_index = 0;
   double sample_time_s = 0.0;
   std::string checkpoint_id;
+  std::string commit_id;
+  bool committed = false;
   std::vector<std::string> value_labels;
   std::vector<double> state_mean;
   std::vector<double> covariance_diag;

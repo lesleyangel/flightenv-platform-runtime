@@ -37,6 +37,9 @@ nlohmann::json SampleSetStore::toCheckpointJson(
   for (const PosteriorFrame& frame : frames_) {
     checkpoints.push_back({
         {"checkpoint_id", frame.checkpoint_id},
+        {"commit_id", frame.commit_id},
+        {"committed", frame.committed},
+        {"commit_barrier", frame.committed ? "posterior_commit" : "uncommitted"},
         {"frame_index", frame.frame_index},
         {"sample_time_s", frame.sample_time_s},
         {"state_mean", vectorJson(frame.state_mean)},

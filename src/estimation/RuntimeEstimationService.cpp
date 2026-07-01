@@ -8,6 +8,7 @@
 #include "FlightEnvPlatformRuntime/estimation/SampleSetStore.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <stdexcept>
 
@@ -47,6 +48,10 @@ nlohmann::json posteriorPortPayload(const PosteriorFrame& frame) {
       {"labels", labelsJson(frame.value_labels)},
       {"values", vectorJson(frame.state_mean)},
       {"checkpoint_id", frame.checkpoint_id},
+      {"commit_id", frame.commit_id},
+      {"committed", frame.committed},
+      {"valid_time_s", frame.sample_time_s},
+      {"commit_barrier", frame.committed ? "posterior_commit" : "uncommitted"},
   };
 }
 
@@ -59,6 +64,9 @@ nlohmann::json uncertaintyPortPayload(const PosteriorFrame& frame) {
       {"sample_time_s", frame.sample_time_s},
       {"labels", labelsJson(frame.value_labels)},
       {"covariance_diag", vectorJson(frame.covariance_diag)},
+      {"commit_id", frame.commit_id},
+      {"committed", frame.committed},
+      {"valid_time_s", frame.sample_time_s},
   };
 }
 
@@ -67,6 +75,9 @@ nlohmann::json frameEvidence(const PosteriorFrame& frame) {
       {"frame_index", frame.frame_index},
       {"sample_time_s", frame.sample_time_s},
       {"posterior_checkpoint", frame.checkpoint_id},
+      {"posterior_commit_id", frame.commit_id},
+      {"posterior_committed", frame.committed},
+      {"commit_barrier", frame.committed ? "posterior_commit" : "uncommitted"},
       {"state_mean", vectorJson(frame.state_mean)},
       {"covariance_diag", vectorJson(frame.covariance_diag)},
       {"diagnostics", frame.diagnostics},
@@ -158,6 +169,54 @@ bool shouldTriggerBranch(
   return max_branches <= 0 || triggered_branch_count < max_branches;
 }
 
+std::string posteriorCommitId(const RuntimeEstimationRequest& request, int frame_index) {
+  std::string prefix = request.branch_id.empty() ? std::string("main") : request.branch_id;
+  std::replace_if(prefix.begin(), prefix.end(), [](unsigned char c) {
+    return !(std::isalnum(c) || c == '_' || c == '-' || c == '.');
+  }, '_');
+  return "posterior_commit." + prefix + ".frame_" + std::to_string(frame_index);
+}
+
+nlohmann::json filterPhaseEvent(
+    const std::string& phase,
+    const std::string& status,
+    const std::string& stage_id,
+    const RuntimeObservationFrame& observation,
+    const std::string& branch_id,
+    const std::string& timeline_id,
+    const std::string& previous_checkpoint,
+    const std::string& posterior_checkpoint,
+    const std::string& commit_id) {
+  nlohmann::json event = {
+      {"timestamp_utc", RuntimeClock::nowUtcIso()},
+      {"event", phase},
+      {"event_kind", phase},
+      {"runtime_event_kind", phase},
+      {"filter_phase", phase},
+      {"status", status},
+      {"stage_id", stage_id},
+      {"branch_id", branch_id},
+      {"timeline_id", timeline_id},
+      {"frame_index", observation.frame_index},
+      {"sample_time_s", observation.sample_time_s},
+  };
+  if (!previous_checkpoint.empty()) {
+    event["previous_checkpoint"] = previous_checkpoint;
+  }
+  if (!posterior_checkpoint.empty()) {
+    event["posterior_checkpoint"] = posterior_checkpoint;
+  }
+  if (!commit_id.empty()) {
+    event["posterior_commit_id"] = commit_id;
+  }
+  if (phase == "posterior_commit") {
+    event["posterior_committed"] = status == "committed";
+    event["commit_barrier"] = "posterior_commit";
+    event["source_state_visibility"] = "committed_only";
+  }
+  return event;
+}
+
 nlohmann::json branchTriggerEvent(
     const RuntimeEstimationRequest& request,
     const nlohmann::json& policy,
@@ -176,15 +235,17 @@ nlohmann::json branchTriggerEvent(
       {"trigger_frame_index", frame.frame_index},
       {"trigger_time_s", frame.sample_time_s},
       {"checkpoint_id", frame.checkpoint_id},
+      {"posterior_commit_id", frame.commit_id},
+      {"seed_checkpoint_committed", frame.committed},
+      {"source_state_visibility", "committed_only"},
+      {"commit_barrier", "posterior_commit"},
       {"seed_policy", policy.value("seed_policy", std::string("latest_checkpoint"))},
-      {"cause_event_id", "estimation_frame_finish." + std::to_string(frame.frame_index)},
+      {"cause_event_id", frame.commit_id.empty() ? "posterior_commit." + std::to_string(frame.frame_index) : frame.commit_id},
       {"status", target_workflow_id.empty() ? "declared_without_target" : "ready_to_start"},
   };
 }
 
-}  // namespace
-
-RuntimeEstimationResult RuntimeEstimationService::runSerial(const RuntimeEstimationRequest& request) const {
+RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, const std::string& execution_mode) {
   const nlohmann::json systems = request.estimation_plan.value("estimation_systems", nlohmann::json::array());
   if (!systems.is_array() || systems.empty()) {
     throw std::runtime_error("RuntimeEstimationService requires estimation_plan.estimation_systems");
@@ -213,6 +274,8 @@ RuntimeEstimationResult RuntimeEstimationService::runSerial(const RuntimeEstimat
   nlohmann::json scheduler_events = nlohmann::json::array();
   nlohmann::json loop_iterations = nlohmann::json::array();
   nlohmann::json branch_events = nlohmann::json::array();
+  nlohmann::json filter_phase_events = nlohmann::json::array();
+  nlohmann::json commit_log = nlohmann::json::array();
   const nlohmann::json workflow = workflowFromSnapshot(request.workflow_snapshot);
   const nlohmann::json branching_policy = workflow.value("branching_policy", nlohmann::json::object());
   const std::string stage_id = jsonString(system, "compiled_stage_id", "online_current.online_estimation");
@@ -223,10 +286,11 @@ RuntimeEstimationResult RuntimeEstimationService::runSerial(const RuntimeEstimat
       {"estimation_system_id", jsonString(system, "estimation_system_id")},
       {"method", method_kind},
       {"frame_count", inbox.size()},
-      {"execution_mode", "serial_mvp"},
+      {"execution_mode", execution_mode},
   });
 
   for (const RuntimeObservationFrame& observation : inbox.frames()) {
+    nlohmann::json frame_phase_events = nlohmann::json::array();
     scheduler_events.push_back({
         {"timestamp_utc", RuntimeClock::nowUtcIso()},
         {"event", "estimation_frame_begin"},
@@ -234,6 +298,9 @@ RuntimeEstimationResult RuntimeEstimationService::runSerial(const RuntimeEstimat
         {"frame_index", observation.frame_index},
         {"sample_time_s", observation.sample_time_s},
     });
+    const PosteriorFrame* previous_frame = store.latest();
+    const std::string previous_checkpoint =
+        previous_frame == nullptr ? std::string() : previous_frame->checkpoint_id;
     RuntimeSampleSchedulingRequest sample_request;
     sample_request.run_dir = request.run_dir;
     sample_request.estimation_system = system;
@@ -261,13 +328,70 @@ RuntimeEstimationResult RuntimeEstimationService::runSerial(const RuntimeEstimat
         });
       }
     }
+    nlohmann::json predict_event = filterPhaseEvent(
+        "filter_predict",
+        "completed",
+        stage_id,
+        observation,
+        request.branch_id,
+        request.timeline_id,
+        previous_checkpoint,
+        "",
+        "");
+    predict_event["sample_scheduler"] = compactSampleScheduleDiagnostics(sample_schedule);
+    scheduler_events.push_back(predict_event);
+    filter_phase_events.push_back(predict_event);
+    frame_phase_events.push_back(predict_event);
     EstimatorStepRequest step_request;
     step_request.observation = observation;
-    step_request.previous = store.latest();
+    step_request.previous = previous_frame;
     EstimatorStepResult step_result = method->step(step_request);
+    step_result.posterior.commit_id = posteriorCommitId(request, observation.frame_index);
+    step_result.posterior.committed = false;
     step_result.posterior.diagnostics["sample_scheduler"] =
         compactSampleScheduleDiagnostics(sample_schedule);
+    step_result.posterior.diagnostics["posterior_commit_id"] = step_result.posterior.commit_id;
+    step_result.posterior.diagnostics["posterior_committed"] = true;
+    step_result.posterior.diagnostics["filter_execution_mode"] = execution_mode;
+    nlohmann::json update_event = filterPhaseEvent(
+        "filter_update",
+        "completed",
+        stage_id,
+        observation,
+        request.branch_id,
+        request.timeline_id,
+        previous_checkpoint,
+        step_result.posterior.checkpoint_id,
+        "");
+    update_event["diagnostics"] = step_result.posterior.diagnostics;
+    scheduler_events.push_back(update_event);
+    filter_phase_events.push_back(update_event);
+    frame_phase_events.push_back(update_event);
+    step_result.posterior.committed = true;
     store.append(step_result.posterior);
+    nlohmann::json commit_event = filterPhaseEvent(
+        "posterior_commit",
+        "committed",
+        stage_id,
+        observation,
+        request.branch_id,
+        request.timeline_id,
+        previous_checkpoint,
+        step_result.posterior.checkpoint_id,
+        step_result.posterior.commit_id);
+    commit_event["checkpoint_id"] = step_result.posterior.checkpoint_id;
+    commit_event["committed"] = true;
+    scheduler_events.push_back(commit_event);
+    filter_phase_events.push_back(commit_event);
+    frame_phase_events.push_back(commit_event);
+    commit_log.push_back({
+        {"frame_index", observation.frame_index},
+        {"sample_time_s", observation.sample_time_s},
+        {"posterior_checkpoint", step_result.posterior.checkpoint_id},
+        {"posterior_commit_id", step_result.posterior.commit_id},
+        {"posterior_committed", true},
+        {"commit_barrier", "posterior_commit"},
+    });
     frame_evidence.push_back(frameEvidence(step_result.posterior));
     const int processed_frame_count = static_cast<int>(store.frames().size());
     if (shouldTriggerBranch(branching_policy, processed_frame_count, static_cast<int>(branch_events.size()))) {
@@ -282,6 +406,10 @@ RuntimeEstimationResult RuntimeEstimationService::runSerial(const RuntimeEstimat
         {"sample_time_s", observation.sample_time_s},
         {"status", "ok"},
         {"posterior_checkpoint", step_result.posterior.checkpoint_id},
+        {"posterior_commit_id", step_result.posterior.commit_id},
+        {"posterior_committed", step_result.posterior.committed},
+        {"commit_barrier", "posterior_commit"},
+        {"filter_phase_events", frame_phase_events},
         {"diagnostics", step_result.posterior.diagnostics},
         {"sample_scheduler", compactSampleScheduleDiagnostics(sample_schedule)},
     });
@@ -315,7 +443,7 @@ RuntimeEstimationResult RuntimeEstimationService::runSerial(const RuntimeEstimat
   nlohmann::json node_snapshot = {
       {"node_id", stage_id},
       {"operator_id", jsonString(system, "estimation_system_id")},
-      {"adapter_id", "runtime.estimation_service.serial"},
+      {"adapter_id", execution_mode == "serial_mvp" ? "runtime.estimation_service.serial" : "runtime.estimation_service.scheduled"},
       {"execution_kind", "system_service"},
       {"status", "ok"},
       {"frame_count", store.frames().size()},
@@ -334,15 +462,27 @@ RuntimeEstimationResult RuntimeEstimationService::runSerial(const RuntimeEstimat
       {"estimation_system_id", jsonString(system, "estimation_system_id")},
       {"stage_id", stage_id},
       {"method", method_kind},
-      {"execution_mode", "serial_mvp"},
+      {"execution_mode", execution_mode},
       {"model_graphs", system.value("model_graphs", nlohmann::json::object())},
       {"summary",
        {
            {"frame_count", store.frames().size()},
+           {"committed_frame_count", commit_log.size()},
            {"state_dim", state_dim},
            {"failed_frame_count", 0},
            {"latest_checkpoint", latest->checkpoint_id},
+           {"latest_commit_id", latest->commit_id},
            {"latest_diagnostics", latest->diagnostics},
+       }},
+      {"filter_commit",
+       {
+           {"phase_model", "predict_update_commit"},
+           {"execution_mode", execution_mode},
+           {"commit_barrier", "posterior_commit"},
+           {"source_state_visibility", "committed_only"},
+           {"committed_frame_count", commit_log.size()},
+           {"events", filter_phase_events},
+           {"commit_log", commit_log},
        }},
       {"sample_scheduler",
        {
@@ -402,6 +542,7 @@ RuntimeEstimationResult RuntimeEstimationService::runSerial(const RuntimeEstimat
                     {"iterations", loop_iterations},
                     {"summary",
                      {{"iteration_count", store.frames().size()},
+                      {"committed_frame_count", commit_log.size()},
                       {"failed_nodes", 0},
                       {"estimation_method", method_kind}}}});
   writer.writeJson("state_checkpoint.json", store.toCheckpointJson(request.run_id, request.workflow_id, request.object_id));
@@ -417,8 +558,13 @@ RuntimeEstimationResult RuntimeEstimationService::runSerial(const RuntimeEstimat
                     {"execution_backend", "native_adapter_sessions"},
                     {"runtime_core",
                      {{"estimation_service", "RuntimeEstimationService"},
-                      {"estimation_execution_mode", "serial_mvp"},
+                      {"estimation_execution_mode", execution_mode},
                       {"sample_scheduler", "ready_queue_sample_batch_v1"}}},
+                    {"filter_commit",
+                     {{"phase_model", "predict_update_commit"},
+                      {"commit_barrier", "posterior_commit"},
+                      {"source_state_visibility", "committed_only"},
+                      {"committed_frame_count", commit_log.size()}}},
                     {"compiled_workflow_dir", request.compiled_workflow_dir.string()},
                     {"summary",
                      {{"node_count", 1},
@@ -427,8 +573,10 @@ RuntimeEstimationResult RuntimeEstimationService::runSerial(const RuntimeEstimat
                       {"estimation_system_count", 1},
                       {"estimation_method", method_kind},
                       {"sample_scheduler_frame_count", sample_scheduler_frames.size()},
+                      {"committed_frame_count", commit_log.size()},
                       {"triggered_branch_count", branch_events.size()},
-                      {"latest_checkpoint", latest->checkpoint_id}}},
+                      {"latest_checkpoint", latest->checkpoint_id},
+                      {"latest_commit_id", latest->commit_id}}},
                     {"branches",
                      {{"policy", branching_policy},
                       {"events", branch_events},
@@ -452,8 +600,20 @@ RuntimeEstimationResult RuntimeEstimationService::runSerial(const RuntimeEstimat
       {"estimation_method", method_kind},
       {"frame_count", result.frame_count},
       {"latest_checkpoint", latest->checkpoint_id},
+      {"latest_commit_id", latest->commit_id},
+      {"committed_frame_count", commit_log.size()},
   };
   return result;
+}
+
+}  // namespace
+
+RuntimeEstimationResult RuntimeEstimationService::runSerial(const RuntimeEstimationRequest& request) const {
+  return runEstimation(request, "serial_mvp");
+}
+
+RuntimeEstimationResult RuntimeEstimationService::runScheduled(const RuntimeEstimationRequest& request) const {
+  return runEstimation(request, "scheduled_predict_update_commit_v1");
 }
 
 }  // namespace FlightEnvPlatformRuntime::estimation

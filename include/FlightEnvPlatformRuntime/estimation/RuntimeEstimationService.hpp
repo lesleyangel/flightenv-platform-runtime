@@ -4,8 +4,8 @@
  * @file RuntimeEstimationService.hpp
  * @brief 系统级滤波/融合服务门面。
  *
- * 大概：这是 Phase 2 的 RuntimeEstimationService 串行 MVP 入口。
- * 具体：读取编译后的 estimation_plan，消费观测帧，调用估计方法，写出后验、checkpoint 和 evidence。
+ * 大概：这是 RuntimeEstimationService 的平台估计入口。
+ * 具体：读取编译后的 estimation_plan，消费观测帧，调度样本批次，显式发布后验 commit/checkpoint/evidence。
  * 被谁使用：NativeWorkflowRunner 在 estimation_system workflow 中调用。
  * 使用谁：RuntimeObservationInbox、EstimatorMethodRegistry、SampleSetStore、RuntimeEvidenceWriter。
  */
@@ -41,6 +41,7 @@ struct RuntimeEstimationResult {
 class RuntimeEstimationService {
  public:
   RuntimeEstimationResult runSerial(const RuntimeEstimationRequest& request) const;
+  RuntimeEstimationResult runScheduled(const RuntimeEstimationRequest& request) const;
 };
 
 }  // namespace FlightEnvPlatformRuntime::estimation

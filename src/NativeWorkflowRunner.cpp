@@ -1957,7 +1957,7 @@ class NativeWorkflowRunner::Impl {
       estimation_request.workflow_snapshot = workflow_snapshot_;
       estimation_request.external_observations = external_observations;
       estimation_request.max_frames = max_iterations;
-      const estimation::RuntimeEstimationResult estimation_result = service.runSerial(estimation_request);
+      const estimation::RuntimeEstimationResult estimation_result = service.runScheduled(estimation_request);
       appendTrace(req.run_dir, "runtime_estimation_service_end frame_count=" +
                                std::to_string(estimation_result.frame_count));
       return NativeWorkflowResult{

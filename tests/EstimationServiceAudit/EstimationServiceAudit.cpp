@@ -173,8 +173,14 @@ void requireBranchEvidence(const fs::path& out_dir, const json& evidence, int ex
     if (event.value("parent_branch_id", std::string()).empty() ||
         event.value("branch_id", std::string()).empty() ||
         event.value("target_workflow_id", std::string()).empty() ||
-        event.value("checkpoint_id", std::string()).empty()) {
+        event.value("checkpoint_id", std::string()).empty() ||
+        event.value("posterior_commit_id", std::string()).empty()) {
       throw std::runtime_error("branch event is missing parent/branch/target/checkpoint fields");
+    }
+    if (!event.value("seed_checkpoint_committed", false) ||
+        event.value("source_state_visibility", std::string()) != "committed_only" ||
+        event.value("commit_barrier", std::string()) != "posterior_commit") {
+      throw std::runtime_error("branch event did not seed from a committed posterior checkpoint");
     }
     if (event.value("status", std::string()) != "ready_to_start") {
       throw std::runtime_error("branch event is not ready_to_start");
@@ -184,6 +190,88 @@ void requireBranchEvidence(const fs::path& out_dir, const json& evidence, int ex
   const json timeline_events = timeline.value("events", json::array());
   if (!timeline_events.is_array() || static_cast<int>(timeline_events.size()) != expected_branches) {
     throw std::runtime_error("branch_timeline event count mismatch");
+  }
+}
+
+void requireFilterCommitEvidence(const fs::path& out_dir, const json& evidence, int expected_frames) {
+  if (evidence.value("execution_mode", std::string()) != "scheduled_predict_update_commit_v1") {
+    throw std::runtime_error("estimation evidence did not use scheduled predict/update/commit mode");
+  }
+  const json summary = evidence.value("summary", json::object());
+  if (summary.value("frame_count", -1) != expected_frames ||
+      summary.value("committed_frame_count", -1) != expected_frames ||
+      summary.value("latest_commit_id", std::string()).empty()) {
+    throw std::runtime_error("estimation summary does not match committed frame count");
+  }
+  const json filter_commit = evidence.value("filter_commit", json::object());
+  if (!filter_commit.is_object() ||
+      filter_commit.value("phase_model", std::string()) != "predict_update_commit" ||
+      filter_commit.value("commit_barrier", std::string()) != "posterior_commit" ||
+      filter_commit.value("source_state_visibility", std::string()) != "committed_only") {
+    throw std::runtime_error("filter_commit evidence is missing the commit barrier contract");
+  }
+  const json commit_log = filter_commit.value("commit_log", json::array());
+  if (!commit_log.is_array() || static_cast<int>(commit_log.size()) != expected_frames) {
+    throw std::runtime_error("posterior commit log count mismatch");
+  }
+  const json phase_events = filter_commit.value("events", json::array());
+  int predict_count = 0;
+  int update_count = 0;
+  int commit_count = 0;
+  for (const auto& event : phase_events) {
+    const std::string kind = event.value("runtime_event_kind", event.value("event_kind", std::string()));
+    if (kind == "filter_predict") {
+      ++predict_count;
+    } else if (kind == "filter_update") {
+      ++update_count;
+    } else if (kind == "posterior_commit") {
+      ++commit_count;
+      if (!event.value("posterior_committed", false) ||
+          event.value("source_state_visibility", std::string()) != "committed_only") {
+        throw std::runtime_error("posterior_commit event did not publish a committed state");
+      }
+    }
+  }
+  if (predict_count != expected_frames || update_count != expected_frames || commit_count != expected_frames) {
+    throw std::runtime_error("filter predict/update/commit phase event count mismatch");
+  }
+
+  const json checkpoints = readJson(out_dir / "state_checkpoint.json");
+  const json checkpoint_items = checkpoints.value("checkpoints", json::array());
+  if (!checkpoint_items.is_array() || static_cast<int>(checkpoint_items.size()) != expected_frames) {
+    throw std::runtime_error("checkpoint count mismatch");
+  }
+  for (const auto& checkpoint : checkpoint_items) {
+    if (!checkpoint.value("committed", false) ||
+        checkpoint.value("commit_barrier", std::string()) != "posterior_commit" ||
+        checkpoint.value("commit_id", std::string()).empty()) {
+      throw std::runtime_error("checkpoint is missing committed posterior metadata");
+    }
+  }
+
+  const json loop = readJson(out_dir / "runtime_loop_summary.json");
+  const json iterations = loop.value("iterations", json::array());
+  if (!iterations.is_array() || static_cast<int>(iterations.size()) != expected_frames) {
+    throw std::runtime_error("runtime_loop_summary iteration count mismatch");
+  }
+  for (const auto& iteration : iterations) {
+    if (!iteration.value("posterior_committed", false) ||
+        iteration.value("posterior_commit_id", std::string()).empty()) {
+      throw std::runtime_error("runtime loop iteration is missing committed posterior metadata");
+    }
+  }
+
+  const json scheduler = readJson(out_dir / "scheduler_timeline.json");
+  const json scheduler_events = scheduler.value("events", json::array());
+  int scheduler_commit_count = 0;
+  for (const auto& event : scheduler_events) {
+    const std::string kind = event.value("runtime_event_kind", event.value("event_kind", std::string()));
+    if (kind == "posterior_commit") {
+      ++scheduler_commit_count;
+    }
+  }
+  if (scheduler_commit_count != expected_frames) {
+    throw std::runtime_error("scheduler timeline posterior_commit count mismatch");
   }
 }
 
@@ -284,7 +372,7 @@ int main(int argc, char** argv) {
     request.max_frames = expected_frames;
 
     FlightEnvPlatformRuntime::estimation::RuntimeEstimationService service;
-    const auto result = service.runSerial(request);
+    const auto result = service.runScheduled(request);
     if (result.exit_code != 0) {
       throw std::runtime_error("service returned non-zero exit code");
     }
@@ -299,6 +387,7 @@ int main(int argc, char** argv) {
     if (require_sample_scheduler) {
       requireSampleSchedulerEvidence(evidence, expected_method, expected_frames, batch_size_override);
     }
+    requireFilterCommitEvidence(out_dir, evidence, expected_frames);
     requireBranchEvidence(out_dir, evidence, expected_branches);
     std::cout << "[PASS] EstimationServiceAudit " << expected_method
               << " frames=" << result.frame_count
