@@ -27,6 +27,7 @@
 #include "FlightEnvPlatformRuntime/RuntimeRateTransitionExecutor.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeReadyQueueExecutor.hpp"
 #include "FlightEnvPlatformRuntime/RuntimePublicFrameBuilder.hpp"
+#include "FlightEnvPlatformRuntime/RuntimeScheduleDiagnostics.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeTimeScheduler.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeTypedBufferStore.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeZeroCopyPolicy.hpp"
@@ -3237,10 +3238,17 @@ class NativeWorkflowRunner::Impl {
     evidence_writer.writeJson("edge_binding_plan.json", edge_binding_plan_);
     evidence_writer.writeJson("rate_transition_plan.json", rate_transition_plan_);
     json scheduler_due_time_trace = json::object();
+    json scheduler_diagnostics = json::object();
     if (!scheduler_table_.empty()) {
       evidence_writer.writeJson("scheduler_table.json", scheduler_table_);
       scheduler_due_time_trace = RuntimeDueTimeScheduler(scheduler_table_).buildTrace();
       evidence_writer.writeJson("scheduler_due_time_trace.json", scheduler_due_time_trace);
+      scheduler_diagnostics = RuntimeScheduleDiagnostics(
+          scheduler_table_,
+          scheduler_due_time_trace,
+          pdk_executor.options.max_workers)
+                                  .build();
+      evidence_writer.writeJson("scheduler_diagnostics.json", scheduler_diagnostics);
     }
     const json time_plan_summary =
         time_plan_.contains("summary") && time_plan_.at("summary").is_object()
@@ -3257,6 +3265,10 @@ class NativeWorkflowRunner::Impl {
     const json scheduler_due_time_trace_summary =
         scheduler_due_time_trace.contains("summary") && scheduler_due_time_trace.at("summary").is_object()
             ? scheduler_due_time_trace.at("summary")
+            : json::object();
+    const json scheduler_diagnostics_summary =
+        scheduler_diagnostics.contains("summary") && scheduler_diagnostics.at("summary").is_object()
+            ? scheduler_diagnostics.at("summary")
             : json::object();
     evidence_writer.writeJson(
         "runtime_evidence.json",
@@ -3322,6 +3334,34 @@ class NativeWorkflowRunner::Impl {
                   scheduler_due_time_trace_summary.value("dependency_violation_count", 0)},
                  {"scheduler_due_time_trace_digest",
                   scheduler_due_time_trace_summary.value("trace_digest", std::string())},
+                 {"scheduler_diagnostics_digest",
+                  scheduler_diagnostics_summary.value("diagnostics_digest", std::string())},
+                 {"rate_graph_node_count",
+                  scheduler_diagnostics_summary.value("node_count", 0)},
+                 {"rate_graph_edge_count",
+                  scheduler_diagnostics_summary.value("rate_graph_edge_count", 0)},
+                 {"rate_graph_transition_edge_count",
+                  scheduler_diagnostics_summary.value("transition_edge_count", 0)},
+                 {"rate_graph_cross_rate_edge_count",
+                  scheduler_diagnostics_summary.value("cross_rate_edge_count", 0)},
+                 {"rate_graph_distinct_period_count",
+                  scheduler_diagnostics_summary.value("distinct_period_count", 0)},
+                 {"deterministic_multitasking_batch_count",
+                  scheduler_diagnostics_summary.value("multitasking_batch_count", 0)},
+                 {"deterministic_multitasking_parallelizable_batch_count",
+                  scheduler_diagnostics_summary.value("parallelizable_batch_count", 0)},
+                 {"deterministic_multitasking_dependency_violation_count",
+                  scheduler_diagnostics_summary.value("multitasking_dependency_violation_count", 0)},
+                 {"deadline_check_event_count",
+                  scheduler_diagnostics_summary.value("deadline_check_event_count", 0)},
+                 {"deadline_miss_count",
+                  scheduler_diagnostics_summary.value("deadline_miss_count", 0)},
+                 {"overrun_count",
+                  scheduler_diagnostics_summary.value("overrun_count", 0)},
+                 {"jitter_violation_count",
+                  scheduler_diagnostics_summary.value("jitter_violation_count", 0)},
+                 {"max_abs_jitter_s",
+                  scheduler_diagnostics_summary.value("max_abs_jitter_s", 0.0)},
                  {"ready_queue_plan_node_count", pdk_scheduler.plan_nodes.size()},
                  {"worker_pool_size", pdk_executor.options.max_workers},
                  {"pdk_workflow_process_spawned", false},
@@ -3339,6 +3379,8 @@ class NativeWorkflowRunner::Impl {
                  {"scheduler_table", scheduler_table_.empty() ? "" : "scheduler_table.json"},
                  {"scheduler_due_time_trace",
                   scheduler_due_time_trace.empty() ? "" : "scheduler_due_time_trace.json"},
+                 {"scheduler_diagnostics",
+                  scheduler_diagnostics.empty() ? "" : "scheduler_diagnostics.json"},
                  {"data_plane_manifest", "data_plane_manifest.json"},
                  {"state_checkpoint", "state_checkpoint.json"},
                  {"sensor_stream", "sensor_stream.json"}}}});
