@@ -10,7 +10,12 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
+#include <iomanip>
+#include <map>
 #include <optional>
+#include <set>
+#include <sstream>
 #include <stdexcept>
 
 namespace FlightEnvPlatformRuntime::estimation {
@@ -158,6 +163,401 @@ double jsonDouble(const nlohmann::json& value, const std::string& key, double fa
   }
   const double parsed = value.at(key).get<double>();
   return std::isfinite(parsed) ? parsed : fallback;
+}
+
+bool jsonBool(const nlohmann::json& value, const std::string& key, bool fallback = false) {
+  if (!value.is_object() || !value.contains(key) || !value.at(key).is_boolean()) {
+    return fallback;
+  }
+  return value.at(key).get<bool>();
+}
+
+double finiteOrZero(double value) {
+  return std::isfinite(value) ? value : 0.0;
+}
+
+double traceOf(const std::vector<double>& values) {
+  double sum = 0.0;
+  for (double value : values) {
+    sum += finiteOrZero(value);
+  }
+  return sum;
+}
+
+std::string digestJson(const nlohmann::json& value) {
+  const std::string text = value.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+  std::uint64_t hash = 1469598103934665603ULL;
+  for (const unsigned char c : text) {
+    hash ^= c;
+    hash *= 1099511628211ULL;
+  }
+  std::ostringstream out;
+  out << "fnv64:" << std::hex << std::setw(16) << std::setfill('0') << hash;
+  return out.str();
+}
+
+int qualityRank(const std::string& status) {
+  if (status == "invalid") {
+    return 4;
+  }
+  if (status == "stale") {
+    return 3;
+  }
+  if (status == "degraded") {
+    return 2;
+  }
+  if (status == "warn") {
+    return 1;
+  }
+  return 0;
+}
+
+std::string qualityStatus(int rank) {
+  if (rank >= 4) {
+    return "invalid";
+  }
+  if (rank == 3) {
+    return "stale";
+  }
+  if (rank == 2) {
+    return "degraded";
+  }
+  if (rank == 1) {
+    return "warn";
+  }
+  return "ok";
+}
+
+const nlohmann::json* findJsonPath(const nlohmann::json& root, const std::string& dotted_path) {
+  if (dotted_path.empty()) {
+    return nullptr;
+  }
+  const nlohmann::json* current = &root;
+  std::size_t begin = 0;
+  while (begin < dotted_path.size()) {
+    const std::size_t end = dotted_path.find('.', begin);
+    const std::string key = dotted_path.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+    if (key.empty() || !current->is_object() || !current->contains(key)) {
+      return nullptr;
+    }
+    current = &current->at(key);
+    if (end == std::string::npos) {
+      break;
+    }
+    begin = end + 1;
+  }
+  return current;
+}
+
+std::optional<double> numericJsonValue(const nlohmann::json* value) {
+  if (value == nullptr) {
+    return std::nullopt;
+  }
+  if (value->is_number()) {
+    const double parsed = value->get<double>();
+    return std::isfinite(parsed) ? std::optional<double>(parsed) : std::nullopt;
+  }
+  if (value->is_boolean()) {
+    return value->get<bool>() ? 1.0 : 0.0;
+  }
+  return std::nullopt;
+}
+
+std::string actionString(const nlohmann::json& actions, const std::string& key) {
+  if (!actions.is_object() || !actions.contains(key) || !actions.at(key).is_string()) {
+    return "";
+  }
+  return actions.at(key).get<std::string>();
+}
+
+void addSelectedAction(
+    nlohmann::json& selected,
+    std::set<std::string>& seen,
+    const std::string& policy_key,
+    const std::string& reason,
+    const std::string& action) {
+  if (action.empty()) {
+    return;
+  }
+  const std::string dedupe_key = policy_key + "|" + reason + "|" + action;
+  if (!seen.insert(dedupe_key).second) {
+    return;
+  }
+  selected.push_back({
+      {"policy_key", policy_key},
+      {"reason", reason},
+      {"action", action},
+  });
+}
+
+bool actionBlocksDownstream(const std::string& action) {
+  return action == "hold_downstream" || action == "block_decision" || action == "block_release";
+}
+
+nlohmann::json compactQualityDecision(const nlohmann::json& decision) {
+  const nlohmann::json scheduler_actions = decision.value("scheduler_actions", nlohmann::json::object());
+  const nlohmann::json adaptive = scheduler_actions.value("adaptive_frequency", nlohmann::json::object());
+  const nlohmann::json gating = scheduler_actions.value("downstream_gating", nlohmann::json::object());
+  return {
+      {"enabled", decision.value("enabled", false)},
+      {"status", decision.value("status", std::string("disabled"))},
+      {"quality_rank", decision.value("quality_rank", 0)},
+      {"decision_id", decision.value("decision_id", std::string())},
+      {"selected_action_count", scheduler_actions.value("selected_action_count", 0)},
+      {"adaptive_frequency",
+       {
+           {"enabled", adaptive.value("enabled", false)},
+           {"decision", adaptive.value("decision", std::string("disabled"))},
+           {"requested_period_s", adaptive.value("requested_period_s", 0.0)},
+       }},
+      {"downstream_gating",
+       {
+           {"enabled", gating.value("enabled", false)},
+           {"decision", gating.value("decision", std::string("pass"))},
+           {"downstream_allowed", gating.value("downstream_allowed", true)},
+       }},
+  };
+}
+
+nlohmann::json evaluateUncertaintyQualityPolicy(
+    const nlohmann::json& policy,
+    const nlohmann::json& method_config,
+    const PosteriorFrame& posterior,
+    const nlohmann::json& observation_timing,
+    int predict_only_streak) {
+  const bool enabled = policy.is_object() && policy.value("enabled", false);
+  nlohmann::json decision = {
+      {"schema_version", "flightenv.platform.uncertainty_quality_decision.v1"},
+      {"enabled", enabled},
+      {"frame_index", posterior.frame_index},
+      {"sample_time_s", posterior.sample_time_s},
+      {"status", enabled ? "ok" : "disabled"},
+      {"quality_rank", 0},
+      {"metric_snapshot", nlohmann::json::object()},
+      {"metric_evaluations", nlohmann::json::array()},
+      {"scheduler_actions", nlohmann::json::object()},
+  };
+  if (!enabled) {
+    decision["decision_id"] = "uncertainty_quality.disabled.frame_" + std::to_string(posterior.frame_index);
+    return decision;
+  }
+
+  nlohmann::json diagnostics =
+      posterior.diagnostics.is_object() ? posterior.diagnostics : nlohmann::json::object();
+  const double covariance_trace = traceOf(posterior.covariance_diag);
+  diagnostics["posterior_covariance_trace"] = covariance_trace;
+  if (!diagnostics.contains("posterior_cov_trace")) {
+    diagnostics["posterior_cov_trace"] = covariance_trace;
+  }
+  diagnostics["predict_only_streak"] = predict_only_streak;
+  if (!diagnostics.contains("observation_timing")) {
+    diagnostics["observation_timing"] = observation_timing;
+  }
+  if (diagnostics.contains("ess") && diagnostics.at("ess").is_number()) {
+    const double particle_count =
+        diagnostics.contains("particle_count") && diagnostics.at("particle_count").is_number()
+            ? diagnostics.at("particle_count").get<double>()
+            : static_cast<double>(method_config.value("particle_count", 0));
+    if (particle_count > 0.0) {
+      diagnostics["ess_ratio"] = diagnostics.at("ess").get<double>() / particle_count;
+    }
+  }
+
+  const nlohmann::json source_root = {
+      {"diagnostics", {{"estimation", diagnostics}}},
+      {"uncertainty",
+       {{"posterior",
+         {{"covariance_trace", covariance_trace},
+          {"covariance_diag", vectorJson(posterior.covariance_diag)}}}}},
+      {"runtime", {{"predict_only_streak", predict_only_streak}}},
+  };
+
+  int overall_rank = 0;
+  bool predict_only_streak_triggered = false;
+  const nlohmann::json metrics = policy.value("metrics", nlohmann::json::object());
+  if (metrics.is_object()) {
+    for (auto it = metrics.begin(); it != metrics.end(); ++it) {
+      const std::string metric_id = it.key();
+      const nlohmann::json metric_policy = it.value().is_object() ? it.value() : nlohmann::json::object();
+      const std::string source = metric_policy.value("source", metric_id);
+      std::optional<double> value = numericJsonValue(findJsonPath(source_root, source));
+      if (!value) {
+        value = numericJsonValue(findJsonPath(diagnostics, metric_id));
+      }
+      if (!value && metric_id == "predict_only_streak") {
+        value = static_cast<double>(predict_only_streak);
+      }
+      if (!value && metric_id == "posterior_covariance_trace") {
+        value = covariance_trace;
+      }
+      if (!value && metric_id == "observation_age_s") {
+        value = numericJsonValue(findJsonPath(observation_timing, "observation_age_s"));
+      }
+
+      int metric_rank = 0;
+      nlohmann::json triggered = nlohmann::json::array();
+      if (value) {
+        const double v = *value;
+        auto checkAbove = [&](const std::string& key, const std::string& status) {
+          if (metric_policy.contains(key) && metric_policy.at(key).is_number()) {
+            const double threshold = metric_policy.at(key).get<double>();
+            if (v > threshold) {
+              metric_rank = std::max(metric_rank, qualityRank(status));
+              triggered.push_back({{"threshold", key}, {"status", status}, {"threshold_value", threshold}});
+            }
+          }
+        };
+        auto checkBelow = [&](const std::string& key, const std::string& status) {
+          if (metric_policy.contains(key) && metric_policy.at(key).is_number()) {
+            const double threshold = metric_policy.at(key).get<double>();
+            if (v < threshold) {
+              metric_rank = std::max(metric_rank, qualityRank(status));
+              triggered.push_back({{"threshold", key}, {"status", status}, {"threshold_value", threshold}});
+            }
+          }
+        };
+        checkAbove("warn_above", "warn");
+        checkAbove("degrade_above", "degraded");
+        checkAbove("stale_above", "stale");
+        checkAbove("invalid_above", "invalid");
+        checkBelow("warn_below", "warn");
+        checkBelow("degrade_below", "degraded");
+        checkBelow("invalid_below", "invalid");
+        if (metric_policy.contains("max_consecutive") && metric_policy.at("max_consecutive").is_number_integer()) {
+          const int max_consecutive = metric_policy.at("max_consecutive").get<int>();
+          if (max_consecutive > 0 && static_cast<int>(v) >= max_consecutive) {
+            metric_rank = std::max(metric_rank, qualityRank("degraded"));
+            predict_only_streak_triggered = predict_only_streak_triggered || metric_id == "predict_only_streak";
+            triggered.push_back({
+                {"threshold", "max_consecutive"},
+                {"status", "degraded"},
+                {"threshold_value", max_consecutive},
+            });
+          }
+        }
+        decision["metric_snapshot"][metric_id] = v;
+      }
+      overall_rank = std::max(overall_rank, metric_rank);
+      decision["metric_evaluations"].push_back({
+          {"metric_id", metric_id},
+          {"source", source},
+          {"value_available", value.has_value()},
+          {"value", value ? nlohmann::json(*value) : nlohmann::json(nullptr)},
+          {"status", qualityStatus(metric_rank)},
+          {"quality_rank", metric_rank},
+          {"triggered_thresholds", triggered},
+      });
+    }
+  }
+
+  const std::string status = qualityStatus(overall_rank);
+  decision["status"] = status;
+  decision["quality_rank"] = overall_rank;
+  decision["decision_id"] =
+      "uncertainty_quality." + status + ".frame_" + std::to_string(posterior.frame_index);
+
+  const nlohmann::json configured_actions =
+      policy.value("scheduler_actions", nlohmann::json::object()).is_object()
+          ? policy.value("scheduler_actions", nlohmann::json::object())
+          : nlohmann::json::object();
+  nlohmann::json selected_actions = nlohmann::json::array();
+  std::set<std::string> seen_actions;
+  if (overall_rank >= qualityRank("warn")) {
+    addSelectedAction(selected_actions, seen_actions, "on_warn", status, actionString(configured_actions, "on_warn"));
+  }
+  if (overall_rank >= qualityRank("degraded")) {
+    addSelectedAction(selected_actions, seen_actions, "on_degraded", status, actionString(configured_actions, "on_degraded"));
+  }
+  if (status == "stale") {
+    addSelectedAction(selected_actions, seen_actions, "on_stale", status, actionString(configured_actions, "on_stale"));
+  }
+  if (status == "invalid") {
+    addSelectedAction(selected_actions, seen_actions, "on_invalid", status, actionString(configured_actions, "on_invalid"));
+  }
+  if (predict_only_streak_triggered) {
+    addSelectedAction(
+        selected_actions,
+        seen_actions,
+        "on_predict_only_streak",
+        "predict_only_streak",
+        actionString(configured_actions, "on_predict_only_streak"));
+  }
+
+  bool downstream_allowed = true;
+  for (const auto& item : selected_actions) {
+    if (item.is_object() && actionBlocksDownstream(item.value("action", std::string()))) {
+      downstream_allowed = false;
+    }
+  }
+
+  nlohmann::json adaptive_decision = {{"enabled", false}, {"decision", "disabled"}};
+  const nlohmann::json adaptive = configured_actions.value("adaptive_frequency", nlohmann::json::object());
+  if (adaptive.is_object() && adaptive.value("enabled", false)) {
+    const double min_period_s = std::max(0.0, jsonDouble(adaptive, "min_period_s", 0.0));
+    const double max_period_s = std::max(min_period_s, jsonDouble(adaptive, "max_period_s", min_period_s));
+    const double default_period_s = std::max(min_period_s, jsonDouble(adaptive, "default_period_s", max_period_s));
+    double requested_period_s = default_period_s;
+    std::string adaptive_status = "keep_default_period";
+    if (overall_rank >= qualityRank("degraded") || predict_only_streak_triggered) {
+      requested_period_s = min_period_s > 0.0 ? min_period_s : default_period_s;
+      adaptive_status = "shorten_period";
+    } else if (overall_rank == qualityRank("warn")) {
+      requested_period_s = default_period_s > 0.0
+                               ? std::max(min_period_s, default_period_s * 0.5)
+                               : min_period_s;
+      adaptive_status = "shorten_period";
+    }
+    if (max_period_s > 0.0) {
+      requested_period_s = std::min(requested_period_s, max_period_s);
+    }
+    adaptive_decision = {
+        {"enabled", true},
+        {"decision", adaptive_status},
+        {"min_period_s", min_period_s},
+        {"max_period_s", max_period_s},
+        {"default_period_s", default_period_s},
+        {"requested_period_s", requested_period_s},
+        {"applies_to_temporal_role", "state_filter"},
+    };
+  }
+
+  nlohmann::json downstream_decision = {{"enabled", false}, {"decision", "pass"}, {"downstream_allowed", downstream_allowed}};
+  const nlohmann::json gating = configured_actions.value("downstream_gating", nlohmann::json::object());
+  if (gating.is_object() && !gating.empty()) {
+    const std::string min_quality = gating.value("min_quality", std::string("invalid"));
+    const int min_rank = qualityRank(min_quality);
+    std::string gating_decision = "pass";
+    if (overall_rank > min_rank) {
+      downstream_allowed = false;
+      gating_decision = status == "stale"
+                            ? gating.value("stale_policy", std::string("hold_downstream"))
+                            : std::string("block_decision");
+    }
+    downstream_decision = {
+        {"enabled", true},
+        {"decision", gating_decision},
+        {"downstream_allowed", downstream_allowed},
+        {"min_quality", min_quality},
+        {"affected_temporal_roles", gating.value("affected_temporal_roles", nlohmann::json::array())},
+        {"stale_policy", gating.value("stale_policy", std::string("hold_downstream"))},
+    };
+  }
+
+  decision["scheduler_actions"] = {
+      {"selected_actions", selected_actions},
+      {"selected_action_count", selected_actions.size()},
+      {"adaptive_frequency", adaptive_decision},
+      {"downstream_gating", downstream_decision},
+  };
+  if (policy.value("evidence", nlohmann::json::object()).value("digest_inputs", true)) {
+    decision["decision_digest_algorithm"] = "fnv64";
+    decision["decision_digest"] = digestJson({
+        {"metric_snapshot", decision["metric_snapshot"]},
+        {"status", decision["status"]},
+        {"scheduler_actions", decision["scheduler_actions"]},
+    });
+  }
+  return decision;
 }
 
 bool shouldTriggerBranch(
@@ -475,12 +875,25 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
   const std::string stage_id = jsonString(system, "compiled_stage_id", "online_current.online_estimation");
   const nlohmann::json profile_schedule_overrides =
       system.value("profile_schedule_overrides", nlohmann::json::array());
+  const nlohmann::json uncertainty_quality_policy =
+      system.value("uncertainty_quality_policy", nlohmann::json::object());
+  const bool uncertainty_quality_policy_enabled =
+      uncertainty_quality_policy.is_object() && uncertainty_quality_policy.value("enabled", false);
   const double late_observation_tolerance_s = resolveLateObservationTolerance(system);
   int missing_observation_count = 0;
   int late_observation_count = 0;
   int predict_only_frame_count = 0;
   int update_frame_count = 0;
   int variable_sample_delta_count = 0;
+  int predict_only_streak = 0;
+  int uncertainty_quality_decision_count = 0;
+  int adaptive_frequency_decision_count = 0;
+  int downstream_gate_hold_count = 0;
+  int downstream_gate_block_count = 0;
+  int branch_hold_count = 0;
+  std::map<std::string, int> uncertainty_quality_status_counts;
+  nlohmann::json uncertainty_quality_events = nlohmann::json::array();
+  nlohmann::json latest_uncertainty_quality_decision = nlohmann::json::object();
   bool has_previous_sample_time = resumed_from_checkpoint;
   double previous_sample_time_s = resumed_from_checkpoint ? resumed_frame->sample_time_s : 0.0;
   scheduler_events.push_back({
@@ -600,6 +1013,7 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
     EstimatorStepResult step_result;
     if (missing_observation) {
       ++predict_only_frame_count;
+      ++predict_only_streak;
       step_result.posterior = predictOnlyPosterior(
           observation,
           previous_frame,
@@ -608,6 +1022,7 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
           method->snapshotState());
       step_result.evidence = step_result.posterior.diagnostics;
     } else {
+      predict_only_streak = 0;
       ++update_frame_count;
       EstimatorStepRequest step_request;
       step_request.observation = observation;
@@ -627,7 +1042,65 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
     step_result.posterior.diagnostics["observation_status"] =
         observation_timing.value("observation_status", std::string("available"));
     step_result.posterior.diagnostics["predict_only"] = missing_observation;
+    step_result.posterior.diagnostics["predict_only_streak"] = predict_only_streak;
     step_result.posterior.diagnostics["observation_timing"] = observation_timing;
+    step_result.posterior.diagnostics["posterior_covariance_trace"] =
+        traceOf(step_result.posterior.covariance_diag);
+    if (!step_result.posterior.diagnostics.contains("posterior_cov_trace")) {
+      step_result.posterior.diagnostics["posterior_cov_trace"] =
+          step_result.posterior.diagnostics["posterior_covariance_trace"];
+    }
+    if (step_result.posterior.diagnostics.contains("ess") &&
+        step_result.posterior.diagnostics.at("ess").is_number()) {
+      const double particle_count =
+          step_result.posterior.diagnostics.contains("particle_count") &&
+                  step_result.posterior.diagnostics.at("particle_count").is_number()
+              ? step_result.posterior.diagnostics.at("particle_count").get<double>()
+              : static_cast<double>(method_config.value("particle_count", 0));
+      if (particle_count > 0.0) {
+        step_result.posterior.diagnostics["ess_ratio"] =
+            step_result.posterior.diagnostics.at("ess").get<double>() / particle_count;
+      }
+    }
+    nlohmann::json uncertainty_quality_decision = evaluateUncertaintyQualityPolicy(
+        uncertainty_quality_policy,
+        method_config,
+        step_result.posterior,
+        observation_timing,
+        predict_only_streak);
+    uncertainty_quality_decision["timestamp_utc"] = RuntimeClock::nowUtcIso();
+    uncertainty_quality_decision["event"] = "uncertainty_quality_decision";
+    uncertainty_quality_decision["event_kind"] = "uncertainty_quality_decision";
+    uncertainty_quality_decision["runtime_event_kind"] = "uncertainty_quality_decision";
+    uncertainty_quality_decision["stage_id"] = stage_id;
+    latest_uncertainty_quality_decision = uncertainty_quality_decision;
+    if (uncertainty_quality_policy_enabled) {
+      ++uncertainty_quality_decision_count;
+      const std::string quality_status =
+          uncertainty_quality_decision.value("status", std::string("ok"));
+      ++uncertainty_quality_status_counts[quality_status];
+      const nlohmann::json quality_actions =
+          uncertainty_quality_decision.value("scheduler_actions", nlohmann::json::object());
+      const nlohmann::json adaptive =
+          quality_actions.value("adaptive_frequency", nlohmann::json::object());
+      if (adaptive.value("enabled", false)) {
+        ++adaptive_frequency_decision_count;
+      }
+      const nlohmann::json gating =
+          quality_actions.value("downstream_gating", nlohmann::json::object());
+      if (gating.value("enabled", false) && !gating.value("downstream_allowed", true)) {
+        const std::string gating_decision = gating.value("decision", std::string());
+        if (gating_decision == "hold_downstream") {
+          ++downstream_gate_hold_count;
+        } else {
+          ++downstream_gate_block_count;
+        }
+      }
+    }
+    uncertainty_quality_events.push_back(uncertainty_quality_decision);
+    scheduler_events.push_back(uncertainty_quality_decision);
+    step_result.posterior.diagnostics["uncertainty_quality"] =
+        compactQualityDecision(uncertainty_quality_decision);
     nlohmann::json update_event = filterPhaseEvent(
         "filter_update",
         missing_observation ? "skipped" : "completed",
@@ -640,6 +1113,7 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
         "");
     attachObservationTiming(update_event, observation_timing);
     update_event["diagnostics"] = step_result.posterior.diagnostics;
+    update_event["uncertainty_quality"] = compactQualityDecision(uncertainty_quality_decision);
     if (missing_observation) {
       update_event["reason"] = "missing_observation";
       update_event["predict_only"] = true;
@@ -665,6 +1139,7 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
     commit_event["predict_only"] = missing_observation;
     commit_event["estimator_state_checkpointed"] =
         step_result.posterior.estimator_state.is_object() && !step_result.posterior.estimator_state.empty();
+    commit_event["uncertainty_quality"] = compactQualityDecision(uncertainty_quality_decision);
     scheduler_events.push_back(commit_event);
     filter_phase_events.push_back(commit_event);
     frame_phase_events.push_back(commit_event);
@@ -683,10 +1158,31 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
     frame_evidence.push_back(frameEvidence(step_result.posterior));
     const int processed_frame_count = static_cast<int>(store.frames().size());
     if (shouldTriggerBranch(branching_policy, processed_frame_count, static_cast<int>(branch_events.size()))) {
-      const nlohmann::json branch_event =
-          branchTriggerEvent(request, branching_policy, step_result.posterior, static_cast<int>(branch_events.size()));
-      branch_events.push_back(branch_event);
-      scheduler_events.push_back(branch_event);
+      const nlohmann::json gating =
+          uncertainty_quality_decision.value("scheduler_actions", nlohmann::json::object())
+              .value("downstream_gating", nlohmann::json::object());
+      const bool downstream_allowed =
+          !uncertainty_quality_policy_enabled || gating.value("downstream_allowed", true);
+      if (downstream_allowed) {
+        const nlohmann::json branch_event =
+            branchTriggerEvent(request, branching_policy, step_result.posterior, static_cast<int>(branch_events.size()));
+        branch_events.push_back(branch_event);
+        scheduler_events.push_back(branch_event);
+      } else {
+        ++branch_hold_count;
+        scheduler_events.push_back({
+            {"timestamp_utc", RuntimeClock::nowUtcIso()},
+            {"event", "branch_held_by_uncertainty_quality"},
+            {"event_kind", "branch_held_by_uncertainty_quality"},
+            {"runtime_event_kind", "branch_held_by_uncertainty_quality"},
+            {"stage_id", stage_id},
+            {"frame_index", observation.frame_index},
+            {"sample_time_s", observation.sample_time_s},
+            {"checkpoint_id", step_result.posterior.checkpoint_id},
+            {"posterior_commit_id", step_result.posterior.commit_id},
+            {"uncertainty_quality", compactQualityDecision(uncertainty_quality_decision)},
+        });
+      }
     }
     loop_iterations.push_back({
         {"loop_iteration_index", observation.frame_index},
@@ -700,6 +1196,7 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
         {"predict_only", missing_observation},
         {"missing_observation", missing_observation},
         {"late_observation", late_observation},
+        {"uncertainty_quality", compactQualityDecision(uncertainty_quality_decision)},
         {"filter_phase_events", frame_phase_events},
         {"diagnostics", step_result.posterior.diagnostics},
         {"sample_scheduler", compactSampleScheduleDiagnostics(sample_schedule)},
@@ -722,6 +1219,26 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
   if (latest == nullptr) {
     throw std::runtime_error("RuntimeEstimationService produced no posterior frames");
   }
+  nlohmann::json uncertainty_quality_status_counts_json = nlohmann::json::object();
+  for (const auto& item : uncertainty_quality_status_counts) {
+    uncertainty_quality_status_counts_json[item.first] = item.second;
+  }
+  const nlohmann::json uncertainty_quality_summary = {
+      {"enabled", uncertainty_quality_policy_enabled},
+      {"decision_count", uncertainty_quality_decision_count},
+      {"status_counts", uncertainty_quality_status_counts_json},
+      {"latest_status",
+       latest_uncertainty_quality_decision.value(
+           "status",
+           std::string(uncertainty_quality_policy_enabled ? "ok" : "disabled"))},
+      {"latest_quality_rank", latest_uncertainty_quality_decision.value("quality_rank", 0)},
+      {"adaptive_frequency_decision_count", adaptive_frequency_decision_count},
+      {"downstream_gate_hold_count", downstream_gate_hold_count},
+      {"downstream_gate_block_count", downstream_gate_block_count},
+      {"branch_hold_count", branch_hold_count},
+      {"policy_digest",
+       uncertainty_quality_policy_enabled ? digestJson(uncertainty_quality_policy) : std::string()},
+  };
   const nlohmann::json latest_outputs = {
       {"status", "ok"},
       {"outputs",
@@ -772,6 +1289,7 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
            {"predict_only_frame_count", predict_only_frame_count},
            {"update_frame_count", update_frame_count},
            {"variable_sample_delta_count", variable_sample_delta_count},
+           {"uncertainty_quality", uncertainty_quality_summary},
            {"resumed_from_checkpoint", resumed_from_checkpoint},
            {"resume_checkpoint_id", resumed_from_checkpoint ? resumed_frame->checkpoint_id : std::string()},
            {"latest_checkpoint", latest->checkpoint_id},
@@ -807,6 +1325,13 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
             resumed_from_checkpoint && resumed_frame->estimator_state.is_object() && !resumed_frame->estimator_state.empty()},
            {"source_state_visibility", "committed_only"},
        }},
+      {"uncertainty_quality",
+       {
+           {"policy", uncertainty_quality_policy},
+           {"summary", uncertainty_quality_summary},
+           {"latest_decision", latest_uncertainty_quality_decision},
+           {"events", uncertainty_quality_events},
+       }},
       {"sample_scheduler",
        {
            {"enabled", true},
@@ -822,6 +1347,20 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
   };
 
   const RuntimeEvidenceWriter writer(request.run_dir);
+  writer.writeJson("uncertainty_quality_evidence.json",
+                   {{"schema_version", "flightenv.platform.uncertainty_quality_evidence.v1"},
+                    {"run_id", request.run_id},
+                    {"workflow_id", request.workflow_id},
+                    {"object_id", request.object_id},
+                    {"branch_id", request.branch_id},
+                    {"timeline_id", request.timeline_id},
+                    {"generated_at_utc", RuntimeClock::nowUtcIso()},
+                    {"estimation_system_id", jsonString(system, "estimation_system_id")},
+                    {"stage_id", stage_id},
+                    {"policy", uncertainty_quality_policy},
+                    {"summary", uncertainty_quality_summary},
+                    {"latest_decision", latest_uncertainty_quality_decision},
+                    {"events", uncertainty_quality_events}});
   writer.writeJson("estimation_evidence.json", estimation_evidence);
   writer.writeJson("scheduler_timeline.json",
                    {{"schema_version", "flightenv.platform.scheduler_timeline.v1"},
@@ -867,7 +1406,8 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
                      {{"iteration_count", store.frames().size()},
                       {"committed_frame_count", commit_log.size()},
                       {"failed_nodes", 0},
-                      {"estimation_method", method_kind}}}});
+                      {"estimation_method", method_kind},
+                      {"uncertainty_quality", uncertainty_quality_summary}}}});
   writer.writeJson("state_checkpoint.json", store.toCheckpointJson(request.run_id, request.workflow_id, request.object_id));
   writer.writeJson("runtime_evidence.json",
                    {{"schema_version", "flightenv.platform.runtime_evidence.v1"},
@@ -890,6 +1430,7 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
                       {"committed_frame_count", commit_log.size()},
                       {"predict_only_frame_count", predict_only_frame_count},
                       {"update_frame_count", update_frame_count}}},
+                    {"uncertainty_quality", uncertainty_quality_summary},
                     {"checkpoint_resume",
                      {{"resumed_from_checkpoint", resumed_from_checkpoint},
                       {"checkpoint_id", resumed_from_checkpoint ? resumed_frame->checkpoint_id : std::string()},
@@ -910,6 +1451,17 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
                       {"predict_only_frame_count", predict_only_frame_count},
                       {"update_frame_count", update_frame_count},
                       {"variable_sample_delta_count", variable_sample_delta_count},
+                      {"uncertainty_quality_policy_enabled", uncertainty_quality_policy_enabled},
+                      {"uncertainty_quality_decision_count", uncertainty_quality_decision_count},
+                      {"uncertainty_quality_latest_status",
+                       uncertainty_quality_summary.value("latest_status", std::string())},
+                      {"uncertainty_quality_adaptive_frequency_decision_count",
+                       adaptive_frequency_decision_count},
+                      {"uncertainty_quality_downstream_gate_hold_count",
+                       downstream_gate_hold_count},
+                      {"uncertainty_quality_downstream_gate_block_count",
+                       downstream_gate_block_count},
+                      {"uncertainty_quality_branch_hold_count", branch_hold_count},
                       {"resumed_from_checkpoint", resumed_from_checkpoint},
                       {"estimation_profile_schedule_override_count",
                        profile_schedule_overrides.is_array() ? profile_schedule_overrides.size() : 0},
@@ -922,6 +1474,7 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
                       {"triggered_branch_count", branch_events.size()}}},
                     {"refs",
                      {{"estimation_evidence", "estimation_evidence.json"},
+                      {"uncertainty_quality_evidence", "uncertainty_quality_evidence.json"},
                       {"branch_timeline", "branch_timeline.json"},
                       {"runtime_node_snapshot", "runtime_node_snapshot.json"},
                       {"runtime_outputs", "runtime_outputs.json"},
@@ -944,6 +1497,7 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
       {"missing_observation_count", missing_observation_count},
       {"late_observation_count", late_observation_count},
       {"predict_only_frame_count", predict_only_frame_count},
+      {"uncertainty_quality", uncertainty_quality_summary},
       {"resumed_from_checkpoint", resumed_from_checkpoint},
   };
   return result;

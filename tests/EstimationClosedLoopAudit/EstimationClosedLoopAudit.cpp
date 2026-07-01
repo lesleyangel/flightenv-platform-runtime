@@ -263,6 +263,46 @@ void requireForecastReadOnlyEvidence(const json& evidence) {
   }
 }
 
+void requireUncertaintyQualityEvidence(
+    const fs::path& full_run_dir,
+    const json& full_evidence,
+    const fs::path& missing_late_run_dir,
+    const json& missing_late_evidence) {
+  const json full_quality = requireObject(full_evidence, "uncertainty_quality");
+  const json full_quality_summary = requireObject(full_quality, "summary");
+  if (!full_quality_summary.value("enabled", false) ||
+      full_quality_summary.value("decision_count", -1) !=
+          requireObject(full_evidence, "summary").value("frame_count", -2) ||
+      full_quality_summary.value("adaptive_frequency_decision_count", -1) !=
+          requireObject(full_evidence, "summary").value("frame_count", -2)) {
+    throw std::runtime_error("uncertainty quality full-run summary mismatch");
+  }
+  const json full_quality_file = readJson(full_run_dir / "uncertainty_quality_evidence.json");
+  if (requireArray(full_quality_file, "events").size() !=
+      static_cast<std::size_t>(requireObject(full_evidence, "summary").value("frame_count", 0))) {
+    throw std::runtime_error("standalone uncertainty quality evidence event count mismatch");
+  }
+
+  const json missing_quality = requireObject(missing_late_evidence, "uncertainty_quality");
+  const json missing_quality_summary = requireObject(missing_quality, "summary");
+  const json status_counts = requireObject(missing_quality_summary, "status_counts");
+  if (status_counts.value("stale", 0) < 1 ||
+      missing_quality_summary.value("downstream_gate_hold_count", 0) < 1) {
+    throw std::runtime_error("late observation did not trigger stale hold_downstream quality decision");
+  }
+  const json missing_quality_file = readJson(missing_late_run_dir / "uncertainty_quality_evidence.json");
+  bool saw_hold_downstream = false;
+  for (const auto& event : requireArray(missing_quality_file, "events")) {
+    const json actions = event.value("scheduler_actions", json::object());
+    const json gating = actions.value("downstream_gating", json::object());
+    saw_hold_downstream = saw_hold_downstream ||
+                          gating.value("decision", std::string()) == "hold_downstream";
+  }
+  if (!saw_hold_downstream) {
+    throw std::runtime_error("uncertainty quality evidence missing hold_downstream decision");
+  }
+}
+
 json singleCheckpointAtFrame(const fs::path& run_dir, int frame_index) {
   const json checkpoint = readJson(run_dir / "state_checkpoint.json");
   json selected = json::array();
@@ -338,6 +378,7 @@ int main(int argc, char** argv) {
         workflow_snapshot,
         makeStream(missing_late_frames));
     requireMissingLateEvidence(missing_late_dir, missing_late_evidence);
+    requireUncertaintyQualityEvidence(full_dir, full_evidence, missing_late_dir, missing_late_evidence);
 
     json resumed_frames = json::array();
     for (int i = 4; i < 8; ++i) {
@@ -364,6 +405,11 @@ int main(int argc, char** argv) {
         {"missing_observation_count", requireObject(missing_late_evidence, "summary").value("missing_observation_count", 0)},
         {"late_observation_count", requireObject(missing_late_evidence, "summary").value("late_observation_count", 0)},
         {"predict_only_frame_count", requireObject(missing_late_evidence, "summary").value("predict_only_frame_count", 0)},
+        {"uncertainty_quality_policy_runtime_evaluated", true},
+        {"uncertainty_quality_stale_decision_count",
+         requireObject(requireObject(requireObject(missing_late_evidence, "uncertainty_quality"), "summary"), "status_counts").value("stale", 0)},
+        {"uncertainty_quality_downstream_hold_count",
+         requireObject(requireObject(missing_late_evidence, "uncertainty_quality"), "summary").value("downstream_gate_hold_count", 0)},
         {"resume_matches_full_from_frame", 4},
         {"forecast_uses_committed_read_only_checkpoint", true},
     };
