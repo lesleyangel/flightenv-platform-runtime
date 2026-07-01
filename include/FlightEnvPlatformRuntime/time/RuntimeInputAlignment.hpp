@@ -37,6 +37,15 @@ enum class RuntimeAlignmentStrategy {
  * @brief 为一个上游依赖解析出的输入对齐策略。
  */
 struct RuntimeInputAlignmentPolicy {
+  std::string transition_id;
+  std::string binding_id;
+  std::string raw_strategy;
+  std::string rate_relation;
+  bool from_rate_transition = false;
+  bool requires_runtime_transition = false;
+  double source_period_s = -1.0;
+  double target_period_s = -1.0;
+  double max_age_s = -1.0;
   std::string upstream_node_id; ///< 产生样本的源节点 id。
   std::string source_port_id;   ///< 可选源端口 id；为空时选择节点级通道。
   std::string target_port_id;   ///< 对齐后要填充的可选目标输入端口 id。
@@ -81,6 +90,10 @@ struct RuntimeInputAlignmentResult {
    * @return 至少评估过一个输入策略时为真。
    */
   bool hasEvidence() const;
+
+  bool hasUnavailableRequiredInputs() const;
+
+  nlohmann::json unavailableRequiredEvidence() const;
 
   /**
    * @brief 序列化所有已对齐输入的证据。

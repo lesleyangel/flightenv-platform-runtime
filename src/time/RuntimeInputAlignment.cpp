@@ -34,11 +34,23 @@ double jsonDouble(const nlohmann::json& value, const std::string& key, double fa
   return value.at(key).get<double>();
 }
 
+bool jsonBool(const nlohmann::json& value, const std::string& key, bool fallback = false) {
+  if (!value.is_object() || !value.contains(key) || !value.at(key).is_boolean()) {
+    return fallback;
+  }
+  return value.at(key).get<bool>();
+}
+
 RuntimeAlignmentStrategy parseStrategy(const nlohmann::json& raw) {
+  const std::string explicit_strategy = jsonString(raw, "strategy");
   const std::string resampling = jsonString(raw, "input_resampling", "none");
   const std::string alignment = jsonString(raw, "alignment", "exact");
-  const std::string strategy = resampling != "none" ? resampling : alignment;
-  if (strategy == "exact" || strategy == "exact_or_substep") return RuntimeAlignmentStrategy::Exact;
+  const std::string strategy = !explicit_strategy.empty()
+                                   ? explicit_strategy
+                                   : (resampling != "none" ? resampling : alignment);
+  if (strategy == "direct" || strategy == "exact" || strategy == "exact_or_substep") {
+    return RuntimeAlignmentStrategy::Exact;
+  }
   if (strategy == "hold_last") return RuntimeAlignmentStrategy::HoldLast;
   if (strategy == "nearest") return RuntimeAlignmentStrategy::Nearest;
   if (strategy == "interpolate" || strategy == "linear") return RuntimeAlignmentStrategy::Linear;
@@ -99,6 +111,17 @@ double durationSecondsNonNegative(RuntimeDuration duration) {
 
 RuntimeInputAlignmentPolicy parsePolicy(const nlohmann::json& raw) {
   RuntimeInputAlignmentPolicy policy;
+  policy.transition_id = jsonString(raw, "transition_id");
+  policy.binding_id = jsonString(raw, "binding_id");
+  policy.raw_strategy = jsonString(raw, "strategy");
+  policy.rate_relation = jsonString(raw, "rate_relation");
+  policy.from_rate_transition =
+      !policy.transition_id.empty() || !policy.binding_id.empty() || !policy.rate_relation.empty();
+  policy.requires_runtime_transition =
+      jsonBool(raw, "requires_runtime_transition", policy.from_rate_transition);
+  policy.source_period_s = jsonDouble(raw, "source_period_s", -1.0);
+  policy.target_period_s = jsonDouble(raw, "target_period_s", -1.0);
+  policy.max_age_s = jsonDouble(raw, "max_age_s", -1.0);
   policy.upstream_node_id = jsonString(raw, "upstream_node_id", jsonString(raw, "source_node_id"));
   policy.source_port_id = jsonString(raw, "source_port_id");
   policy.target_port_id = jsonString(raw, "target_port_id");
@@ -106,8 +129,8 @@ RuntimeInputAlignmentPolicy parsePolicy(const nlohmann::json& raw) {
   policy.raw_input_resampling = jsonString(raw, "input_resampling", "none");
   policy.tensor_interpolation = jsonString(raw, "tensor_interpolation", "nearest");
   policy.strategy = parseStrategy(raw);
-  policy.max_staleness_s = jsonDouble(raw, "max_staleness_s", -1.0);
-  policy.max_gap_s = jsonDouble(raw, "max_gap_s", -1.0);
+  policy.max_staleness_s = jsonDouble(raw, "max_staleness_s", policy.max_age_s);
+  policy.max_gap_s = jsonDouble(raw, "max_gap_s", policy.max_age_s);
   return policy;
 }
 
@@ -299,12 +322,23 @@ RuntimeAlignedInput alignOne(
 
 nlohmann::json RuntimeAlignedInput::evidence() const {
   return {
+      {"transition_id", policy.transition_id},
+      {"binding_id", policy.binding_id},
       {"upstream_node_id", policy.upstream_node_id},
       {"source_port_id", policy.source_port_id},
       {"target_port_id", policy.target_port_id},
       {"strategy", strategyName(policy.strategy)},
+      {"raw_strategy", policy.raw_strategy},
       {"raw_alignment", policy.raw_alignment},
       {"raw_input_resampling", policy.raw_input_resampling},
+      {"rate_relation", policy.rate_relation},
+      {"from_rate_transition", policy.from_rate_transition},
+      {"requires_runtime_transition", policy.requires_runtime_transition},
+      {"source_period_s", policy.source_period_s},
+      {"target_period_s", policy.target_period_s},
+      {"max_age_s", policy.max_age_s},
+      {"max_staleness_s", policy.max_staleness_s},
+      {"max_gap_s", policy.max_gap_s},
       {"tensor_interpolation", policy.tensor_interpolation},
       {"available", available},
       {"status", status},
@@ -321,6 +355,33 @@ bool RuntimeInputAlignmentResult::hasEvidence() const {
   return !inputs.empty();
 }
 
+bool RuntimeInputAlignmentResult::hasUnavailableRequiredInputs() const {
+  for (const auto& input : inputs) {
+    const bool required =
+        input.policy.from_rate_transition &&
+        input.policy.requires_runtime_transition &&
+        input.policy.strategy != RuntimeAlignmentStrategy::Independent;
+    if (required && !input.available) {
+      return true;
+    }
+  }
+  return false;
+}
+
+nlohmann::json RuntimeInputAlignmentResult::unavailableRequiredEvidence() const {
+  nlohmann::json items = nlohmann::json::array();
+  for (const auto& input : inputs) {
+    const bool required =
+        input.policy.from_rate_transition &&
+        input.policy.requires_runtime_transition &&
+        input.policy.strategy != RuntimeAlignmentStrategy::Independent;
+    if (required && !input.available) {
+      items.push_back(input.evidence());
+    }
+  }
+  return items;
+}
+
 nlohmann::json RuntimeInputAlignmentResult::evidence() const {
   nlohmann::json items = nlohmann::json::array();
   for (const auto& input : inputs) {
@@ -334,7 +395,13 @@ RuntimeInputAlignmentResult RuntimeInputAlignment::alignNodeInputs(
     const nlohmann::json& time_info,
     const RuntimePortSampleBuffer& sample_buffer) {
   RuntimeInputAlignmentResult result;
-  const nlohmann::json alignments = time_info.value("input_alignment", node.value("input_alignment", nlohmann::json::array()));
+  nlohmann::json alignments = nlohmann::json::array();
+  if (node.contains("rate_transitions") && node.at("rate_transitions").is_array() &&
+      !node.at("rate_transitions").empty()) {
+    alignments = node.at("rate_transitions");
+  } else {
+    alignments = time_info.value("input_alignment", node.value("input_alignment", nlohmann::json::array()));
+  }
   if (!alignments.is_array()) {
     return result;
   }

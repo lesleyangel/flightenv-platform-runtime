@@ -2977,6 +2977,19 @@ int PlatformRuntimeHost::runBranchWorker() {
       };
       writeJson(options_.branch_run_dir / "runtime_outputs.json", latest_outputs);
 
+      const fs::path latest_chunk_dir = latest_seed_path.parent_path();
+      const json latest_chunk_runtime_evidence =
+          objectOrEmpty(readJsonIfExists(latest_chunk_dir / "runtime_evidence.json"));
+      const json latest_chunk_summary =
+          objectOrEmpty(latest_chunk_runtime_evidence.value("summary", json::object()));
+      const fs::path latest_rate_transition_plan = latest_chunk_dir / "rate_transition_plan.json";
+      if (fs::exists(latest_rate_transition_plan)) {
+        fs::copy_file(
+            latest_rate_transition_plan,
+            options_.branch_run_dir / "rate_transition_plan.json",
+            fs::copy_options::overwrite_existing);
+      }
+
       writeJson(options_.branch_run_dir / "runtime_evidence.json",
                 {
                     {"schema_version", "flightenv.platform.runtime_evidence.v1"},
@@ -3004,6 +3017,11 @@ int PlatformRuntimeHost::runBranchWorker() {
                          {"base_dt_s", base_dt_s},
                          {"output_period_s", output_period_s},
                          {"field_artifact_count", countFieldArtifactEntries(aggregate_data)},
+                         {"rate_transition_count", jsonInt(latest_chunk_summary, "rate_transition_count", 0)},
+                         {"cross_rate_transition_count",
+                          jsonInt(latest_chunk_summary, "cross_rate_transition_count", 0)},
+                         {"runtime_rate_transition_count",
+                          jsonInt(latest_chunk_summary, "runtime_rate_transition_count", 0)},
                          {"stop_reason", stop_reason},
                          {"trigger_frame_index", options_.trigger_frame_index},
                          {"trigger_time_s", options_.trigger_time_s},
@@ -3015,6 +3033,7 @@ int PlatformRuntimeHost::runBranchWorker() {
                          {"data_plane_manifest", "data_plane_manifest.json"},
                          {"state_checkpoint", "state_checkpoint.json"},
                          {"runtime_node_snapshot", "runtime_node_snapshot.json"},
+                         {"rate_transition_plan", "rate_transition_plan.json"},
                      }},
                 });
     };

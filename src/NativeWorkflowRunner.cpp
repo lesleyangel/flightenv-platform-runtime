@@ -2114,6 +2114,27 @@ class NativeWorkflowRunner::Impl {
             RuntimeInputAlignment::alignNodeInputs(node, time_info, port_sample_buffer);
         RuntimeInputAlignment::applyAlignedInputs(input_alignment, upstream);
         public_tick_effective_delta_t_by_node[node_id] = cadence.effective_delta_t_s;
+        if (input_alignment.hasUnavailableRequiredInputs()) {
+          scheduler_events.push_back({
+              {"timestamp_utc", nowUtcIso()},
+              {"node_id", node_id},
+              {"event", "input_alignment_blocked"},
+              {"runtime_event_id", loop_event.event_id},
+              {"runtime_event_kind", loop_event.event_kind},
+              {"status", "blocked"},
+              {"reason", "required_rate_transition_input_unavailable"},
+              {"dispatch_tick_index", dispatch_tick_index},
+              {"runtime_event_time_s", loop_event.event_time_s},
+              {"runtime_event_time_ns", loop_event.event_time.nanoseconds},
+              {"loop_iteration_index", iteration},
+              {"input_binding", port_binding.evidence},
+              {"input_alignment", input_alignment.evidence()},
+              {"unavailable_required_inputs", input_alignment.unavailableRequiredEvidence()},
+          });
+          appendTrace(req.run_dir, "execute_node_deferred_by_input_alignment iteration=" +
+                                     std::to_string(iteration) + " node=" + node_id);
+          continue;
+        }
         RuntimeReadyAdmission admission =
             ready_executor.admitNode(node, loop_event, outputs, port_store, req.branch_id, req.timeline_id);
         scheduler_events.push_back({
@@ -2412,12 +2433,53 @@ class NativeWorkflowRunner::Impl {
     data_plane_plan_ = readJsonIfExists(options_.compiled_workflow / "data_plane_plan.json");
     estimation_plan_ = readJsonIfExists(options_.compiled_workflow / "estimation_plan.json");
     edge_binding_plan_ = readJson(options_.compiled_workflow / "edge_binding_plan.json");
+    const fs::path rate_transition_plan_path = options_.compiled_workflow / "rate_transition_plan.json";
+    const bool has_rate_transition_plan = fs::exists(rate_transition_plan_path);
+    rate_transition_plan_ = has_rate_transition_plan
+                                ? readJson(rate_transition_plan_path)
+                                : json{
+                                      {"schema_version", "flightenv.platform.rate_transition_plan.v1"},
+                                      {"transitions", json::array()},
+                                      {"summary",
+                                       {{"transition_count", 0},
+                                        {"same_rate_transition_count", 0},
+                                        {"cross_rate_transition_count", 0},
+                                        {"fast_to_slow_count", 0},
+                                        {"slow_to_fast_count", 0},
+                                        {"runtime_transition_count", 0}}},
+                                  };
     workflow_snapshot_ = readJsonIfExists(options_.compiled_workflow / "workflow_snapshot.json");
     operator_snapshot_ = readJsonIfExists(options_.compiled_workflow / "operator_snapshot.json");
     resource_lock_ = readJsonIfExists(options_.compiled_workflow / "resource_lock.json");
     model_snapshot_ = readJsonIfExists(options_.compiled_workflow / "model_snapshot.json");
     json execution_nodes = requireArray(execution_plan_, "nodes", options_.compiled_workflow / "execution_plan.json");
     edge_bindings_by_target_ = json::object();
+    rate_transitions_by_binding_ = json::object();
+    rate_transitions_by_target_ = json::object();
+    const json compiled_transitions = rate_transition_plan_.value("transitions", json::array());
+    if (compiled_transitions.is_array()) {
+      for (const auto& transition : compiled_transitions) {
+        if (!transition.is_object()) {
+          continue;
+        }
+        const std::string transition_id = jsonString(transition, "transition_id");
+        const std::string binding_id = jsonString(transition, "binding_id");
+        const std::string target_node_id = jsonString(transition, "target_node_id");
+        const std::string source_node_id = jsonString(transition, "source_node_id");
+        const std::string source_port_id = jsonString(transition, "source_port_id");
+        const std::string target_port_id = jsonString(transition, "target_port_id");
+        if (transition_id.empty() || binding_id.empty() || target_node_id.empty() ||
+            source_node_id.empty() || source_port_id.empty() || target_port_id.empty()) {
+          throw std::runtime_error("rate_transition_plan.json contains an incomplete transition");
+        }
+        if (rate_transitions_by_binding_.contains(binding_id)) {
+          throw std::runtime_error(
+              "rate_transition_plan.json contains duplicate transition for binding: " + binding_id);
+        }
+        rate_transitions_by_binding_[binding_id] = transition;
+        rate_transitions_by_target_[target_node_id].push_back(transition);
+      }
+    }
     const json compiled_bindings = edge_binding_plan_.value("bindings", json::array());
     if (compiled_bindings.is_array()) {
       for (const auto& binding : compiled_bindings) {
@@ -2432,7 +2494,15 @@ class NativeWorkflowRunner::Impl {
             source_port_id.empty() || target_port_id.empty()) {
           throw std::runtime_error("edge_binding_plan.json contains an incomplete binding");
         }
-        edge_bindings_by_target_[target_node_id].push_back(binding);
+        json enriched_binding = binding;
+        const std::string binding_id = jsonString(enriched_binding, "binding_id");
+        if (!binding_id.empty() && rate_transitions_by_binding_.contains(binding_id)) {
+          enriched_binding["rate_transition"] = rate_transitions_by_binding_.at(binding_id);
+        } else if (has_rate_transition_plan) {
+          throw std::runtime_error(
+              "rate_transition_plan.json is missing a transition for edge binding: " + binding_id);
+        }
+        edge_bindings_by_target_[target_node_id].push_back(enriched_binding);
       }
     }
     if (edge_bindings_by_target_.empty() &&
@@ -2508,6 +2578,9 @@ class NativeWorkflowRunner::Impl {
         }
       }
       node["edge_bindings"] = edge_bindings_by_target_.at(node_id);
+      if (rate_transitions_by_target_.contains(node_id)) {
+        node["rate_transitions"] = rate_transitions_by_target_.at(node_id);
+      }
     }
     nodes_ = topoSortNodes(execution_nodes);
     workflow_id_ = jsonString(execution_plan_, "workflow_id", "workflow");
@@ -3098,6 +3171,7 @@ class NativeWorkflowRunner::Impl {
     evidence_writer.writeJson("adapter_session_summary.json", sessionSummary());
     evidence_writer.writeJson("adapter_backend_capability_report.json", backend_capability_report);
     evidence_writer.writeJson("edge_binding_plan.json", edge_binding_plan_);
+    evidence_writer.writeJson("rate_transition_plan.json", rate_transition_plan_);
     evidence_writer.writeJson(
         "runtime_evidence.json",
         {{"schema_version", "flightenv.platform.runtime_evidence.v1"},
@@ -3128,6 +3202,12 @@ class NativeWorkflowRunner::Impl {
                  {"runtime_packet_count", port_store_packets.size()},
                  {"port_store_node_output_count", portStoreEvidence(port_store).value("node_output_count", 0)},
                  {"edge_binding_count", edge_binding_plan_.value("summary", json::object()).value("binding_count", 0)},
+                 {"rate_transition_count",
+                  rate_transition_plan_.value("summary", json::object()).value("transition_count", 0)},
+                 {"cross_rate_transition_count",
+                  rate_transition_plan_.value("summary", json::object()).value("cross_rate_transition_count", 0)},
+                 {"runtime_rate_transition_count",
+                  rate_transition_plan_.value("summary", json::object()).value("runtime_transition_count", 0)},
                  {"ready_queue_plan_node_count", pdk_scheduler.plan_nodes.size()},
                  {"worker_pool_size", pdk_executor.options.max_workers},
                  {"pdk_workflow_process_spawned", false},
@@ -3140,6 +3220,7 @@ class NativeWorkflowRunner::Impl {
                  {"runtime_outputs", "runtime_outputs.json"},
                  {"runtime_loop_summary", "runtime_loop_summary.json"},
                  {"edge_binding_plan", "edge_binding_plan.json"},
+                 {"rate_transition_plan", "rate_transition_plan.json"},
                  {"data_plane_manifest", "data_plane_manifest.json"},
                  {"state_checkpoint", "state_checkpoint.json"},
                  {"sensor_stream", "sensor_stream.json"}}}});
@@ -3154,12 +3235,15 @@ class NativeWorkflowRunner::Impl {
   json data_plane_plan_ = json::object();
   json estimation_plan_ = json::object();
   json edge_binding_plan_ = json::object();
+  json rate_transition_plan_ = json::object();
   json workflow_snapshot_ = json::object();
   json operator_snapshot_ = json::object();
   json resource_lock_ = json::object();
   json model_snapshot_ = json::object();
   json adapter_registry_ = json::object();
   json edge_bindings_by_target_ = json::object();
+  json rate_transitions_by_binding_ = json::object();
+  json rate_transitions_by_target_ = json::object();
   std::vector<json> nodes_;
   std::map<std::string, json> operator_by_id_;
   std::map<std::string, json> resource_by_id_;

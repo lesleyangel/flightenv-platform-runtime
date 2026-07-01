@@ -126,6 +126,27 @@ std::string bindingTargetPortId(const nlohmann::json& binding) {
       jsonString(binding, "target_port", jsonString(binding, "target_port_name")));
 }
 
+nlohmann::json rateTransitionEvidence(const nlohmann::json& binding) {
+  if (!binding.is_object() || !binding.contains("rate_transition") ||
+      !binding.at("rate_transition").is_object()) {
+    return nlohmann::json::object();
+  }
+  const nlohmann::json& transition = binding.at("rate_transition");
+  nlohmann::json evidence = {
+      {"transition_id", jsonString(transition, "transition_id")},
+      {"binding_id", jsonString(transition, "binding_id")},
+      {"rate_relation", jsonString(transition, "rate_relation")},
+      {"strategy", jsonString(transition, "strategy")},
+      {"source_period_s", transition.value("source_period_s", -1.0)},
+      {"target_period_s", transition.value("target_period_s", -1.0)},
+      {"requires_runtime_transition", jsonBool(transition, "requires_runtime_transition", false)},
+  };
+  if (transition.contains("max_age_s")) {
+    evidence["max_age_s"] = transition.at("max_age_s");
+  }
+  return evidence;
+}
+
 bool currentOutputsContainPort(
     const nlohmann::json& outputs,
     const std::string& node_id,
@@ -348,7 +369,7 @@ RuntimeReadyAdmission RuntimeReadyQueueExecutor::admitNode(
       const std::string source_port_id = bindingSourcePortId(binding);
       const std::string target_port_id = bindingTargetPortId(binding);
       const PortReadiness readiness = source_port_ready(source_node_id, source_port_id);
-      port_check_details.push_back({
+      nlohmann::json port_check = {
           {"source_node_id", source_node_id},
           {"source_port_id", source_port_id},
           {"target_port_id", target_port_id},
@@ -356,7 +377,12 @@ RuntimeReadyAdmission RuntimeReadyQueueExecutor::admitNode(
           {"timeline_id", timeline_id},
           {"ready", readiness.ready},
           {"readiness_source", readiness.source},
-      });
+      };
+      const nlohmann::json transition_evidence = rateTransitionEvidence(binding);
+      if (!transition_evidence.empty()) {
+        port_check["rate_transition"] = transition_evidence;
+      }
+      port_check_details.push_back(port_check);
       if (!readiness.ready) {
         appendUnique(admission.missing_input_ports, target_port_id.empty() ? source_node_id : target_port_id);
       }
