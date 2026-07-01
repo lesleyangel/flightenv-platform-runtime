@@ -2428,6 +2428,7 @@ class NativeWorkflowRunner::Impl {
     execution_plan_ = readJson(options_.compiled_workflow / "execution_plan.json");
     time_plan_ = readJsonIfExists(options_.compiled_workflow / "time_plan.json");
     scheduler_plan_ = readJsonIfExists(options_.compiled_workflow / "scheduler_plan.json");
+    scheduler_table_ = readJsonIfExists(options_.compiled_workflow / "scheduler_table.json");
     uncertainty_plan_ = readJsonIfExists(options_.compiled_workflow / "uncertainty_plan.json");
     state_store_plan_ = readJsonIfExists(options_.compiled_workflow / "state_store_plan.json");
     data_plane_plan_ = readJsonIfExists(options_.compiled_workflow / "data_plane_plan.json");
@@ -3172,6 +3173,9 @@ class NativeWorkflowRunner::Impl {
     evidence_writer.writeJson("adapter_backend_capability_report.json", backend_capability_report);
     evidence_writer.writeJson("edge_binding_plan.json", edge_binding_plan_);
     evidence_writer.writeJson("rate_transition_plan.json", rate_transition_plan_);
+    if (!scheduler_table_.empty()) {
+      evidence_writer.writeJson("scheduler_table.json", scheduler_table_);
+    }
     const json time_plan_summary =
         time_plan_.contains("summary") && time_plan_.at("summary").is_object()
             ? time_plan_.at("summary")
@@ -3179,6 +3183,10 @@ class NativeWorkflowRunner::Impl {
     const json scheduler_plan_summary =
         scheduler_plan_.contains("summary") && scheduler_plan_.at("summary").is_object()
             ? scheduler_plan_.at("summary")
+            : json::object();
+    const json scheduler_table_summary =
+        scheduler_table_.contains("summary") && scheduler_table_.at("summary").is_object()
+            ? scheduler_table_.at("summary")
             : json::object();
     evidence_writer.writeJson(
         "runtime_evidence.json",
@@ -3223,6 +3231,14 @@ class NativeWorkflowRunner::Impl {
                   time_plan_summary.value("profile_schedule_override_node_count", 0)},
                  {"scheduler_profile_schedule_override_node_count",
                   scheduler_plan_summary.value("profile_schedule_override_node_count", 0)},
+                 {"scheduler_table_dispatch_entry_count",
+                  scheduler_table_summary.value("dispatch_entry_count", 0)},
+                 {"scheduler_table_transition_entry_count",
+                  scheduler_table_summary.value("transition_entry_count", 0)},
+                 {"scheduler_table_runtime_transition_entry_count",
+                  scheduler_table_summary.value("runtime_transition_entry_count", 0)},
+                 {"scheduler_table_profile_schedule_override_entry_count",
+                  scheduler_table_summary.value("profile_schedule_override_entry_count", 0)},
                  {"ready_queue_plan_node_count", pdk_scheduler.plan_nodes.size()},
                  {"worker_pool_size", pdk_executor.options.max_workers},
                  {"pdk_workflow_process_spawned", false},
@@ -3236,6 +3252,7 @@ class NativeWorkflowRunner::Impl {
                  {"runtime_loop_summary", "runtime_loop_summary.json"},
                  {"edge_binding_plan", "edge_binding_plan.json"},
                  {"rate_transition_plan", "rate_transition_plan.json"},
+                 {"scheduler_table", scheduler_table_.empty() ? "" : "scheduler_table.json"},
                  {"data_plane_manifest", "data_plane_manifest.json"},
                  {"state_checkpoint", "state_checkpoint.json"},
                  {"sensor_stream", "sensor_stream.json"}}}});
@@ -3245,6 +3262,7 @@ class NativeWorkflowRunner::Impl {
   json execution_plan_ = json::object();
   json time_plan_ = json::object();
   json scheduler_plan_ = json::object();
+  json scheduler_table_ = json::object();
   json uncertainty_plan_ = json::object();
   json state_store_plan_ = json::object();
   json data_plane_plan_ = json::object();
