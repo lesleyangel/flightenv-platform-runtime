@@ -279,6 +279,8 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
   const nlohmann::json workflow = workflowFromSnapshot(request.workflow_snapshot);
   const nlohmann::json branching_policy = workflow.value("branching_policy", nlohmann::json::object());
   const std::string stage_id = jsonString(system, "compiled_stage_id", "online_current.online_estimation");
+  const nlohmann::json profile_schedule_overrides =
+      system.value("profile_schedule_overrides", nlohmann::json::array());
   scheduler_events.push_back({
       {"timestamp_utc", RuntimeClock::nowUtcIso()},
       {"event", "estimation_session_begin"},
@@ -464,10 +466,13 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
       {"method", method_kind},
       {"execution_mode", execution_mode},
       {"model_graphs", system.value("model_graphs", nlohmann::json::object())},
+      {"profile_schedule_overrides", profile_schedule_overrides},
       {"summary",
        {
            {"frame_count", store.frames().size()},
            {"committed_frame_count", commit_log.size()},
+           {"profile_schedule_override_count",
+            profile_schedule_overrides.is_array() ? profile_schedule_overrides.size() : 0},
            {"state_dim", state_dim},
            {"failed_frame_count", 0},
            {"latest_checkpoint", latest->checkpoint_id},
@@ -574,6 +579,8 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
                       {"estimation_method", method_kind},
                       {"sample_scheduler_frame_count", sample_scheduler_frames.size()},
                       {"committed_frame_count", commit_log.size()},
+                      {"estimation_profile_schedule_override_count",
+                       profile_schedule_overrides.is_array() ? profile_schedule_overrides.size() : 0},
                       {"triggered_branch_count", branch_events.size()},
                       {"latest_checkpoint", latest->checkpoint_id},
                       {"latest_commit_id", latest->commit_id}}},

@@ -3172,6 +3172,14 @@ class NativeWorkflowRunner::Impl {
     evidence_writer.writeJson("adapter_backend_capability_report.json", backend_capability_report);
     evidence_writer.writeJson("edge_binding_plan.json", edge_binding_plan_);
     evidence_writer.writeJson("rate_transition_plan.json", rate_transition_plan_);
+    const json time_plan_summary =
+        time_plan_.contains("summary") && time_plan_.at("summary").is_object()
+            ? time_plan_.at("summary")
+            : json::object();
+    const json scheduler_plan_summary =
+        scheduler_plan_.contains("summary") && scheduler_plan_.at("summary").is_object()
+            ? scheduler_plan_.at("summary")
+            : json::object();
     evidence_writer.writeJson(
         "runtime_evidence.json",
         {{"schema_version", "flightenv.platform.runtime_evidence.v1"},
@@ -3208,6 +3216,13 @@ class NativeWorkflowRunner::Impl {
                   rate_transition_plan_.value("summary", json::object()).value("cross_rate_transition_count", 0)},
                  {"runtime_rate_transition_count",
                   rate_transition_plan_.value("summary", json::object()).value("runtime_transition_count", 0)},
+                 {"time_plan_node_count", time_plan_summary.value("node_count", 0)},
+                 {"time_plan_distinct_delta_t_s",
+                  time_plan_summary.value("distinct_delta_t_s", json::array())},
+                 {"time_plan_profile_schedule_override_node_count",
+                  time_plan_summary.value("profile_schedule_override_node_count", 0)},
+                 {"scheduler_profile_schedule_override_node_count",
+                  scheduler_plan_summary.value("profile_schedule_override_node_count", 0)},
                  {"ready_queue_plan_node_count", pdk_scheduler.plan_nodes.size()},
                  {"worker_pool_size", pdk_executor.options.max_workers},
                  {"pdk_workflow_process_spawned", false},
