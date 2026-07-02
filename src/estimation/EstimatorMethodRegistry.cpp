@@ -207,6 +207,74 @@ class ParticleFilterMethod final : public IEstimatorMethod {
     return {posterior, posterior.diagnostics};
   }
 
+  EstimatorStepResult predictOnly(const EstimatorStepRequest& request) override {
+    std::vector<double> target(state_dim_, 0.0);
+    if (request.previous && request.previous->state_mean.size() >= state_dim_) {
+      target = request.previous->state_mean;
+      target.resize(state_dim_, 0.0);
+    } else {
+      target = resizedObservation(request.observation, state_dim_);
+    }
+    ensureParticles(target);
+
+    const std::vector<double> before_mean = weightedMean();
+    for (std::size_t p = 0; p < particles_.size(); ++p) {
+      for (std::size_t d = 0; d < state_dim_; ++d) {
+        const double deterministic_shift =
+            d < before_mean.size() ? target[d] - before_mean[d] : 0.0;
+        particles_[p][d] += deterministic_shift;
+      }
+    }
+
+    const double spread_growth = 1.005;
+    const std::vector<double> shifted_mean = weightedMean();
+    for (std::size_t p = 0; p < particles_.size(); ++p) {
+      for (std::size_t d = 0; d < state_dim_; ++d) {
+        const double centered = particles_[p][d] - shifted_mean[d];
+        const double deterministic_jitter =
+            1.0e-6 * static_cast<double>((static_cast<int>(p + d) % 11) - 5);
+        particles_[p][d] = shifted_mean[d] + spread_growth * centered + deterministic_jitter;
+      }
+    }
+
+    const std::vector<double> mean = weightedMean();
+    std::vector<double> covariance_diag = covarianceDiag(mean);
+    for (double& value : covariance_diag) {
+      value = std::max(kMinVariance, value);
+    }
+    const double ess = effectiveSampleSize();
+
+    PosteriorFrame posterior;
+    posterior.frame_index = request.observation.frame_index;
+    posterior.sample_time_s = request.observation.sample_time_s;
+    posterior.value_labels = request.previous && !request.previous->value_labels.empty()
+                                 ? request.previous->value_labels
+                                 : resizedLabels(request.observation, state_dim_);
+    posterior.value_labels.resize(state_dim_);
+    for (std::size_t d = 0; d < state_dim_; ++d) {
+      if (posterior.value_labels[d].empty()) {
+        posterior.value_labels[d] = "state_" + std::to_string(d);
+      }
+    }
+    posterior.state_mean = mean;
+    posterior.covariance_diag = std::move(covariance_diag);
+    posterior.checkpoint_id =
+        "posterior.pf.frame_" + std::to_string(request.observation.frame_index) + ".predict_only";
+    posterior.diagnostics = {
+        {"particle_count", particle_count_},
+        {"ess", ess},
+        {"resampling_count", resampling_count_},
+        {"resampled_this_frame", false},
+        {"posterior_checkpoint", posterior.checkpoint_id},
+        {"predict_only", true},
+        {"observation_update_applied", false},
+        {"forecast_uncertainty_propagation", "particle_predict_only"},
+        {"spread_growth", spread_growth},
+        {"posterior_cov_trace", traceOf(posterior.covariance_diag)},
+    };
+    return {posterior, posterior.diagnostics};
+  }
+
   nlohmann::json snapshotState() const override {
     return {
         {"method_kind", kind()},
@@ -273,6 +341,29 @@ class ParticleFilterMethod final : public IEstimatorMethod {
       sum_sq += weight * weight;
     }
     return sum_sq > 0.0 ? 1.0 / sum_sq : 0.0;
+  }
+
+  std::vector<double> weightedMean() const {
+    std::vector<double> mean(state_dim_, 0.0);
+    for (std::size_t p = 0; p < particles_.size(); ++p) {
+      const double weight = p < weights_.size() ? weights_[p] : 0.0;
+      for (std::size_t d = 0; d < state_dim_; ++d) {
+        mean[d] += weight * particles_[p][d];
+      }
+    }
+    return mean;
+  }
+
+  std::vector<double> covarianceDiag(const std::vector<double>& mean) const {
+    std::vector<double> covariance_diag(state_dim_, kMinVariance);
+    for (std::size_t p = 0; p < particles_.size(); ++p) {
+      const double weight = p < weights_.size() ? weights_[p] : 0.0;
+      for (std::size_t d = 0; d < state_dim_; ++d) {
+        const double delta = particles_[p][d] - mean[d];
+        covariance_diag[d] += weight * delta * delta;
+      }
+    }
+    return covariance_diag;
   }
 
   void systematicResample() {
@@ -358,6 +449,47 @@ class BlackboxUnscentedKalmanMethod final : public IEstimatorMethod {
         {"posterior_cov_trace", trace},
         {"jitter_count", jitter_count_},
         {"posterior_checkpoint", posterior.checkpoint_id},
+        {"covariance_diag_nonnegative", true},
+        {"covariance_symmetric", true},
+    };
+    return {posterior, posterior.diagnostics};
+  }
+
+  EstimatorStepResult predictOnly(const EstimatorStepRequest& request) override {
+    if (!initialized_) {
+      mean_ = request.previous && request.previous->state_mean.size() >= state_dim_
+                  ? request.previous->state_mean
+                  : resizedObservation(request.observation, state_dim_);
+      covariance_diag_ = request.previous && request.previous->covariance_diag.size() >= state_dim_
+                             ? request.previous->covariance_diag
+                             : std::vector<double>(state_dim_, 1.0);
+      mean_.resize(state_dim_, 0.0);
+      covariance_diag_.resize(state_dim_, 1.0);
+      initialized_ = true;
+    }
+    for (double& value : covariance_diag_) {
+      value = std::max(covariance_jitter_, value * 1.01 + covariance_jitter_);
+    }
+
+    PosteriorFrame posterior;
+    posterior.frame_index = request.observation.frame_index;
+    posterior.sample_time_s = request.observation.sample_time_s;
+    posterior.value_labels = request.previous && !request.previous->value_labels.empty()
+                                 ? request.previous->value_labels
+                                 : resizedLabels(request.observation, state_dim_);
+    posterior.value_labels.resize(state_dim_);
+    posterior.state_mean = mean_;
+    posterior.covariance_diag = covariance_diag_;
+    posterior.checkpoint_id =
+        "posterior.ukf.frame_" + std::to_string(request.observation.frame_index) + ".predict_only";
+    posterior.diagnostics = {
+        {"sigma_point_count", static_cast<int>(2 * state_dim_ + 1)},
+        {"posterior_cov_trace", traceOf(covariance_diag_)},
+        {"jitter_count", jitter_count_},
+        {"posterior_checkpoint", posterior.checkpoint_id},
+        {"predict_only", true},
+        {"observation_update_applied", false},
+        {"forecast_uncertainty_propagation", "covariance_predict_only"},
         {"covariance_diag_nonnegative", true},
         {"covariance_symmetric", true},
     };
@@ -494,6 +626,49 @@ class ExtendedKalmanMethod final : public IEstimatorMethod {
     return {posterior, posterior.diagnostics};
   }
 
+  EstimatorStepResult predictOnly(const EstimatorStepRequest& request) override {
+    if (!initialized_) {
+      mean_ = request.previous && request.previous->state_mean.size() >= state_dim_
+                  ? request.previous->state_mean
+                  : resizedObservation(request.observation, state_dim_);
+      covariance_diag_ = request.previous && request.previous->covariance_diag.size() >= state_dim_
+                             ? request.previous->covariance_diag
+                             : std::vector<double>(state_dim_, 1.0);
+      mean_.resize(state_dim_, 0.0);
+      covariance_diag_.resize(state_dim_, 1.0);
+      initialized_ = true;
+    }
+    for (std::size_t d = 0; d < state_dim_; ++d) {
+      covariance_diag_[d] = std::max(kMinVariance, covariance_diag_[d] + process_noise_diag_[d]);
+    }
+
+    PosteriorFrame posterior;
+    posterior.frame_index = request.observation.frame_index;
+    posterior.sample_time_s = request.observation.sample_time_s;
+    posterior.value_labels = request.previous && !request.previous->value_labels.empty()
+                                 ? request.previous->value_labels
+                                 : resizedLabels(request.observation, state_dim_);
+    posterior.value_labels.resize(state_dim_);
+    posterior.state_mean = mean_;
+    posterior.covariance_diag = covariance_diag_;
+    posterior.checkpoint_id =
+        "posterior.ekf.frame_" + std::to_string(request.observation.frame_index) + ".predict_only";
+    posterior.diagnostics = {
+        {"linearization", linearization_},
+        {"jacobian_provider", jacobian_provider_},
+        {"requires_jacobian", true},
+        {"supports_blackbox_transition", jacobian_provider_ == "finite_difference"},
+        {"posterior_cov_trace", traceOf(posterior.covariance_diag)},
+        {"posterior_checkpoint", posterior.checkpoint_id},
+        {"predict_only", true},
+        {"observation_update_applied", false},
+        {"forecast_uncertainty_propagation", "covariance_predict_only"},
+        {"covariance_diag_nonnegative", true},
+        {"method_skeleton", true},
+    };
+    return {posterior, posterior.diagnostics};
+  }
+
   nlohmann::json snapshotState() const override {
     return {
         {"method_kind", kind()},
@@ -597,6 +772,60 @@ class EnsembleKalmanMethod final : public IEstimatorMethod {
         {"ensemble_spread_trace", traceOf(posterior.covariance_diag)},
         {"posterior_cov_trace", traceOf(posterior.covariance_diag)},
         {"posterior_checkpoint", posterior.checkpoint_id},
+        {"covariance_diag_nonnegative", true},
+        {"method_skeleton", true},
+    };
+    return {posterior, posterior.diagnostics};
+  }
+
+  EstimatorStepResult predictOnly(const EstimatorStepRequest& request) override {
+    const std::vector<double> center = request.previous && request.previous->state_mean.size() >= state_dim_
+                                          ? request.previous->state_mean
+                                          : resizedObservation(request.observation, state_dim_);
+    ensureEnsemble(request, center);
+    for (auto& member : ensemble_) {
+      for (std::size_t d = 0; d < state_dim_; ++d) {
+        const double centered = member[d] - ensemble_mean_[d];
+        member[d] = ensemble_mean_[d] + std::max(1.0, inflation_factor_) * 1.005 * centered;
+      }
+    }
+
+    std::vector<double> mean(state_dim_, 0.0);
+    for (const auto& member : ensemble_) {
+      for (std::size_t d = 0; d < state_dim_; ++d) {
+        mean[d] += member[d] / static_cast<double>(ensemble_size_);
+      }
+    }
+    std::vector<double> covariance_diag(state_dim_, kMinVariance);
+    for (const auto& member : ensemble_) {
+      for (std::size_t d = 0; d < state_dim_; ++d) {
+        const double delta = member[d] - mean[d];
+        covariance_diag[d] += delta * delta / static_cast<double>(std::max(1, ensemble_size_ - 1));
+      }
+    }
+
+    ensemble_mean_ = mean;
+    PosteriorFrame posterior;
+    posterior.frame_index = request.observation.frame_index;
+    posterior.sample_time_s = request.observation.sample_time_s;
+    posterior.value_labels = request.previous && !request.previous->value_labels.empty()
+                                 ? request.previous->value_labels
+                                 : resizedLabels(request.observation, state_dim_);
+    posterior.value_labels.resize(state_dim_);
+    posterior.state_mean = std::move(mean);
+    posterior.covariance_diag = std::move(covariance_diag);
+    posterior.checkpoint_id =
+        "posterior.enkf.frame_" + std::to_string(request.observation.frame_index) + ".predict_only";
+    posterior.diagnostics = {
+        {"ensemble_size", ensemble_size_},
+        {"inflation_factor", inflation_factor_},
+        {"localization", localization_},
+        {"ensemble_spread_trace", traceOf(posterior.covariance_diag)},
+        {"posterior_cov_trace", traceOf(posterior.covariance_diag)},
+        {"posterior_checkpoint", posterior.checkpoint_id},
+        {"predict_only", true},
+        {"observation_update_applied", false},
+        {"forecast_uncertainty_propagation", "ensemble_predict_only"},
         {"covariance_diag_nonnegative", true},
         {"method_skeleton", true},
     };

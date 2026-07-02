@@ -31,7 +31,9 @@
 #include "FlightEnvPlatformRuntime/RuntimeTimeScheduler.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeTypedBufferStore.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeZeroCopyPolicy.hpp"
+#include "FlightEnvPlatformRuntime/estimation/EstimatorMethodRegistry.hpp"
 #include "FlightEnvPlatformRuntime/estimation/RuntimeEstimationService.hpp"
+#include "FlightEnvPlatformRuntime/estimation/SampleSetStore.hpp"
 #include "FlightEnvPlatformRuntime/time/RuntimeEventQueue.hpp"
 #include "FlightEnvPlatformRuntime/time/RuntimeInputAlignment.hpp"
 #include "FlightEnvPlatformRuntime/time/RuntimeMaterialization.hpp"
@@ -50,6 +52,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -841,6 +844,317 @@ json seedFromRuntimeOutputs(const fs::path& path) {
   };
   return seed;
 }
+
+std::vector<double> doubleArrayFromJson(const json& values) {
+  std::vector<double> out;
+  if (!values.is_array()) {
+    return out;
+  }
+  out.reserve(values.size());
+  for (const auto& item : values) {
+    if (!item.is_number()) {
+      out.push_back(0.0);
+      continue;
+    }
+    const double value = item.get<double>();
+    out.push_back(std::isfinite(value) ? value : 0.0);
+  }
+  return out;
+}
+
+std::vector<std::string> stringArrayFromJson(const json& values) {
+  std::vector<std::string> out;
+  if (!values.is_array()) {
+    return out;
+  }
+  out.reserve(values.size());
+  for (const auto& item : values) {
+    out.push_back(item.is_string() ? item.get<std::string>() : std::string());
+  }
+  return out;
+}
+
+json doubleArrayJson(const std::vector<double>& values) {
+  json out = json::array();
+  for (double value : values) {
+    out.push_back(value);
+  }
+  return out;
+}
+
+json stringArrayJson(const std::vector<std::string>& values) {
+  json out = json::array();
+  for (const std::string& value : values) {
+    out.push_back(value);
+  }
+  return out;
+}
+
+double traceOfDoubles(const std::vector<double>& values) {
+  double trace = 0.0;
+  for (double value : values) {
+    trace += std::isfinite(value) ? value : 0.0;
+  }
+  return trace;
+}
+
+std::optional<estimation::PosteriorFrame> latestEstimatorCheckpointFromSeed(
+    const fs::path& seed_runtime_outputs) {
+  if (seed_runtime_outputs.empty()) {
+    return std::nullopt;
+  }
+  const fs::path seed_path = fs::absolute(seed_runtime_outputs);
+  const fs::path checkpoint_path =
+      fs::is_directory(seed_path) ? seed_path / "state_checkpoint.json"
+                                  : seed_path.parent_path() / "state_checkpoint.json";
+  const json checkpoint_payload = readJsonIfExists(checkpoint_path);
+  const json checkpoints = checkpoint_payload.value("checkpoints", json::array());
+  if (!checkpoints.is_array()) {
+    return std::nullopt;
+  }
+
+  std::optional<estimation::PosteriorFrame> latest;
+  for (const auto& item : checkpoints) {
+    if (!item.is_object()) {
+      continue;
+    }
+    const json estimator_state = item.value("estimator_state", json::object());
+    if (!estimator_state.is_object() || estimator_state.empty()) {
+      continue;
+    }
+    estimation::PosteriorFrame frame;
+    frame.frame_index = jsonInt(item, "frame_index", jsonInt(item, "loop_iteration_index", 0));
+    frame.sample_time_s = jsonDouble(item, "sample_time_s", 0.0);
+    frame.checkpoint_id = jsonString(item, "checkpoint_id");
+    frame.commit_id = jsonString(item, "commit_id");
+    frame.committed = item.value("committed", false);
+    frame.value_labels = stringArrayFromJson(item.value("labels", item.value("value_labels", json::array())));
+    frame.state_mean = doubleArrayFromJson(item.value("state_mean", json::array()));
+    frame.covariance_diag = doubleArrayFromJson(item.value("covariance_diag", json::array()));
+    frame.estimator_state = estimator_state;
+    frame.diagnostics = item.value("diagnostics", json::object());
+    if (frame.state_mean.empty() || frame.covariance_diag.empty()) {
+      continue;
+    }
+    latest = std::move(frame);
+  }
+  return latest;
+}
+
+struct ForecastUncertaintyStep {
+  json output = json::object();
+  json checkpoint = json::object();
+  json event = json::object();
+  json scheduler_event = json::object();
+};
+
+class ForecastUncertaintyTracker {
+ public:
+  bool initialize(const fs::path& seed_runtime_outputs) {
+    const auto seed_frame = latestEstimatorCheckpointFromSeed(seed_runtime_outputs);
+    if (!seed_frame || !seed_frame->estimator_state.is_object()) {
+      return false;
+    }
+    const std::string method_kind = jsonString(seed_frame->estimator_state, "method_kind");
+    if (method_kind.empty()) {
+      return false;
+    }
+    try {
+      method_ = estimation::EstimatorMethodRegistry::create(method_kind);
+    } catch (const std::exception&) {
+      method_.reset();
+      return false;
+    }
+    latest_ = *seed_frame;
+    method_kind_ = method_kind;
+    const std::size_t state_dim =
+        std::max<std::size_t>(1, latest_.state_mean.empty() ? latest_.covariance_diag.size()
+                                                            : latest_.state_mean.size());
+    method_->configure(latest_.estimator_state, state_dim);
+    method_->restoreState(latest_.estimator_state);
+    seed_checkpoint_id_ = latest_.checkpoint_id;
+    seed_covariance_trace_ = traceOfDoubles(latest_.covariance_diag);
+    latest_covariance_trace_ = seed_covariance_trace_;
+    enabled_ = true;
+    return true;
+  }
+
+  bool enabled() const {
+    return enabled_ && method_ != nullptr;
+  }
+
+  ForecastUncertaintyStep step(
+      const NativeWorkflowRequest& req,
+      const std::string& workflow_id,
+      const std::string& object_id,
+      int loop_iteration_index,
+      double delta_t_s) {
+    if (!enabled()) {
+      return {};
+    }
+    if (!(delta_t_s > 0.0) || !std::isfinite(delta_t_s)) {
+      delta_t_s = 1.0;
+    }
+
+    estimation::RuntimeObservationFrame observation;
+    observation.frame_index = latest_.frame_index + 1;
+    observation.sample_time_s = latest_.sample_time_s + delta_t_s;
+    observation.arrival_time_s = observation.sample_time_s;
+    observation.has_arrival_time = true;
+    observation.missing_observation = true;
+    observation.observation_status = "predict_only_forecast";
+    observation.value_labels = latest_.value_labels;
+    observation.values = latest_.state_mean;
+    observation.payload = {
+        {"source", "forecast_uncertainty_predict_only"},
+        {"seed_checkpoint_id", seed_checkpoint_id_},
+        {"loop_iteration_index", loop_iteration_index},
+    };
+
+    estimation::EstimatorStepRequest request;
+    request.observation = observation;
+    request.previous = &latest_;
+    estimation::EstimatorStepResult result = method_->predictOnly(request);
+    result.posterior.estimator_state = method_->snapshotState();
+    result.posterior.committed = true;
+    result.posterior.commit_id =
+        req.run_id + ".forecast_uncertainty.frame_" + std::to_string(observation.frame_index);
+    result.posterior.diagnostics["forecast_uncertainty"] = true;
+    result.posterior.diagnostics["branch_id"] = req.branch_id;
+    result.posterior.diagnostics["timeline_id"] = req.timeline_id;
+    result.posterior.diagnostics["seed_checkpoint_id"] = seed_checkpoint_id_;
+    result.posterior.diagnostics["loop_iteration_index"] = loop_iteration_index;
+
+    latest_ = result.posterior;
+    latest_covariance_trace_ = traceOfDoubles(latest_.covariance_diag);
+    ++step_count_;
+    const double growth_ratio =
+        seed_covariance_trace_ > 0.0 ? latest_covariance_trace_ / seed_covariance_trace_ : 0.0;
+
+    json diagnostics = latest_.diagnostics;
+    diagnostics["covariance_trace"] = latest_covariance_trace_;
+    diagnostics["seed_covariance_trace"] = seed_covariance_trace_;
+    diagnostics["growth_ratio"] = growth_ratio;
+    diagnostics["step_count"] = step_count_;
+    diagnostics["method_kind"] = method_kind_;
+
+    const json state_payload = {
+        {"contract_id", "platform.state_vector.v1"},
+        {"frame_index", latest_.frame_index},
+        {"sample_time_s", latest_.sample_time_s},
+        {"valid_time_s", latest_.sample_time_s},
+        {"checkpoint_id", latest_.checkpoint_id},
+        {"labels", stringArrayJson(latest_.value_labels)},
+        {"values", doubleArrayJson(latest_.state_mean)},
+        {"source", "estimator_predict_only"},
+    };
+    const json uncertainty_payload = {
+        {"contract_id", "platform.uncertainty_summary.v1"},
+        {"representation", "diagonal_covariance"},
+        {"frame_index", latest_.frame_index},
+        {"sample_time_s", latest_.sample_time_s},
+        {"checkpoint_id", latest_.checkpoint_id},
+        {"covariance_diag", doubleArrayJson(latest_.covariance_diag)},
+        {"covariance_trace", latest_covariance_trace_},
+        {"seed_covariance_trace", seed_covariance_trace_},
+        {"growth_ratio", growth_ratio},
+        {"observation_update_applied", false},
+        {"predict_only", true},
+        {"method_kind", method_kind_},
+    };
+
+    ForecastUncertaintyStep step;
+    step.output = {
+        {"status", "ok"},
+        {"synthetic_node", true},
+        {"node_id", "__forecast_uncertainty__"},
+        {"operator_id", "platform.estimation.forecast_predict_only.synthetic.v1"},
+        {"execution_kind", "platform_synthetic"},
+        {"outputs",
+         {
+             {"state.forecast", state_payload},
+             {"uncertainty.forecast", uncertainty_payload},
+             {"diagnostics.forecast", diagnostics},
+         }},
+        {"time_info",
+         {
+             {"public_output_time_s", latest_.sample_time_s},
+             {"loop_iteration_index", loop_iteration_index},
+             {"branch_id", req.branch_id},
+             {"timeline_id", req.timeline_id},
+         }},
+    };
+    step.checkpoint = {
+        {"checkpoint_id", latest_.checkpoint_id},
+        {"commit_id", latest_.commit_id},
+        {"checkpoint_kind", "forecast_predict_only"},
+        {"committed", true},
+        {"commit_barrier", "forecast_predict_only"},
+        {"loop_iteration_index", loop_iteration_index},
+        {"frame_index", latest_.frame_index},
+        {"sample_time_s", latest_.sample_time_s},
+        {"labels", stringArrayJson(latest_.value_labels)},
+        {"state_mean", doubleArrayJson(latest_.state_mean)},
+        {"covariance_diag", doubleArrayJson(latest_.covariance_diag)},
+        {"estimator_state", latest_.estimator_state},
+        {"diagnostics", diagnostics},
+    };
+    step.event = {
+        {"event", "forecast_uncertainty_predict_only"},
+        {"run_id", req.run_id},
+        {"workflow_id", workflow_id},
+        {"object_id", object_id},
+        {"branch_id", req.branch_id},
+        {"timeline_id", req.timeline_id},
+        {"loop_iteration_index", loop_iteration_index},
+        {"frame_index", latest_.frame_index},
+        {"sample_time_s", latest_.sample_time_s},
+        {"method_kind", method_kind_},
+        {"checkpoint_id", latest_.checkpoint_id},
+        {"seed_checkpoint_id", seed_checkpoint_id_},
+        {"covariance_trace", latest_covariance_trace_},
+        {"seed_covariance_trace", seed_covariance_trace_},
+        {"growth_ratio", growth_ratio},
+    };
+    step.scheduler_event = {
+        {"event", "forecast_uncertainty_predict_only"},
+        {"status", "completed"},
+        {"synthetic_node", true},
+        {"node_id", "__forecast_uncertainty__"},
+        {"operator_id", "platform.estimation.forecast_predict_only.synthetic.v1"},
+        {"loop_iteration_index", loop_iteration_index},
+        {"frame_index", latest_.frame_index},
+        {"event_time_s", latest_.sample_time_s},
+        {"branch_id", req.branch_id},
+        {"timeline_id", req.timeline_id},
+    };
+    return step;
+  }
+
+  json summary() const {
+    const double growth_ratio =
+        seed_covariance_trace_ > 0.0 ? latest_covariance_trace_ / seed_covariance_trace_ : 0.0;
+    return {
+        {"enabled", enabled()},
+        {"method_kind", method_kind_},
+        {"step_count", step_count_},
+        {"seed_checkpoint_id", seed_checkpoint_id_},
+        {"seed_covariance_trace", seed_covariance_trace_},
+        {"latest_covariance_trace", latest_covariance_trace_},
+        {"growth_ratio", growth_ratio},
+    };
+  }
+
+ private:
+  bool enabled_ = false;
+  int step_count_ = 0;
+  double seed_covariance_trace_ = 0.0;
+  double latest_covariance_trace_ = 0.0;
+  std::string method_kind_;
+  std::string seed_checkpoint_id_;
+  estimation::PosteriorFrame latest_;
+  std::unique_ptr<estimation::IEstimatorMethod> method_;
+};
 
 flightenv::platform::RuntimePacket buildRuntimePacket(
     const std::string& run_id,
@@ -1974,6 +2288,11 @@ class NativeWorkflowRunner::Impl {
     const int max_iterations = req.prepare_only ? 1 : std::max(1, jsonInt(loop_policy, "max_iterations", req.max_iterations));
     const double base_dt_s = jsonDouble(loop_policy, "base_dt_s", 0.0);
     const double output_period_s = jsonDouble(loop_policy, "output_period_s", base_dt_s);
+    ForecastUncertaintyTracker forecast_uncertainty;
+    json forecast_uncertainty_events = json::array();
+    if (forecast_uncertainty.initialize(req.seed_runtime_outputs)) {
+      appendTrace(req.run_dir, "forecast_uncertainty_tracker_enabled");
+    }
     if (!req.prepare_only && nodes_.empty() &&
         estimation_plan_.value("summary", json::object()).value("estimation_system_count", 0) > 0) {
       appendTrace(req.run_dir, "runtime_estimation_service_begin");
@@ -2020,6 +2339,7 @@ class NativeWorkflowRunner::Impl {
       writeArtifacts(req, lifecycle_events, scheduler_events, node_snapshots, uncertainty_nodes, checkpoints,
                      data_plane_entries, input_artifacts, output_artifacts, loop_iterations,
                      runtime_packets, runtime_rate_transition_nodes, outputs,
+                     forecast_uncertainty_events, forecast_uncertainty.summary(),
                      previous_seed, external_observations, port_store, pdk_scheduler, pdk_executor,
                      ready_executor,
                      0, failed_nodes, true);
@@ -2426,6 +2746,17 @@ class NativeWorkflowRunner::Impl {
         stop_requested = true;
         break;
       }
+      if (forecast_uncertainty.enabled()) {
+        const double forecast_delta_t_s = output_period_s > 0.0 ? output_period_s : base_dt_s;
+        const ForecastUncertaintyStep forecast_step = forecast_uncertainty.step(
+            req, workflow_id_, object_id_, iteration, forecast_delta_t_s);
+        if (!forecast_step.output.empty()) {
+          outputs["__forecast_uncertainty__"] = forecast_step.output;
+          checkpoints.push_back(forecast_step.checkpoint);
+          forecast_uncertainty_events.push_back(forecast_step.event);
+          scheduler_events.push_back(forecast_step.scheduler_event);
+        }
+      }
       previous_seed = recurrentSeedFromOutputs(outputs, iteration);
       public_tick_outputs = json::object();
       public_tick_effective_delta_t_by_node = json::object();
@@ -2439,6 +2770,7 @@ class NativeWorkflowRunner::Impl {
     writeArtifacts(req, lifecycle_events, scheduler_events, node_snapshots, uncertainty_nodes, checkpoints,
                    data_plane_entries, input_artifacts, output_artifacts, loop_iterations,
                    runtime_packets, runtime_rate_transition_nodes, outputs,
+                   forecast_uncertainty_events, forecast_uncertainty.summary(),
                    previous_seed, external_observations, port_store, pdk_scheduler, pdk_executor,
                    ready_executor,
                    iteration_count, failed_nodes, false);
@@ -3130,6 +3462,8 @@ class NativeWorkflowRunner::Impl {
       const json& runtime_packets,
       const json& runtime_rate_transition_nodes,
       const json& outputs,
+      const json& forecast_uncertainty_events,
+      const json& forecast_uncertainty_summary,
       const json& seed,
       const json& external_observations,
       const flightenv::platform::ThreadSafePortStore& port_store,
@@ -3304,6 +3638,17 @@ class NativeWorkflowRunner::Impl {
                {"generated_at_utc", nowUtcIso()},
                {"nodes", uncertainty_nodes}});
     evidence_writer.writeJson(
+        "forecast_uncertainty_evidence.json",
+        {{"schema_version", "flightenv.platform.forecast_uncertainty_evidence.v1"},
+               {"run_id", req.run_id},
+               {"workflow_id", workflow_id_},
+               {"object_id", object_id_},
+               {"branch_id", req.branch_id},
+               {"timeline_id", req.timeline_id},
+               {"generated_at_utc", nowUtcIso()},
+               {"summary", forecast_uncertainty_summary},
+               {"events", forecast_uncertainty_events}});
+    evidence_writer.writeJson(
         "state_checkpoint.json",
         {{"schema_version", "flightenv.platform.state_checkpoint.v1"},
                {"run_id", req.run_id},
@@ -3398,6 +3743,16 @@ class NativeWorkflowRunner::Impl {
                  {"runtime_rate_transition_node_event_count", runtime_rate_transition_nodes.size()},
                  {"runtime_rate_transition_node_executed_count", runtime_rate_transition_executed_count},
                  {"runtime_rate_transition_node_blocked_count", runtime_rate_transition_blocked_count},
+                 {"forecast_uncertainty_enabled",
+                  forecast_uncertainty_summary.value("enabled", false)},
+                 {"forecast_uncertainty_step_count",
+                  forecast_uncertainty_summary.value("step_count", 0)},
+                 {"forecast_uncertainty_seed_covariance_trace",
+                  forecast_uncertainty_summary.value("seed_covariance_trace", 0.0)},
+                 {"forecast_uncertainty_latest_covariance_trace",
+                  forecast_uncertainty_summary.value("latest_covariance_trace", 0.0)},
+                 {"forecast_uncertainty_growth_ratio",
+                  forecast_uncertainty_summary.value("growth_ratio", 0.0)},
                  {"edge_binding_count", edge_binding_plan_.value("summary", json::object()).value("binding_count", 0)},
                  {"rate_transition_count",
                   rate_transition_plan_.value("summary", json::object()).value("transition_count", 0)},
@@ -3478,6 +3833,7 @@ class NativeWorkflowRunner::Impl {
                  {"scheduler_diagnostics",
                   scheduler_diagnostics.empty() ? "" : "scheduler_diagnostics.json"},
                  {"data_plane_manifest", "data_plane_manifest.json"},
+                 {"forecast_uncertainty_evidence", "forecast_uncertainty_evidence.json"},
                  {"state_checkpoint", "state_checkpoint.json"},
                  {"sensor_stream", "sensor_stream.json"}}}});
   }

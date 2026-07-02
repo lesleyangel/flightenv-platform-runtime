@@ -35,6 +35,7 @@ class IEstimatorMethod {
   virtual std::string kind() const = 0;
   virtual void configure(const nlohmann::json& method_config, std::size_t state_dim) = 0;
   virtual EstimatorStepResult step(const EstimatorStepRequest& request) = 0;
+  virtual EstimatorStepResult predictOnly(const EstimatorStepRequest& request) = 0;
   virtual nlohmann::json snapshotState() const = 0;
   virtual void restoreState(const nlohmann::json& state) = 0;
 };

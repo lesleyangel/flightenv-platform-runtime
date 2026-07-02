@@ -1014,13 +1014,11 @@ RuntimeEstimationResult runEstimation(const RuntimeEstimationRequest& request, c
     if (missing_observation) {
       ++predict_only_frame_count;
       ++predict_only_streak;
-      step_result.posterior = predictOnlyPosterior(
-          observation,
-          previous_frame,
-          state_dim,
-          method_kind,
-          method->snapshotState());
-      step_result.evidence = step_result.posterior.diagnostics;
+      EstimatorStepRequest step_request;
+      step_request.observation = observation;
+      step_request.previous = previous_frame;
+      step_result = method->predictOnly(step_request);
+      step_result.posterior.estimator_state = method->snapshotState();
     } else {
       predict_only_streak = 0;
       ++update_frame_count;
