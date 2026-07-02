@@ -64,6 +64,17 @@ RuntimeAlignmentStrategy parseStrategy(const nlohmann::json& raw) {
   return RuntimeAlignmentStrategy::Unsupported;
 }
 
+bool isHoldLastName(const std::string& value) {
+  return value == "hold_last" || value == "hold" || value == "zero_order_hold";
+}
+
+bool isSlowToFastHoldPolicy(const RuntimeInputAlignmentPolicy& policy) {
+  return policy.rate_relation == "slow_to_fast" &&
+         (isHoldLastName(policy.raw_strategy) ||
+          isHoldLastName(policy.raw_alignment) ||
+          isHoldLastName(policy.raw_input_resampling));
+}
+
 std::string strategyName(RuntimeAlignmentStrategy strategy) {
   switch (strategy) {
     case RuntimeAlignmentStrategy::Exact: return "exact";
@@ -174,6 +185,11 @@ RuntimeInputAlignmentPolicy parsePolicy(const nlohmann::json& raw) {
                         : parseStrategy(raw);
   policy.max_staleness_s = jsonDouble(raw, "max_staleness_s", policy.max_age_s);
   policy.max_gap_s = jsonDouble(raw, "max_gap_s", policy.max_age_s);
+  if (isSlowToFastHoldPolicy(policy) && policy.source_period_s > 0.0) {
+    policy.max_age_s = std::max(policy.max_age_s, policy.source_period_s);
+    policy.max_staleness_s = std::max(policy.max_staleness_s, policy.source_period_s);
+    policy.max_gap_s = std::max(policy.max_gap_s, policy.source_period_s);
+  }
   return policy;
 }
 

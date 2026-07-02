@@ -253,6 +253,13 @@ function Assert-SmokeEvidenceGate {
     }
     Require-PositiveCount -Count $events.Count -Label 'Gate B scheduler events'
 
+    $droppedNodeDue = @($events | Where-Object {
+        [string](Get-PropertyOrNull -ObjectValue $_ -Name 'event') -eq 'node_due_dropped'
+    })
+    if ($droppedNodeDue.Count -gt 0) {
+        throw "Gate C observed dropped node_due events: $($droppedNodeDue.Count)"
+    }
+
     foreach ($kind in @('checkpoint_due', 'stop_check_due')) {
         $count = @($events | Where-Object {
             (Get-RuntimeEventKind -ObjectValue $_) -eq $kind -or [string](Get-PropertyOrNull -ObjectValue $_ -Name 'event') -eq $kind

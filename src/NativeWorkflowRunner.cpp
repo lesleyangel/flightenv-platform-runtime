@@ -204,6 +204,36 @@ bool jsonBool(const json& value, const std::string& key, bool fallback = false) 
   return value.at(key).get<bool>();
 }
 
+struct SchedulerRuntimeEventCounts {
+  int input_alignment_blocked_count = 0;
+  int ready_queue_rejected_count = 0;
+  int node_due_retry_scheduled_count = 0;
+  int node_due_dropped_count = 0;
+};
+
+SchedulerRuntimeEventCounts countSchedulerRuntimeEvents(const json& scheduler_events) {
+  SchedulerRuntimeEventCounts counts;
+  if (!scheduler_events.is_array()) {
+    return counts;
+  }
+  for (const auto& event : scheduler_events) {
+    if (!event.is_object()) {
+      continue;
+    }
+    const std::string event_name = jsonString(event, "event");
+    if (event_name == "input_alignment_blocked") {
+      ++counts.input_alignment_blocked_count;
+    } else if (event_name == "ready_queue_admission" && !jsonBool(event, "accepted", true)) {
+      ++counts.ready_queue_rejected_count;
+    } else if (event_name == "node_due_retry_scheduled") {
+      ++counts.node_due_retry_scheduled_count;
+    } else if (event_name == "node_due_dropped") {
+      ++counts.node_due_dropped_count;
+    }
+  }
+  return counts;
+}
+
 bool envFlagEnabled(const char* name) {
   const char* value = std::getenv(name);
   if (value == nullptr) {
@@ -1997,7 +2027,8 @@ class NativeWorkflowRunner::Impl {
     }
 
     RuntimeEventLoop event_loop;
-    time_scheduler.seedWorkflowEvents(event_loop.queue(), nodes_, max_iterations, base_dt_s, output_period_s);
+    time_scheduler.seedWorkflowEvents(
+        event_loop.queue(), nodes_, max_iterations, base_dt_s, output_period_s, scheduler_table_);
     if (external_observations.is_array()) {
       const int input_event_count =
           std::min<int>(max_iterations, static_cast<int>(external_observations.size()));
@@ -2032,6 +2063,51 @@ class NativeWorkflowRunner::Impl {
     int public_tick_failed_nodes = 0;
     int dispatch_tick_index = 0;
     bool stop_requested = false;
+    // R3：被输入对齐或就绪检查挡下的 node_due 不再直接丢拍。同一到期时刻允许一次重试，
+    // 重试事件排在同时刻所有常规 node_due / branch 事件之后（priority 60000）、checkpoint
+    // 与公共拍物化之前，让"同拍上游先跑完再试一次"成为可能；重试仍失败则记录一等
+    // node_due_dropped 事件后放弃 —— 有界、确定、无活锁（节点自身后续到期事件已在种子里）。
+    constexpr int kNodeDueRetryPriority = 60000;
+    constexpr int kNodeDueMaxRetries = 1;
+    auto scheduleNodeDueRetryOrDrop = [&](const RuntimeEvent& blocked_event,
+                                          const std::string& blocked_node_id,
+                                          const std::string& blocked_reason) {
+      const int retry_count = jsonInt(blocked_event.payload, "retry_count", 0);
+      if (retry_count < kNodeDueMaxRetries) {
+        RuntimeEvent retry_event = blocked_event;
+        retry_event.event_id.clear();  // 入队时重新生成事件 id
+        retry_event.priority = kNodeDueRetryPriority;
+        retry_event.payload["retry_count"] = retry_count + 1;
+        retry_event.payload["retry_of_event_id"] = blocked_event.event_id;
+        retry_event.payload["retry_reason"] = blocked_reason;
+        event_loop.queue().push(std::move(retry_event));
+        scheduler_events.push_back({
+            {"timestamp_utc", nowUtcIso()},
+            {"node_id", blocked_node_id},
+            {"event", "node_due_retry_scheduled"},
+            {"status", "deferred"},
+            {"reason", blocked_reason},
+            {"retry_count", retry_count + 1},
+            {"runtime_event_id", blocked_event.event_id},
+            {"runtime_event_time_s", blocked_event.event_time_s},
+            {"runtime_event_time_ns", blocked_event.event_time.nanoseconds},
+            {"loop_iteration_index", std::max(0, blocked_event.iteration_index)},
+        });
+        return;
+      }
+      scheduler_events.push_back({
+          {"timestamp_utc", nowUtcIso()},
+          {"node_id", blocked_node_id},
+          {"event", "node_due_dropped"},
+          {"status", "dropped"},
+          {"reason", blocked_reason},
+          {"retry_count", retry_count},
+          {"runtime_event_id", blocked_event.event_id},
+          {"runtime_event_time_s", blocked_event.event_time_s},
+          {"runtime_event_time_ns", blocked_event.event_time.nanoseconds},
+          {"loop_iteration_index", std::max(0, blocked_event.iteration_index)},
+      });
+    };
     while (!event_loop.empty()) {
       const RuntimeEvent loop_event = event_loop.next();
       if (loop_event.event_kind == "input_arrived") {
@@ -2167,6 +2243,7 @@ class NativeWorkflowRunner::Impl {
           });
           appendTrace(req.run_dir, "execute_node_deferred_by_input_alignment iteration=" +
                                      std::to_string(iteration) + " node=" + node_id);
+          scheduleNodeDueRetryOrDrop(loop_event, node_id, "required_rate_transition_input_unavailable");
           continue;
         }
         RuntimeReadyAdmission admission =
@@ -2195,6 +2272,7 @@ class NativeWorkflowRunner::Impl {
         if (!admission.accepted) {
           appendTrace(req.run_dir, "execute_node_deferred iteration=" + std::to_string(iteration) +
                                      " node=" + node_id + " reason=" + admission.reason);
+          scheduleNodeDueRetryOrDrop(loop_event, node_id, admission.reason);
           continue;
         }
         const std::int64_t execution_started_steady_ns = steadyNowNs();
@@ -3083,6 +3161,8 @@ class NativeWorkflowRunner::Impl {
     const json port_store_packets = runtimePacketArrayFromPortStore(port_store);
     const json backend_capability_report = adapterBackendCapabilityReport();
     const json typed_buffer_store_summary = RuntimeTypedBufferStore::instance().summary();
+    const SchedulerRuntimeEventCounts scheduler_runtime_event_counts =
+        countSchedulerRuntimeEvents(scheduler_events);
     const json pdk_runtime_core = {
         {"runtime_packet", "FlightEnvPlatform::RuntimePacket"},
         {"port_store", portStoreEvidence(port_store)},
@@ -3157,7 +3237,15 @@ class NativeWorkflowRunner::Impl {
                  {"failed_nodes", failed_nodes},
                  {"base_dt_s", summary_base_dt_s},
                  {"output_period_s", summary_output_period_s},
-                 {"held_output_count", held_output_total}}}});
+                 {"held_output_count", held_output_total},
+                 {"input_alignment_blocked_count",
+                  scheduler_runtime_event_counts.input_alignment_blocked_count},
+                 {"ready_queue_rejected_count",
+                  scheduler_runtime_event_counts.ready_queue_rejected_count},
+                 {"node_due_retry_scheduled_count",
+                  scheduler_runtime_event_counts.node_due_retry_scheduled_count},
+                 {"node_due_dropped_count",
+                  scheduler_runtime_event_counts.node_due_dropped_count}}}});
     evidence_writer.writeJson(
         "runtime_packets.json",
         {{"schema_version", "flightenv.platform.runtime_packets.v1"},
@@ -3289,6 +3377,14 @@ class NativeWorkflowRunner::Impl {
                 {{"node_count", nodes_.size()},
                  {"iteration_count", iteration_count},
                  {"failed_nodes", failed_nodes},
+                 {"input_alignment_blocked_count",
+                  scheduler_runtime_event_counts.input_alignment_blocked_count},
+                 {"ready_queue_rejected_count",
+                  scheduler_runtime_event_counts.ready_queue_rejected_count},
+                 {"node_due_retry_scheduled_count",
+                  scheduler_runtime_event_counts.node_due_retry_scheduled_count},
+                 {"node_due_dropped_count",
+                  scheduler_runtime_event_counts.node_due_dropped_count},
                  {"zero_copy_mode", runtimeZeroCopyModeName(
                                         resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode))},
                  {"typed_buffer_persistence", runtimeTypedBufferPersistenceName(

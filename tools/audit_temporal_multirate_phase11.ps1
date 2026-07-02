@@ -172,6 +172,7 @@ function Invoke-SmokeAndAudit {
     Assert-True ([int]$runtimeSummary.deadline_miss_count -eq 0) "runtime evidence deadline miss count is nonzero for $RunId"
     Assert-True ([int]$runtimeSummary.overrun_count -eq 0) "runtime evidence overrun count is nonzero for $RunId"
     Assert-True ([int]$runtimeSummary.jitter_violation_count -eq 0) "runtime evidence jitter violation count is nonzero for $RunId"
+    Assert-True ([int](Get-Prop $runtimeSummary 'node_due_dropped_count' 0) -eq 0) "runtime evidence node_due dropped count is nonzero for $RunId"
 
     return [pscustomobject][ordered]@{
         run_id = $RunId
@@ -191,6 +192,10 @@ function Invoke-SmokeAndAudit {
         deadline_miss_count = [int]$summary.deadline_miss_count
         overrun_count = [int]$summary.overrun_count
         jitter_violation_count = [int]$summary.jitter_violation_count
+        input_alignment_blocked_count = [int](Get-Prop $runtimeSummary 'input_alignment_blocked_count' 0)
+        ready_queue_rejected_count = [int](Get-Prop $runtimeSummary 'ready_queue_rejected_count' 0)
+        node_due_retry_scheduled_count = [int](Get-Prop $runtimeSummary 'node_due_retry_scheduled_count' 0)
+        node_due_dropped_count = [int](Get-Prop $runtimeSummary 'node_due_dropped_count' 0)
     }
 }
 

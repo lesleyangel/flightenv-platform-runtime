@@ -9,11 +9,15 @@
  * object semantics or operator behavior.
  */
 
+#include "FlightEnvPlatformRuntime/time/RuntimeTimeTypes.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -34,10 +38,35 @@ class RuntimeDueTimeScheduler {
     const double quantum_s = dispatchQuantumS(rows);
     const double horizon_s = dispatchHorizonS(rows, quantum_s);
     const int max_tick_count = 512;
-    const int tick_count =
-        quantum_s > kEpsilon
-            ? std::min(max_tick_count, static_cast<int>(std::floor((horizon_s + kEpsilon) / quantum_s)) + 1)
-            : 0;
+    // 直接枚举各行的绝对到期时刻 (first_due + k*period) 作为派发栅格，与 live 种子
+    // seedWorkflowEvents 的绝对栅格语义一致。旧实现以最小周期为均匀量子扫描时间轴，
+    // 会漏掉与最小周期不可整除的到期点（如 2ms/3ms 两行时，3ms 行只在 6ms、12ms
+    // 命中，3ms、9ms 被跳过），导致审计基准本身漏拍。quantum_s 仍保留为最小周期，
+    // 仅用于 summary 与慢节点分类。
+    std::vector<double> tick_times;
+    if (quantum_s > kEpsilon) {
+      std::set<double> due_grid;
+      for (const Row& row : rows) {
+        if (!(row.period_s > kEpsilon)) {
+          continue;
+        }
+        // 每行至多贡献 max_tick_count 个最早到期点：全局最早 512 个去重时刻
+        // 必然包含于各行前 512 个到期点的并集，因此该上限不影响截断语义。
+        for (int due_index = 0; due_index < max_tick_count; ++due_index) {
+          const double due_time_s = normalizeTime(
+              row.first_due_time_s + static_cast<double>(due_index) * row.period_s);
+          if (due_time_s > horizon_s + kEpsilon) {
+            break;
+          }
+          due_grid.insert(due_time_s);
+        }
+      }
+      tick_times.assign(due_grid.begin(), due_grid.end());
+      if (static_cast<int>(tick_times.size()) > max_tick_count) {
+        tick_times.resize(static_cast<std::size_t>(max_tick_count));
+      }
+    }
+    const int tick_count = static_cast<int>(tick_times.size());
 
     nlohmann::json events = nlohmann::json::array();
     std::set<double> distinct_due_times;
@@ -48,7 +77,7 @@ class RuntimeDueTimeScheduler {
     int dependency_violation_count = 0;
 
     for (int tick_index = 0; tick_index < tick_count; ++tick_index) {
-      const double tick_time_s = normalizeTime(tick_index * quantum_s);
+      const double tick_time_s = tick_times[static_cast<std::size_t>(tick_index)];
       std::vector<Row> due_rows;
       std::set<std::string> due_node_ids;
       for (const Row& row : rows) {
@@ -167,6 +196,8 @@ class RuntimeDueTimeScheduler {
         {"tick_count", tick_count},
         {"deterministic_single_thread", true},
         {"expanded_from_scheduler_table", true},
+        {"tick_enumeration", "absolute_due_times"},
+        {"first_due_rule", "offset_plus_period_or_public_tick_dependency_floor"},
         {"dispatch_sort_keys", {"scheduling_level", "priority_rank", "dispatch_order", "source_order", "node_id"}},
     };
     const nlohmann::json stable_payload = {{"summary", stable_summary}, {"events", events}};
@@ -297,7 +328,20 @@ class RuntimeDueTimeScheduler {
         row.period_s = normalizeTime(base_dt_s > kEpsilon ? base_dt_s : 1.0);
       }
       row.offset_s = normalizeTime(jsonDouble(item, "offset_s", 0.0));
-      row.first_due_time_s = normalizeTime(jsonDouble(item, "due_time_s", row.offset_s));
+      // 首拍规则与 live 种子同源（runtimeNodeFirstDueNanoseconds）：快节点 = offset + period，
+      // 慢节点 = offset + 公共拍。有意不再使用表内 due_time_s —— 它取自 time_point.run_time_s
+      // 的区间起点约定（多为 0），与 runtime 区间末端输出约定相差一拍，正是旧审计 trace
+      // 与实际执行相位分歧的根源。
+      {
+        const std::int64_t period_ns = RuntimeDuration::fromSeconds(row.period_s).nanoseconds;
+        const std::int64_t public_ns =
+            RuntimeDuration::fromSeconds(base_dt_s > kEpsilon ? base_dt_s : row.period_s).nanoseconds;
+        const std::int64_t offset_ns = RuntimeDuration::fromSeconds(row.offset_s).nanoseconds;
+        row.first_due_time_s = normalizeTime(
+            RuntimeTimePoint::fromNanoseconds(
+                runtimeNodeFirstDueNanoseconds(period_ns, public_ns, offset_ns))
+                .seconds());
+      }
       row.dispatch_order = jsonInt(item, "dispatch_order", fallback_order);
       row.source_order = jsonInt(item, "source_order", fallback_order);
       row.scheduling_level = jsonInt(item, "scheduling_level", 0);
@@ -325,7 +369,53 @@ class RuntimeDueTimeScheduler {
       }
       return left.node_id < right.node_id;
     });
+    applyDependencyAwareFirstDue(rows);
     return rows;
+  }
+
+  static void applyDependencyAwareFirstDue(std::vector<Row>& rows) {
+    std::map<std::string, std::size_t> index_by_node;
+    for (std::size_t index = 0; index < rows.size(); ++index) {
+      if (!rows[index].node_id.empty()) {
+        index_by_node[rows[index].node_id] = index;
+      }
+    }
+
+    std::map<std::string, std::int64_t> resolved_first_due_ns_by_node;
+    std::set<std::string> resolving;
+    std::function<std::int64_t(const std::string&)> resolveFirstDueNs =
+        [&](const std::string& node_id) -> std::int64_t {
+      const auto existing = resolved_first_due_ns_by_node.find(node_id);
+      if (existing != resolved_first_due_ns_by_node.end()) {
+        return existing->second;
+      }
+      const auto index_found = index_by_node.find(node_id);
+      if (index_found == index_by_node.end()) {
+        return 0;
+      }
+      Row& row = rows[index_found->second];
+      std::int64_t resolved_ns = RuntimeDuration::fromSeconds(row.first_due_time_s).nanoseconds;
+      if (resolving.count(node_id) != 0) {
+        return resolved_ns;
+      }
+      resolving.insert(node_id);
+      for (const std::string& dep : row.depends_on) {
+        if (index_by_node.count(dep) == 0) {
+          continue;
+        }
+        resolved_ns = runtimeNodeFirstDueAfterDependencyNanoseconds(
+            resolved_ns,
+            resolveFirstDueNs(dep));
+      }
+      resolving.erase(node_id);
+      resolved_first_due_ns_by_node[node_id] = resolved_ns;
+      return resolved_ns;
+    };
+
+    for (Row& row : rows) {
+      row.first_due_time_s =
+          normalizeTime(RuntimeTimePoint::fromNanoseconds(resolveFirstDueNs(row.node_id)).seconds());
+    }
   }
 
   static double dispatchQuantumS(const std::vector<Row>& rows) {
