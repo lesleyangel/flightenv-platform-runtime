@@ -1755,6 +1755,10 @@ void PlatformRuntimeHost::prepareRuntime() {
       })},
       {"adapter_registry", pathString(options_.adapter_registry)},
       {"execution_backend", options_.execution_backend},
+      {"execution_backend_class",
+       useNativeBackend() ? "production_native_adapter_sessions"
+                          : "compatibility_compiled_workflow_process_backend"},
+      {"compatibility_status", useNativeBackend() ? "production" : "compat_only"},
       {"native_session_note",
        useNativeBackend()
            ? "C++ Host directly manages adapter session lifecycle; DLL adapters stay in-process and PDK workflow process is not spawned."
@@ -4476,6 +4480,10 @@ void PlatformRuntimeHost::writeRuntimeHostEvidenceLocked(const std::string& stat
            {"implementation", "FlightEnvPlatformRuntimeHost.cpp"},
            {"role", "C++ online mainline and prediction branch scheduler"},
            {"execution_backend", options_.execution_backend},
+           {"execution_backend_class",
+            useNativeBackend() ? "production_native_adapter_sessions"
+                               : "compatibility_compiled_workflow_process_backend"},
+           {"compatibility_status", useNativeBackend() ? "production" : "compat_only"},
            {"runtime_zero_copy_mode", runtimeZeroCopyModeName(
                                           resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode))},
            {"typed_buffer_persistence", runtimeTypedBufferPersistenceName(
@@ -4486,6 +4494,8 @@ void PlatformRuntimeHost::writeRuntimeHostEvidenceLocked(const std::string& stat
             options_.branch_manager_enabled ? "background_branch_worker_process"
                                             : "native_in_process_branch_threads"},
            {"legacy_process_backend_allowed", options_.allow_legacy_process_backend},
+           {"legacy_process_backend_required_flag",
+            options_.execution_backend == "compiled_workflow_process_backend"},
            {"runtime_run_indexer", "cpp_host_internal"},
            {"wildcard_adapter_policy", "disabled_for_native_production"},
            {"native_session_note",
@@ -4631,6 +4641,10 @@ void PlatformRuntimeHost::writeFinalSummary(const std::string& status) {
       {"host",
        {
            {"execution_backend", options_.execution_backend},
+           {"execution_backend_class",
+            useNativeBackend() ? "production_native_adapter_sessions"
+                               : "compatibility_compiled_workflow_process_backend"},
+           {"compatibility_status", useNativeBackend() ? "production" : "compat_only"},
            {"in_process_adapter_sessions", useNativeBackend()},
            {"runtime_zero_copy_mode", runtimeZeroCopyModeName(
                                           resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode))},

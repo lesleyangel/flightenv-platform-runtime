@@ -65,6 +65,65 @@ if ([string]::IsNullOrWhiteSpace($AdapterRegistry)) {
     $AdapterRegistry = Join-Path $objectRoot 'tools\adapter_registries\ballistic_adapters.local.json'
 }
 
+function Read-JsonFile {
+    param([Parameter(Mandatory = $true)][string]$PathValue)
+    return Get-Content -LiteralPath $PathValue -Encoding UTF8 -Raw | ConvertFrom-Json
+}
+
+function Resolve-ObjectProfilePath {
+    param([Parameter(Mandatory = $true)][string]$PathValue)
+    if ([System.IO.Path]::IsPathRooted($PathValue)) {
+        return [System.IO.Path]::GetFullPath($PathValue)
+    }
+    if ($PathValue.StartsWith("_local_artifacts") -or $PathValue.StartsWith("_deps")) {
+        return [System.IO.Path]::GetFullPath((Join-Path $workspaceRoot $PathValue))
+    }
+    return [System.IO.Path]::GetFullPath((Join-Path $objectRoot $PathValue))
+}
+
+function Resolve-DefaultExternalObservationStream {
+    $candidates = [System.Collections.Generic.List[object]]::new()
+    $profilePath = Join-Path $objectRoot 'runtime\platform_runtime_profile.json'
+    if (Test-Path -LiteralPath $profilePath -PathType Leaf) {
+        $profile = Read-JsonFile -PathValue $profilePath
+        if ($null -ne $profile.PSObject.Properties['external_observation_stream_candidates']) {
+            foreach ($candidate in @($profile.external_observation_stream_candidates)) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$candidate)) {
+                    $candidates.Add([pscustomobject]@{
+                        path = [string]$candidate
+                        source = 'object_runtime_profile.external_observation_stream_candidates'
+                    }) | Out-Null
+                }
+            }
+        }
+    }
+
+    foreach ($fallback in @(
+        'fixtures/sensor_stream_db70_real_db.json',
+        'fixtures/sensor_stream_db70.json',
+        'fixtures/sensor_stream.json'
+    )) {
+        $candidates.Add([pscustomobject]@{
+            path = $fallback
+            source = 'runtime_smoke_object_fixture_fallback'
+        }) | Out-Null
+    }
+
+    $checked = @()
+    foreach ($candidate in $candidates) {
+        $resolved = Resolve-ObjectProfilePath -PathValue ([string]$candidate.path)
+        $checked += $resolved
+        if (Test-Path -LiteralPath $resolved -PathType Leaf) {
+            return [pscustomobject]@{
+                path = $resolved
+                source = [string]$candidate.source
+                checked = $checked
+            }
+        }
+    }
+    throw "External observation stream not found from object runtime profile or fixture fallbacks. Checked: $($checked -join '; ')"
+}
+
 if (-not $SkipBuild) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $runtimeRoot 'tools\build_platform_runtime.ps1') `
         -Configuration $Configuration `
@@ -85,9 +144,15 @@ if (-not $SkipBuild) {
     -OutDir $compiledRoot `
     -RunId "$RunIdPrefix.compile.future"
 
+$ExternalObservationStreamSource = 'explicit_argument'
 if ([string]::IsNullOrWhiteSpace($ExternalObservationStream)) {
-    $ExternalObservationStream = Join-Path $workspaceRoot '_local_artifacts\platform-pdk\runtime-host-runs\reentry.online_filtering_external_input.v1\ui_external_stream_smoke_20260614.online\sensor_stream.json'
+    $resolvedStream = Resolve-DefaultExternalObservationStream
+    $ExternalObservationStream = $resolvedStream.path
+    $ExternalObservationStreamSource = $resolvedStream.source
+    Write-Host "external_observation_stream_source=$ExternalObservationStreamSource"
+    Write-Host "external_observation_stream=$ExternalObservationStream"
 }
+$ExternalObservationStream = [System.IO.Path]::GetFullPath($ExternalObservationStream)
 if (-not (Test-Path -LiteralPath $ExternalObservationStream -PathType Leaf)) {
     throw "External observation stream not found. Pass -ExternalObservationStream: $ExternalObservationStream"
 }
