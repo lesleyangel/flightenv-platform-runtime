@@ -13,6 +13,7 @@
 
 #include "NativeAdapterSessions.hpp"
 #include "NativeWorkflowCompiledState.hpp"
+#include "NativeWorkflowDispatchLoop.hpp"
 #include "NativeWorkflowEvidenceWriter.hpp"
 #include "NativeWorkflowNodePreparation.hpp"
 #include "NativeWorkflowNodeResultCommit.hpp"
@@ -1078,51 +1079,6 @@ class NativeWorkflowRunner::Impl {
     int public_tick_failed_nodes = 0;
     int dispatch_tick_index = 0;
     bool stop_requested = false;
-    // R3锛氳杈撳叆瀵归綈鎴栧氨缁鏌ユ尅涓嬬殑 node_due 涓嶅啀鐩存帴涓㈡媿銆傚悓涓€鍒版湡鏃跺埢鍏佽涓€娆￠噸璇曪紝
-    // 閲嶈瘯浜嬩欢鎺掑湪鍚屾椂鍒绘墍鏈夊父瑙?node_due / branch 浜嬩欢涔嬪悗锛坧riority 60000锛夈€乧heckpoint
-    // 涓庡叕鍏辨媿鐗╁寲涔嬪墠锛岃"鍚屾媿涓婃父鍏堣窇瀹屽啀璇曚竴娆?鎴愪负鍙兘锛涢噸璇曚粛澶辫触鍒欒褰曚竴绛?
-    // node_due_dropped 浜嬩欢鍚庢斁寮?鈥斺€?鏈夌晫銆佺‘瀹氥€佹棤娲婚攣锛堣妭鐐硅嚜韬悗缁埌鏈熶簨浠跺凡鍦ㄧ瀛愰噷锛夈€?
-    constexpr int kNodeDueRetryPriority = 60000;
-    constexpr int kNodeDueMaxRetries = 1;
-    auto scheduleNodeDueRetryOrDrop = [&](const RuntimeEvent& blocked_event,
-                                          const std::string& blocked_node_id,
-                                          const std::string& blocked_reason) {
-      const int retry_count = jsonInt(blocked_event.payload, "retry_count", 0);
-      if (retry_count < kNodeDueMaxRetries) {
-        RuntimeEvent retry_event = blocked_event;
-        retry_event.event_id.clear();  // 鍏ラ槦鏃堕噸鏂扮敓鎴愪簨浠?id
-        retry_event.priority = kNodeDueRetryPriority;
-        retry_event.payload["retry_count"] = retry_count + 1;
-        retry_event.payload["retry_of_event_id"] = blocked_event.event_id;
-        retry_event.payload["retry_reason"] = blocked_reason;
-        event_loop.queue().push(std::move(retry_event));
-        scheduler_events.push_back({
-            {"timestamp_utc", nowUtcIso()},
-            {"node_id", blocked_node_id},
-            {"event", "node_due_retry_scheduled"},
-            {"status", "deferred"},
-            {"reason", blocked_reason},
-            {"retry_count", retry_count + 1},
-            {"runtime_event_id", blocked_event.event_id},
-            {"runtime_event_time_s", blocked_event.event_time_s},
-            {"runtime_event_time_ns", blocked_event.event_time.nanoseconds},
-            {"loop_iteration_index", std::max(0, blocked_event.iteration_index)},
-        });
-        return;
-      }
-      scheduler_events.push_back({
-          {"timestamp_utc", nowUtcIso()},
-          {"node_id", blocked_node_id},
-          {"event", "node_due_dropped"},
-          {"status", "dropped"},
-          {"reason", blocked_reason},
-          {"retry_count", retry_count},
-          {"runtime_event_id", blocked_event.event_id},
-          {"runtime_event_time_s", blocked_event.event_time_s},
-          {"runtime_event_time_ns", blocked_event.event_time.nanoseconds},
-          {"loop_iteration_index", std::max(0, blocked_event.iteration_index)},
-      });
-    };
     while (!event_loop.empty()) {
       const RuntimeEvent loop_event = event_loop.next();
       if (loop_event.event_kind == "input_arrived") {
@@ -1207,15 +1163,10 @@ class NativeWorkflowRunner::Impl {
                 [&](const std::string& message) {
                   appendTrace(req.run_dir, message);
                 },
-            });
+        });
         const RuntimePortBindingResolveResult& port_binding = input_preparation.port_binding;
-        json input_binding_event = RuntimeEventLoop::schedulerEvent(
-            loop_event,
-            "input_binding",
-            port_binding.evidence);
-        input_binding_event["node_id"] = node_id;
-        input_binding_event["input_binding"] = port_binding.evidence;
-        scheduler_events.push_back(input_binding_event);
+        scheduler_events.push_back(
+            nativeWorkflowInputBindingSchedulerEvent(loop_event, node_id, port_binding.evidence));
         json upstream = input_preparation.upstream;
         const RuntimeRateTransitionExecutionResult& transition_execution =
             input_preparation.transition_execution;
@@ -1231,83 +1182,54 @@ class NativeWorkflowRunner::Impl {
         const RuntimeInputAlignmentResult& input_alignment = input_preparation.input_alignment;
         public_tick_effective_delta_t_by_node[node_id] = cadence.effective_delta_t_s;
         if (input_alignment.hasUnavailableRequiredInputs()) {
-          scheduler_events.push_back({
-              {"timestamp_utc", nowUtcIso()},
-              {"node_id", node_id},
-              {"event", "input_alignment_blocked"},
-              {"runtime_event_id", loop_event.event_id},
-              {"runtime_event_kind", loop_event.event_kind},
-              {"status", "blocked"},
-              {"reason", "required_rate_transition_input_unavailable"},
-              {"dispatch_tick_index", dispatch_tick_index},
-              {"runtime_event_time_s", loop_event.event_time_s},
-              {"runtime_event_time_ns", loop_event.event_time.nanoseconds},
-              {"loop_iteration_index", iteration},
-              {"input_binding", port_binding.evidence},
-              {"input_alignment", input_alignment.evidence()},
-              {"unavailable_required_inputs", input_alignment.unavailableRequiredEvidence()},
-          });
+          scheduler_events.push_back(nativeWorkflowInputAlignmentBlockedEvent(
+              loop_event,
+              node_id,
+              dispatch_tick_index,
+              port_binding.evidence,
+              input_alignment));
           appendTrace(req.run_dir, "execute_node_deferred_by_input_alignment iteration=" +
                                      std::to_string(iteration) + " node=" + node_id);
-          scheduleNodeDueRetryOrDrop(loop_event, node_id, "required_rate_transition_input_unavailable");
+          scheduleNativeWorkflowNodeDueRetryOrDrop(
+              event_loop.queue(),
+              scheduler_events,
+              loop_event,
+              node_id,
+              "required_rate_transition_input_unavailable");
           continue;
         }
         RuntimeReadyAdmission admission =
             ready_executor.admitNode(node, loop_event, outputs, port_store, req.branch_id, req.timeline_id);
-        scheduler_events.push_back({
-            {"timestamp_utc", nowUtcIso()},
-            {"node_id", node_id},
-            {"event", "ready_queue_admission"},
-            {"runtime_event_id", loop_event.event_id},
-            {"runtime_event_kind", loop_event.event_kind},
-            {"status", admission.status},
-            {"accepted", admission.accepted},
-            {"reason", admission.reason},
-            {"dispatch_tick_index", dispatch_tick_index},
-            {"runtime_event_time_s", loop_event.event_time_s},
-            {"runtime_event_time_ns", loop_event.event_time.nanoseconds},
-            {"loop_iteration_index", iteration},
-            {"input_binding", port_binding.evidence},
-            {"dependency_check", admission.evidence.value("dependency_check", json::object())},
-            {"port_check", admission.evidence.value("port_check", json::object())},
-            {"resource_check", admission.evidence.value("resource_check", json::object())},
-            {"parallel_check", admission.evidence.value("parallel_check", json::object())},
-            {"deadline_check", admission.evidence.value("deadline_check", json::object())},
-            {"ready_queue", admission.evidence},
-        });
+        scheduler_events.push_back(nativeWorkflowReadyQueueAdmissionEvent(
+            loop_event,
+            node_id,
+            dispatch_tick_index,
+            port_binding.evidence,
+            admission));
         if (!admission.accepted) {
           appendTrace(req.run_dir, "execute_node_deferred iteration=" + std::to_string(iteration) +
                                      " node=" + node_id + " reason=" + admission.reason);
-          scheduleNodeDueRetryOrDrop(loop_event, node_id, admission.reason);
+          scheduleNativeWorkflowNodeDueRetryOrDrop(
+              event_loop.queue(),
+              scheduler_events,
+              loop_event,
+              node_id,
+              admission.reason);
           continue;
         }
         const std::int64_t execution_started_steady_ns = steadyNowNs();
-        scheduler_events.push_back({
-            {"timestamp_utc", nowUtcIso()},
-            {"node_id", node_id},
-            {"event", "start"},
-            {"runtime_event_id", loop_event.event_id},
-            {"runtime_event_kind", loop_event.event_kind},
-            {"status", "running"},
-            {"dispatch_tick_index", dispatch_tick_index},
-            {"dispatch_time_s", cadence.public_output_time_s},
-            {"dispatch_time_ns", cadence.public_output_time.nanoseconds},
-            {"runtime_event_time_s", loop_event.event_time_s},
-            {"runtime_event_time_ns", loop_event.event_time.nanoseconds},
-            {"loop_iteration_index", iteration},
-            {"execution_started_steady_ns", execution_started_steady_ns},
-            {"output_period_s", cadence.output_period_s},
-            {"output_period_ns", cadence.output_period.nanoseconds},
-            {"effective_delta_t_s", cadence.effective_delta_t_s},
-            {"effective_delta_t_ns", cadence.effective_delta_t.nanoseconds},
-            {"next_due_time_s", cadence.next_due_time_s},
-            {"next_due_time_ns", cadence.next_due_time.nanoseconds},
-            {"input_binding", port_binding.evidence},
-            {"input_alignment", input_alignment.evidence()},
-            {"ready_queue", admission.evidence},
-            {"scheduling_level", jsonInt(schedulerInfo(compiled_.scheduler_plan, node_id), "scheduling_level", 0)},
-            {"parallel_group_id", jsonString(schedulerInfo(compiled_.scheduler_plan, node_id), "parallel_group_id")},
-        });
+        const json scheduler_node_info = schedulerInfo(compiled_.scheduler_plan, node_id);
+        scheduler_events.push_back(nativeWorkflowNodeStartEvent(
+            loop_event,
+            node_id,
+            dispatch_tick_index,
+            cadence,
+            port_binding.evidence,
+            input_alignment,
+            admission,
+            jsonInt(scheduler_node_info, "scheduling_level", 0),
+            jsonString(scheduler_node_info, "parallel_group_id"),
+            execution_started_steady_ns));
 
         try {
           const json node_result = executeNode(node, upstream, req, time_info, lifecycle_events, data_plane_entries,
@@ -1329,29 +1251,14 @@ class NativeWorkflowRunner::Impl {
             }
           }
           const std::int64_t execution_finished_steady_ns = steadyNowNs();
-          scheduler_events.push_back({
-              {"timestamp_utc", nowUtcIso()},
-              {"node_id", node_id},
-              {"event", "finish"},
-              {"runtime_event_id", loop_event.event_id},
-              {"runtime_event_kind", loop_event.event_kind},
-              {"status", "ok"},
-              {"duration_ms", jsonInt(node_result, "duration_ms", 0)},
-              {"dispatch_tick_index", dispatch_tick_index},
-              {"runtime_event_time_s", loop_event.event_time_s},
-              {"runtime_event_time_ns", loop_event.event_time.nanoseconds},
-              {"loop_iteration_index", iteration},
-              {"execution_started_steady_ns", execution_started_steady_ns},
-              {"execution_finished_steady_ns", execution_finished_steady_ns},
-              {"execution_elapsed_ms",
-               std::chrono::duration_cast<std::chrono::milliseconds>(
-                   std::chrono::nanoseconds(execution_finished_steady_ns - execution_started_steady_ns))
-                   .count()},
-              {"output_period_s", cadence.output_period_s},
-              {"output_period_ns", cadence.output_period.nanoseconds},
-              {"effective_delta_t_s", cadence.effective_delta_t_s},
-              {"effective_delta_t_ns", cadence.effective_delta_t.nanoseconds},
-          });
+          scheduler_events.push_back(nativeWorkflowNodeFinishOkEvent(
+              loop_event,
+              node_id,
+              dispatch_tick_index,
+              cadence,
+              jsonInt(node_result, "duration_ms", 0),
+              execution_started_steady_ns,
+              execution_finished_steady_ns));
           ready_executor.completeNode(admission);
         } catch (const std::exception& exc) {
           const std::int64_t execution_finished_steady_ns = steadyNowNs();
@@ -1369,24 +1276,12 @@ class NativeWorkflowRunner::Impl {
               {"reason", exc.what()},
               {"loop_iteration_index", iteration},
           });
-          scheduler_events.push_back({
-              {"timestamp_utc", nowUtcIso()},
-              {"node_id", node_id},
-              {"event", "finish"},
-              {"runtime_event_id", loop_event.event_id},
-              {"runtime_event_kind", loop_event.event_kind},
-              {"status", "failed"},
-              {"reason", exc.what()},
-              {"runtime_event_time_s", loop_event.event_time_s},
-              {"runtime_event_time_ns", loop_event.event_time.nanoseconds},
-              {"loop_iteration_index", iteration},
-              {"execution_started_steady_ns", execution_started_steady_ns},
-              {"execution_finished_steady_ns", execution_finished_steady_ns},
-              {"execution_elapsed_ms",
-               std::chrono::duration_cast<std::chrono::milliseconds>(
-                   std::chrono::nanoseconds(execution_finished_steady_ns - execution_started_steady_ns))
-                   .count()},
-          });
+          scheduler_events.push_back(nativeWorkflowNodeFinishFailedEvent(
+              loop_event,
+              node_id,
+              exc.what(),
+              execution_started_steady_ns,
+              execution_finished_steady_ns));
           stop_requested = true;
           break;
         }

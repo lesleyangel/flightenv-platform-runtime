@@ -107,6 +107,7 @@
     <ClCompile Include="..\src\main.cpp" />
     <ClCompile Include="..\src\NativeAdapterSessions.cpp" />
     <ClCompile Include="..\src\NativeWorkflowCompiledState.cpp" />
+    <ClCompile Include="..\src\NativeWorkflowDispatchLoop.cpp" />
     <ClCompile Include="..\src\NativeWorkflowEvidenceWriter.cpp" />
     <ClCompile Include="..\src\NativeWorkflowNodePreparation.cpp" />
     <ClCompile Include="..\src\NativeWorkflowNodeResultCommit.cpp" />
@@ -146,6 +147,7 @@
   <ItemGroup>
     <ClInclude Include="..\src\NativeAdapterSessions.hpp" />
     <ClInclude Include="..\src\NativeWorkflowCompiledState.hpp" />
+    <ClInclude Include="..\src\NativeWorkflowDispatchLoop.hpp" />
     <ClInclude Include="..\src\NativeWorkflowEvidenceWriter.hpp" />
     <ClInclude Include="..\src\NativeWorkflowNodePreparation.hpp" />
     <ClInclude Include="..\src\NativeWorkflowNodeResultCommit.hpp" />
