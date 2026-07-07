@@ -105,6 +105,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\src\main.cpp" />
+    <ClCompile Include="..\src\NativeAdapterSessions.cpp" />
     <ClCompile Include="..\src\NativeWorkflowRunner.cpp" />
     <ClCompile Include="..\src\PlatformRuntimeHost.cpp" />
     <ClCompile Include="..\src\RuntimeAdapterInvoker.cpp" />
@@ -139,6 +140,7 @@
     <ClCompile Include="..\src\estimation\SampleSetStore.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\src\NativeAdapterSessions.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\AdapterSession.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\NativeWorkflowRunner.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\PlatformRuntimeHost.hpp" />
