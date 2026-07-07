@@ -1,34 +1,31 @@
-/**
+﻿/**
  * @file NativeWorkflowRunner.cpp
- * @brief 实现本地 workflow 执行器。
+ * @brief 瀹炵幇鏈湴 workflow 鎵ц鍣ㄣ€?
  *
- * 大概：这是 platform-runtime 当前最核心的执行路径实现。
- * 具体：它负责解析对象包和 workflow、准备端口、调用 adapter/operator、推进时间和收集输出。
- * 被谁使用：被 PlatformRuntimeHost、runtime CLI、端到端测试和 launcher/SDK 间接使用。
- * 使用谁：使用 PDK 契约、AdapterSession、time 组件、nlohmann::json、文件系统和数据面引用。
- * 拆分判断：能总结但明显偏大；后续应继续拆 backend executor、port binding、materialization、evidence writer。
+ * 澶ф锛氳繖鏄?platform-runtime 褰撳墠鏈€鏍稿績鐨勬墽琛岃矾寰勫疄鐜般€?
+ * 鍏蜂綋锛氬畠璐熻矗瑙ｆ瀽瀵硅薄鍖呭拰 workflow銆佸噯澶囩鍙ｃ€佽皟鐢?adapter/operator銆佹帹杩涙椂闂村拰鏀堕泦杈撳嚭銆?
+ * 琚皝浣跨敤锛氳 PlatformRuntimeHost銆乺untime CLI銆佺鍒扮娴嬭瘯鍜?launcher/SDK 闂存帴浣跨敤銆?
+ * 浣跨敤璋侊細浣跨敤 PDK 濂戠害銆丄dapterSession銆乼ime 缁勪欢銆乶lohmann::json銆佹枃浠剁郴缁熷拰鏁版嵁闈㈠紩鐢ㄣ€?
+ * 鎷嗗垎鍒ゆ柇锛氳兘鎬荤粨浣嗘槑鏄惧亸澶э紱鍚庣画搴旂户缁媶 backend executor銆乸ort binding銆乵aterialization銆乪vidence writer銆?
  */
 
 #include "FlightEnvPlatformRuntime/NativeWorkflowRunner.hpp"
 
 #include "NativeAdapterSessions.hpp"
 #include "NativeWorkflowCompiledState.hpp"
+#include "NativeWorkflowEvidenceWriter.hpp"
 #include "NativeWorkflowNodePreparation.hpp"
 #include "NativeWorkflowNodeResultCommit.hpp"
 
 #include "FlightEnvPlatform/Adapter/AdapterAbi.hpp"
 #include "FlightEnvPlatform/Runtime/ReadyQueueScheduler.hpp"
-#include "FlightEnvPlatform/Runtime/RuntimePacket.hpp"
 #include "FlightEnvPlatform/Runtime/ThreadPoolExecutor.hpp"
 #include "FlightEnvPlatform/Runtime/ThreadSafePortStore.hpp"
 #include "FlightEnvPlatformRuntime/AdapterSession.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeAdapterInvoker.hpp"
-#include "FlightEnvPlatformRuntime/RuntimeDueTimeScheduler.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeEventLoop.hpp"
-#include "FlightEnvPlatformRuntime/RuntimeEvidenceWriter.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeReadyQueueExecutor.hpp"
 #include "FlightEnvPlatformRuntime/RuntimePublicFrameBuilder.hpp"
-#include "FlightEnvPlatformRuntime/RuntimeScheduleDiagnostics.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeTimeScheduler.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeTypedBufferStore.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeZeroCopyPolicy.hpp"
@@ -52,7 +49,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -185,36 +181,6 @@ bool jsonBool(const json& value, const std::string& key, bool fallback = false) 
     return fallback;
   }
   return value.at(key).get<bool>();
-}
-
-struct SchedulerRuntimeEventCounts {
-  int input_alignment_blocked_count = 0;
-  int ready_queue_rejected_count = 0;
-  int node_due_retry_scheduled_count = 0;
-  int node_due_dropped_count = 0;
-};
-
-SchedulerRuntimeEventCounts countSchedulerRuntimeEvents(const json& scheduler_events) {
-  SchedulerRuntimeEventCounts counts;
-  if (!scheduler_events.is_array()) {
-    return counts;
-  }
-  for (const auto& event : scheduler_events) {
-    if (!event.is_object()) {
-      continue;
-    }
-    const std::string event_name = jsonString(event, "event");
-    if (event_name == "input_alignment_blocked") {
-      ++counts.input_alignment_blocked_count;
-    } else if (event_name == "ready_queue_admission" && !jsonBool(event, "accepted", true)) {
-      ++counts.ready_queue_rejected_count;
-    } else if (event_name == "node_due_retry_scheduled") {
-      ++counts.node_due_retry_scheduled_count;
-    } else if (event_name == "node_due_dropped") {
-      ++counts.node_due_dropped_count;
-    }
-  }
-  return counts;
 }
 
 bool envFlagEnabled(const char* name) {
@@ -446,76 +412,6 @@ json schedulerInfo(const json& scheduler_plan, const std::string& node_id) {
     info = {{"node_id", node_id}, {"scheduling_level", 0}, {"parallel_group_id", ""}, {"can_run_parallel", false}};
   }
   return info;
-}
-
-json readyQueueSchedulerEvidence(const flightenv::platform::ReadyQueueScheduler& scheduler) {
-  return {
-      {"type", "FlightEnvPlatform::ReadyQueueScheduler"},
-      {"policy",
-       {
-           {"max_parallelism", scheduler.policy.max_parallelism},
-           {"ready_queue_policy", scheduler.policy.ready_queue_policy},
-           {"resource_conflict_policy", scheduler.policy.resource_conflict_policy},
-           {"deadline_policy", scheduler.policy.deadline_policy},
-           {"default_deadline_s", scheduler.policy.default_deadline_s},
-           {"record_timeline", scheduler.policy.record_timeline},
-       }},
-      {"plan_node_count", scheduler.plan_nodes.size()},
-      {"effective_max_parallelism", scheduler.max_parallelism()},
-  };
-}
-
-json threadPoolExecutorEvidence(const flightenv::platform::ThreadPoolExecutorDescriptor& executor) {
-  return {
-      {"type", "FlightEnvPlatform::ThreadPoolExecutorDescriptor"},
-      {"options",
-       {
-           {"max_workers", executor.options.max_workers},
-           {"worker_name_prefix", executor.options.worker_name_prefix},
-       }},
-  };
-}
-
-json runtimePacketArrayFromPortStore(const flightenv::platform::ThreadSafePortStore& port_store) {
-  json packets = json::array();
-  for (const auto& packet : port_store.snapshot_packets()) {
-    packets.push_back(nativeWorkflowRuntimePacketToJson(packet));
-  }
-  return packets;
-}
-
-json portStoreEvidence(const flightenv::platform::ThreadSafePortStore& port_store) {
-  const std::vector<flightenv::platform::RuntimePacket> packets = port_store.snapshot_packets();
-  std::set<std::string> output_nodes;
-  std::set<std::string> ports;
-  std::set<std::string> logical_node_ports;
-  std::set<std::string> scoped_logical_node_ports;
-  for (const auto& packet : packets) {
-    if (!packet.node_id.empty()) {
-      output_nodes.insert(packet.node_id);
-    }
-    if (!packet.port_name.empty()) {
-      ports.insert(packet.port_name);
-    }
-    const auto port_id = packet.tags.find("port_id");
-    if (!packet.node_id.empty() && port_id != packet.tags.end() && !port_id->second.empty()) {
-      logical_node_ports.insert(packet.node_id + "." + port_id->second);
-      const auto branch_id = packet.tags.find("branch_id");
-      const auto timeline_id = packet.tags.find("timeline_id");
-      scoped_logical_node_ports.insert(
-          (branch_id == packet.tags.end() ? std::string() : branch_id->second) + "|" +
-          (timeline_id == packet.tags.end() ? std::string() : timeline_id->second) + "|" +
-          packet.node_id + "." + port_id->second);
-    }
-  }
-  return {
-      {"type", "FlightEnvPlatform::ThreadSafePortStore"},
-      {"packet_count", packets.size()},
-      {"port_count", ports.size()},
-      {"node_output_count", output_nodes.size()},
-      {"port_packet_count", logical_node_ports.size()},
-      {"scoped_port_packet_count", scoped_logical_node_ports.size()},
-  };
 }
 
 json resourcePayload(const std::map<std::string, json>& resource_locks_by_id, const json& node) {
@@ -1182,10 +1078,10 @@ class NativeWorkflowRunner::Impl {
     int public_tick_failed_nodes = 0;
     int dispatch_tick_index = 0;
     bool stop_requested = false;
-    // R3：被输入对齐或就绪检查挡下的 node_due 不再直接丢拍。同一到期时刻允许一次重试，
-    // 重试事件排在同时刻所有常规 node_due / branch 事件之后（priority 60000）、checkpoint
-    // 与公共拍物化之前，让"同拍上游先跑完再试一次"成为可能；重试仍失败则记录一等
-    // node_due_dropped 事件后放弃 —— 有界、确定、无活锁（节点自身后续到期事件已在种子里）。
+    // R3锛氳杈撳叆瀵归綈鎴栧氨缁鏌ユ尅涓嬬殑 node_due 涓嶅啀鐩存帴涓㈡媿銆傚悓涓€鍒版湡鏃跺埢鍏佽涓€娆￠噸璇曪紝
+    // 閲嶈瘯浜嬩欢鎺掑湪鍚屾椂鍒绘墍鏈夊父瑙?node_due / branch 浜嬩欢涔嬪悗锛坧riority 60000锛夈€乧heckpoint
+    // 涓庡叕鍏辨媿鐗╁寲涔嬪墠锛岃"鍚屾媿涓婃父鍏堣窇瀹屽啀璇曚竴娆?鎴愪负鍙兘锛涢噸璇曚粛澶辫触鍒欒褰曚竴绛?
+    // node_due_dropped 浜嬩欢鍚庢斁寮?鈥斺€?鏈夌晫銆佺‘瀹氥€佹棤娲婚攣锛堣妭鐐硅嚜韬悗缁埌鏈熶簨浠跺凡鍦ㄧ瀛愰噷锛夈€?
     constexpr int kNodeDueRetryPriority = 60000;
     constexpr int kNodeDueMaxRetries = 1;
     auto scheduleNodeDueRetryOrDrop = [&](const RuntimeEvent& blocked_event,
@@ -1194,7 +1090,7 @@ class NativeWorkflowRunner::Impl {
       const int retry_count = jsonInt(blocked_event.payload, "retry_count", 0);
       if (retry_count < kNodeDueMaxRetries) {
         RuntimeEvent retry_event = blocked_event;
-        retry_event.event_id.clear();  // 入队时重新生成事件 id
+        retry_event.event_id.clear();  // 鍏ラ槦鏃堕噸鏂扮敓鎴愪簨浠?id
         retry_event.priority = kNodeDueRetryPriority;
         retry_event.payload["retry_count"] = retry_count + 1;
         retry_event.payload["retry_of_event_id"] = blocked_event.event_id;
@@ -1910,39 +1806,6 @@ class NativeWorkflowRunner::Impl {
     };
   }
 
-  json buildSensorStreamArtifact(const NativeWorkflowRequest& req, const json& observations) const {
-    json frames = json::array();
-    if (observations.is_array()) {
-      for (std::size_t i = 0; i < observations.size(); ++i) {
-        const json& frame = observations.at(i);
-        frames.push_back({
-            {"frame_index", static_cast<int>(i)},
-            {"loop_iteration_index", static_cast<int>(i)},
-            {"sample_time_s", jsonDouble(frame, "sample_time_s", jsonDouble(frame, "time_s", static_cast<double>(i)))},
-            {"sensor_count", frame.value("sensor_count", 0)},
-            {"source", "external_observation_stream"},
-            {"selected_state", frame.value("selected_state", frame.value("state", json::object()))},
-            {"frame", frame},
-        });
-      }
-    }
-    return {
-        {"schema_version", "flightenv.platform.sensor_stream.v1"},
-        {"run_id", req.run_id},
-        {"workflow_id", compiled_.workflow_id},
-        {"object_id", compiled_.object_id},
-        {"generated_at_utc", nowUtcIso()},
-        {"source_operator_id", "external.measurement_driver"},
-        {"source_stream_path", pathString(req.external_observation_stream)},
-        {"frames", frames},
-        {"summary",
-         {
-             {"frame_count", frames.size()},
-             {"input_exhausted", false},
-         }},
-    };
-  }
-
   void writeArtifacts(
       const NativeWorkflowRequest& req,
       const json& lifecycle_events,
@@ -1968,371 +1831,54 @@ class NativeWorkflowRunner::Impl {
       int iteration_count,
       int failed_nodes,
       bool prepare_only) const {
-    const std::string status = failed_nodes == 0 ? (prepare_only ? "prepared" : "completed") : "failed";
-    const RuntimeEvidenceWriter evidence_writer(req.run_dir);
-    int held_output_total = 0;
-    double summary_base_dt_s = 0.0;
-    double summary_output_period_s = 0.0;
-    if (loop_iterations.is_array()) {
-      for (const auto& item : loop_iterations) {
-        if (!item.is_object()) {
-          continue;
-        }
-        held_output_total += jsonInt(item, "held_output_count", 0);
-        if (summary_base_dt_s <= 0.0) {
-          summary_base_dt_s = jsonDouble(item, "base_dt_s", 0.0);
-        }
-        if (summary_output_period_s <= 0.0) {
-          summary_output_period_s = jsonDouble(item, "output_period_s", 0.0);
-        }
-      }
-    }
-    const json port_store_packets = runtimePacketArrayFromPortStore(port_store);
+    const json session_summary = sessionSummary();
     const json backend_capability_report = adapterBackendCapabilityReport();
-    const json typed_buffer_store_summary = RuntimeTypedBufferStore::instance().summary();
-    const SchedulerRuntimeEventCounts scheduler_runtime_event_counts =
-        countSchedulerRuntimeEvents(scheduler_events);
-    const json pdk_runtime_core = {
-        {"runtime_packet", "FlightEnvPlatform::RuntimePacket"},
-        {"port_store", portStoreEvidence(port_store)},
-        {"ready_queue_scheduler", readyQueueSchedulerEvidence(pdk_scheduler)},
-        {"thread_pool_executor", threadPoolExecutorEvidence(pdk_executor)},
-        {"ready_queue_executor", ready_executor.runtimeCoreEvidence()},
-        {"adapter_session_contract", kAdapterSessionContract},
-        {"legacy_json_packet_buffer_count", runtime_packets.size()},
-        {"typed_packet_fields",
-         {"contract_id",
-          "typed_schema_id",
-          "typed_dto_name",
-          "typed_payload_ref",
-          "typed_buffer_ref",
-          "buffer_layout_id",
-          "buffer_bytes",
-          "zero_copy_eligible"}},
-        {"zero_copy_mode", runtimeZeroCopyModeName(
-                               resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode))},
-        {"typed_buffer_persistence", runtimeTypedBufferPersistenceName(
-                                        resolveRuntimeTypedBufferPersistence(
-                                            options_.typed_buffer_persistence))},
-        {"single_kernel_stage", "R2.runtime_packet_typed_ref_bridge"},
-        {"remaining_host_owned_services",
-         {"online_loop_clock", "branch_manager", "runtime_index_writer", "health_ledger_writer"}},
-    };
-    evidence_writer.writeJson(
-        "adapter_lifecycle_log.json",
-        {{"schema_version", "flightenv.platform.adapter_lifecycle_log.v1"},
-               {"run_id", req.run_id},
-               {"workflow_id", compiled_.workflow_id},
-               {"object_id", compiled_.object_id},
-               {"generated_at_utc", nowUtcIso()},
-               {"execution_backend", "native_adapter_sessions"},
-               {"events", lifecycle_events}});
-    evidence_writer.writeJson(
-        "scheduler_timeline.json",
-        {{"schema_version", "flightenv.platform.scheduler_timeline.v1"},
-               {"run_id", req.run_id},
-               {"workflow_id", compiled_.workflow_id},
-               {"object_id", compiled_.object_id},
-               {"generated_at_utc", nowUtcIso()},
-               {"events", scheduler_events}});
-    evidence_writer.writeJson(
-        "runtime_node_snapshot.json",
-        {{"schema_version", "flightenv.platform.runtime_node_snapshot.v1"},
-               {"run_id", req.run_id},
-               {"workflow_id", compiled_.workflow_id},
-               {"object_id", compiled_.object_id},
-               {"generated_at_utc", nowUtcIso()},
-               {"nodes", node_snapshots}});
-    evidence_writer.writeJson(
-        "runtime_outputs.json",
-        {{"schema_version", "flightenv.platform.runtime_outputs.v1"},
-               {"run_id", req.run_id},
-               {"workflow_id", compiled_.workflow_id},
-               {"object_id", compiled_.object_id},
-               {"generated_at_utc", nowUtcIso()},
-               {"last_loop_iteration_index", std::max(0, iteration_count - 1)},
-               {"typed_buffer_store", typed_buffer_store_summary},
-               {"outputs", outputs}});
-    evidence_writer.writeJson(
-        "runtime_loop_summary.json",
-        {{"schema_version", "flightenv.platform.runtime_loop_summary.v1"},
-               {"run_id", req.run_id},
-               {"workflow_id", compiled_.workflow_id},
-               {"object_id", compiled_.object_id},
-               {"generated_at_utc", nowUtcIso()},
-               {"iterations", loop_iterations},
-               {"summary",
-                {{"iteration_count", iteration_count},
-                 {"failed_nodes", failed_nodes},
-                 {"base_dt_s", summary_base_dt_s},
-                 {"output_period_s", summary_output_period_s},
-                 {"held_output_count", held_output_total},
-                 {"input_alignment_blocked_count",
-                  scheduler_runtime_event_counts.input_alignment_blocked_count},
-                 {"ready_queue_rejected_count",
-                  scheduler_runtime_event_counts.ready_queue_rejected_count},
-                 {"node_due_retry_scheduled_count",
-                  scheduler_runtime_event_counts.node_due_retry_scheduled_count},
-                 {"node_due_dropped_count",
-                  scheduler_runtime_event_counts.node_due_dropped_count}}}});
-    evidence_writer.writeJson(
-        "runtime_packets.json",
-        {{"schema_version", "flightenv.platform.runtime_packets.v1"},
-               {"run_id", req.run_id},
-               {"workflow_id", compiled_.workflow_id},
-               {"object_id", compiled_.object_id},
-               {"branch_id", req.branch_id},
-               {"timeline_id", req.timeline_id},
-               {"generated_at_utc", nowUtcIso()},
-               {"producer", "ThreadSafePortStore"},
-               {"summary", portStoreEvidence(port_store)},
-               {"packets", port_store_packets}});
-    int runtime_rate_transition_executed_count = 0;
-    int runtime_rate_transition_blocked_count = 0;
-    if (runtime_rate_transition_nodes.is_array()) {
-      for (const auto& item : runtime_rate_transition_nodes) {
-        if (!item.is_object()) {
-          continue;
-        }
-        if (jsonString(item, "status") == "executed") {
-          ++runtime_rate_transition_executed_count;
-        } else if (jsonString(item, "status") == "blocked") {
-          ++runtime_rate_transition_blocked_count;
-        }
-      }
-    }
-    evidence_writer.writeJson(
-        "runtime_rate_transition_nodes.json",
-        {{"schema_version", "flightenv.platform.runtime_rate_transition_nodes.v1"},
-               {"run_id", req.run_id},
-               {"workflow_id", compiled_.workflow_id},
-               {"object_id", compiled_.object_id},
-               {"branch_id", req.branch_id},
-               {"timeline_id", req.timeline_id},
-               {"generated_at_utc", nowUtcIso()},
-               {"nodes", runtime_rate_transition_nodes},
-               {"summary",
-                {{"event_count", runtime_rate_transition_nodes.size()},
-                 {"executed_count", runtime_rate_transition_executed_count},
-                 {"blocked_count", runtime_rate_transition_blocked_count}}}});
-    evidence_writer.writeJson(
-        "data_plane_manifest.json",
-        {{"schema_version", "flightenv.platform.data_plane_manifest.v1"},
-               {"run_id", req.run_id},
-               {"workflow_id", compiled_.workflow_id},
-               {"object_id", compiled_.object_id},
-               {"generated_at_utc", nowUtcIso()},
-               {"entries", data_plane_entries},
-               {"summary", {{"entry_count", data_plane_entries.size()}}}});
-    evidence_writer.writeJson(
-        "uncertainty_evidence.json",
-        {{"schema_version", "flightenv.platform.uncertainty_evidence.v1"},
-               {"run_id", req.run_id},
-               {"workflow_id", compiled_.workflow_id},
-               {"object_id", compiled_.object_id},
-               {"generated_at_utc", nowUtcIso()},
-               {"nodes", uncertainty_nodes}});
-    evidence_writer.writeJson(
-        "forecast_uncertainty_evidence.json",
-        {{"schema_version", "flightenv.platform.forecast_uncertainty_evidence.v1"},
-               {"run_id", req.run_id},
-               {"workflow_id", compiled_.workflow_id},
-               {"object_id", compiled_.object_id},
-               {"branch_id", req.branch_id},
-               {"timeline_id", req.timeline_id},
-               {"generated_at_utc", nowUtcIso()},
-               {"summary", forecast_uncertainty_summary},
-               {"events", forecast_uncertainty_events}});
-    evidence_writer.writeJson(
-        "state_checkpoint.json",
-        {{"schema_version", "flightenv.platform.state_checkpoint.v1"},
-               {"run_id", req.run_id},
-               {"workflow_id", compiled_.workflow_id},
-               {"object_id", compiled_.object_id},
-               {"generated_at_utc", nowUtcIso()},
-               {"checkpoints", checkpoints}});
-    evidence_writer.writeJson(
-        "runtime_artifacts.json",
-        {{"schema_version", "flightenv.platform.runtime_artifacts.v1"},
-               {"run_id", req.run_id},
-               {"workflow_id", compiled_.workflow_id},
-               {"object_id", compiled_.object_id},
-               {"generated_at_utc", nowUtcIso()},
-               {"inputs", input_artifacts},
-               {"outputs", output_artifacts}});
-    evidence_writer.writeJson("sensor_stream.json", buildSensorStreamArtifact(req, external_observations));
-    evidence_writer.writeJson("adapter_session_summary.json", sessionSummary());
-    evidence_writer.writeJson("adapter_backend_capability_report.json", backend_capability_report);
-    evidence_writer.writeJson("edge_binding_plan.json", compiled_.edge_binding_plan);
-    evidence_writer.writeJson("rate_transition_plan.json", compiled_.rate_transition_plan);
-    json scheduler_due_time_trace = json::object();
-    json scheduler_diagnostics = json::object();
-    if (!compiled_.scheduler_table.empty()) {
-      evidence_writer.writeJson("scheduler_table.json", compiled_.scheduler_table);
-      scheduler_due_time_trace = RuntimeDueTimeScheduler(compiled_.scheduler_table).buildTrace();
-      evidence_writer.writeJson("scheduler_due_time_trace.json", scheduler_due_time_trace);
-      scheduler_diagnostics = RuntimeScheduleDiagnostics(
-          compiled_.scheduler_table,
-          scheduler_due_time_trace,
-          pdk_executor.options.max_workers)
-                                  .build();
-      evidence_writer.writeJson("scheduler_diagnostics.json", scheduler_diagnostics);
-    }
-    const json time_plan_summary =
-        compiled_.time_plan.contains("summary") && compiled_.time_plan.at("summary").is_object()
-            ? compiled_.time_plan.at("summary")
-            : json::object();
-    const json scheduler_plan_summary =
-        compiled_.scheduler_plan.contains("summary") && compiled_.scheduler_plan.at("summary").is_object()
-            ? compiled_.scheduler_plan.at("summary")
-            : json::object();
-    const json scheduler_table_summary =
-        compiled_.scheduler_table.contains("summary") && compiled_.scheduler_table.at("summary").is_object()
-            ? compiled_.scheduler_table.at("summary")
-            : json::object();
-    const json scheduler_due_time_trace_summary =
-        scheduler_due_time_trace.contains("summary") && scheduler_due_time_trace.at("summary").is_object()
-            ? scheduler_due_time_trace.at("summary")
-            : json::object();
-    const json scheduler_diagnostics_summary =
-        scheduler_diagnostics.contains("summary") && scheduler_diagnostics.at("summary").is_object()
-            ? scheduler_diagnostics.at("summary")
-            : json::object();
-    evidence_writer.writeJson(
-        "runtime_evidence.json",
-        {{"schema_version", "flightenv.platform.runtime_evidence.v1"},
-               {"run_id", req.run_id},
-               {"workflow_id", compiled_.workflow_id},
-               {"object_id", compiled_.object_id},
-               {"branch_id", req.branch_id},
-               {"timeline_id", req.timeline_id},
-               {"status", status},
-               {"generated_at_utc", nowUtcIso()},
-               {"execution_backend", "native_adapter_sessions"},
-               {"runtime_core", pdk_runtime_core},
-               {"adapter_registry_ref", pathString(options_.adapter_registry)},
-               {"compiled_workflow_dir", pathString(options_.compiled_workflow)},
-               {"initial_seed", seed},
-               {"summary",
-                {{"node_count", compiled_.nodes.size()},
-                 {"iteration_count", iteration_count},
-                 {"failed_nodes", failed_nodes},
-                 {"input_alignment_blocked_count",
-                  scheduler_runtime_event_counts.input_alignment_blocked_count},
-                 {"ready_queue_rejected_count",
-                  scheduler_runtime_event_counts.ready_queue_rejected_count},
-                 {"node_due_retry_scheduled_count",
-                  scheduler_runtime_event_counts.node_due_retry_scheduled_count},
-                 {"node_due_dropped_count",
-                  scheduler_runtime_event_counts.node_due_dropped_count},
-                 {"zero_copy_mode", runtimeZeroCopyModeName(
-                                        resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode))},
-                 {"typed_buffer_persistence", runtimeTypedBufferPersistenceName(
-                                                resolveRuntimeTypedBufferPersistence(
-                                                    options_.typed_buffer_persistence))},
-                 {"adapter_session_count", sessions_.size()},
-                 {"adapter_backend_capability", backend_capability_report.value("summary", json::object())},
-                 {"typed_buffer_store", typed_buffer_store_summary},
-                 {"runtime_packet_count", port_store_packets.size()},
-                 {"port_store_node_output_count", portStoreEvidence(port_store).value("node_output_count", 0)},
-                 {"runtime_rate_transition_node_event_count", runtime_rate_transition_nodes.size()},
-                 {"runtime_rate_transition_node_executed_count", runtime_rate_transition_executed_count},
-                 {"runtime_rate_transition_node_blocked_count", runtime_rate_transition_blocked_count},
-                 {"forecast_uncertainty_enabled",
-                  forecast_uncertainty_summary.value("enabled", false)},
-                 {"forecast_uncertainty_step_count",
-                  forecast_uncertainty_summary.value("step_count", 0)},
-                 {"forecast_uncertainty_seed_covariance_trace",
-                  forecast_uncertainty_summary.value("seed_covariance_trace", 0.0)},
-                 {"forecast_uncertainty_latest_covariance_trace",
-                  forecast_uncertainty_summary.value("latest_covariance_trace", 0.0)},
-                 {"forecast_uncertainty_growth_ratio",
-                  forecast_uncertainty_summary.value("growth_ratio", 0.0)},
-                 {"edge_binding_count", compiled_.edge_binding_plan.value("summary", json::object()).value("binding_count", 0)},
-                 {"rate_transition_count",
-                  compiled_.rate_transition_plan.value("summary", json::object()).value("transition_count", 0)},
-                 {"cross_rate_transition_count",
-                  compiled_.rate_transition_plan.value("summary", json::object()).value("cross_rate_transition_count", 0)},
-                 {"runtime_rate_transition_count",
-                  compiled_.rate_transition_plan.value("summary", json::object()).value("runtime_transition_count", 0)},
-                 {"time_plan_node_count", time_plan_summary.value("node_count", 0)},
-                 {"time_plan_distinct_delta_t_s",
-                  time_plan_summary.value("distinct_delta_t_s", json::array())},
-                 {"time_plan_profile_schedule_override_node_count",
-                  time_plan_summary.value("profile_schedule_override_node_count", 0)},
-                 {"scheduler_profile_schedule_override_node_count",
-                  scheduler_plan_summary.value("profile_schedule_override_node_count", 0)},
-                 {"scheduler_table_dispatch_entry_count",
-                  scheduler_table_summary.value("dispatch_entry_count", 0)},
-                 {"scheduler_table_transition_entry_count",
-                  scheduler_table_summary.value("transition_entry_count", 0)},
-                 {"scheduler_table_runtime_transition_entry_count",
-                  scheduler_table_summary.value("runtime_transition_entry_count", 0)},
-                 {"scheduler_table_profile_schedule_override_entry_count",
-                  scheduler_table_summary.value("profile_schedule_override_entry_count", 0)},
-                 {"scheduler_due_time_trace_dispatch_event_count",
-                  scheduler_due_time_trace_summary.value("dispatch_event_count", 0)},
-                 {"scheduler_due_time_trace_held_not_due_event_count",
-                  scheduler_due_time_trace_summary.value("held_not_due_event_count", 0)},
-                 {"scheduler_due_time_trace_not_due_violation_count",
-                  scheduler_due_time_trace_summary.value("not_due_violation_count", 0)},
-                 {"scheduler_due_time_trace_dependency_violation_count",
-                  scheduler_due_time_trace_summary.value("dependency_violation_count", 0)},
-                 {"scheduler_due_time_trace_digest",
-                  scheduler_due_time_trace_summary.value("trace_digest", std::string())},
-                 {"scheduler_diagnostics_digest",
-                  scheduler_diagnostics_summary.value("diagnostics_digest", std::string())},
-                 {"rate_graph_node_count",
-                  scheduler_diagnostics_summary.value("node_count", 0)},
-                 {"rate_graph_edge_count",
-                  scheduler_diagnostics_summary.value("rate_graph_edge_count", 0)},
-                 {"rate_graph_transition_edge_count",
-                  scheduler_diagnostics_summary.value("transition_edge_count", 0)},
-                 {"rate_graph_cross_rate_edge_count",
-                  scheduler_diagnostics_summary.value("cross_rate_edge_count", 0)},
-                 {"rate_graph_distinct_period_count",
-                  scheduler_diagnostics_summary.value("distinct_period_count", 0)},
-                 {"deterministic_multitasking_batch_count",
-                  scheduler_diagnostics_summary.value("multitasking_batch_count", 0)},
-                 {"deterministic_multitasking_parallelizable_batch_count",
-                  scheduler_diagnostics_summary.value("parallelizable_batch_count", 0)},
-                 {"deterministic_multitasking_dependency_violation_count",
-                  scheduler_diagnostics_summary.value("multitasking_dependency_violation_count", 0)},
-                 {"deadline_check_event_count",
-                  scheduler_diagnostics_summary.value("deadline_check_event_count", 0)},
-                 {"deadline_miss_count",
-                  scheduler_diagnostics_summary.value("deadline_miss_count", 0)},
-                 {"overrun_count",
-                  scheduler_diagnostics_summary.value("overrun_count", 0)},
-                 {"jitter_violation_count",
-                  scheduler_diagnostics_summary.value("jitter_violation_count", 0)},
-                 {"max_abs_jitter_s",
-                  scheduler_diagnostics_summary.value("max_abs_jitter_s", 0.0)},
-                 {"ready_queue_plan_node_count", pdk_scheduler.plan_nodes.size()},
-                 {"worker_pool_size", pdk_executor.options.max_workers},
-                 {"pdk_workflow_process_spawned", false},
-                 {"operator_process_spawned_by_host", false}}},
-               {"refs",
-               {{"adapter_lifecycle_log", "adapter_lifecycle_log.json"},
-                 {"adapter_session_summary", "adapter_session_summary.json"},
-                 {"adapter_backend_capability_report", "adapter_backend_capability_report.json"},
-                 {"runtime_node_snapshot", "runtime_node_snapshot.json"},
-                 {"runtime_outputs", "runtime_outputs.json"},
-                 {"runtime_loop_summary", "runtime_loop_summary.json"},
-                 {"runtime_rate_transition_nodes", "runtime_rate_transition_nodes.json"},
-                 {"edge_binding_plan", "edge_binding_plan.json"},
-                 {"rate_transition_plan", "rate_transition_plan.json"},
-                 {"scheduler_table", compiled_.scheduler_table.empty() ? "" : "scheduler_table.json"},
-                 {"scheduler_due_time_trace",
-                  scheduler_due_time_trace.empty() ? "" : "scheduler_due_time_trace.json"},
-                 {"scheduler_diagnostics",
-                  scheduler_diagnostics.empty() ? "" : "scheduler_diagnostics.json"},
-                 {"data_plane_manifest", "data_plane_manifest.json"},
-                 {"forecast_uncertainty_evidence", "forecast_uncertainty_evidence.json"},
-                 {"state_checkpoint", "state_checkpoint.json"},
-                 {"sensor_stream", "sensor_stream.json"}}}});
+    writeNativeWorkflowEvidence({
+        req.run_dir,
+        options_.adapter_registry,
+        options_.compiled_workflow,
+        req.external_observation_stream,
+        req.run_id,
+        compiled_.workflow_id,
+        compiled_.object_id,
+        req.branch_id,
+        req.timeline_id,
+        runtimeZeroCopyModeName(resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode)),
+        runtimeTypedBufferPersistenceName(resolveRuntimeTypedBufferPersistence(options_.typed_buffer_persistence)),
+        compiled_.nodes.size(),
+        sessions_.size(),
+        &lifecycle_events,
+        &scheduler_events,
+        &node_snapshots,
+        &uncertainty_nodes,
+        &checkpoints,
+        &data_plane_entries,
+        &input_artifacts,
+        &output_artifacts,
+        &loop_iterations,
+        &runtime_packets,
+        &runtime_rate_transition_nodes,
+        &outputs,
+        &forecast_uncertainty_events,
+        &forecast_uncertainty_summary,
+        &seed,
+        &external_observations,
+        &session_summary,
+        &backend_capability_report,
+        &compiled_.edge_binding_plan,
+        &compiled_.rate_transition_plan,
+        &compiled_.scheduler_table,
+        &compiled_.time_plan,
+        &compiled_.scheduler_plan,
+        &port_store,
+        &pdk_scheduler,
+        &pdk_executor,
+        &ready_executor,
+        iteration_count,
+        failed_nodes,
+        prepare_only,
+    });
   }
-
   NativeWorkflowOptions options_;
   NativeWorkflowCompiledState compiled_;
   std::map<std::string, std::unique_ptr<IAdapterSession>> sessions_;

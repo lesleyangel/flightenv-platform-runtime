@@ -107,6 +107,7 @@
     <ClCompile Include="..\src\main.cpp" />
     <ClCompile Include="..\src\NativeAdapterSessions.cpp" />
     <ClCompile Include="..\src\NativeWorkflowCompiledState.cpp" />
+    <ClCompile Include="..\src\NativeWorkflowEvidenceWriter.cpp" />
     <ClCompile Include="..\src\NativeWorkflowNodePreparation.cpp" />
     <ClCompile Include="..\src\NativeWorkflowNodeResultCommit.cpp" />
     <ClCompile Include="..\src\NativeWorkflowRunner.cpp" />
@@ -145,6 +146,7 @@
   <ItemGroup>
     <ClInclude Include="..\src\NativeAdapterSessions.hpp" />
     <ClInclude Include="..\src\NativeWorkflowCompiledState.hpp" />
+    <ClInclude Include="..\src\NativeWorkflowEvidenceWriter.hpp" />
     <ClInclude Include="..\src\NativeWorkflowNodePreparation.hpp" />
     <ClInclude Include="..\src\NativeWorkflowNodeResultCommit.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\AdapterSession.hpp" />
