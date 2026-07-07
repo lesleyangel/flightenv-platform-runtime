@@ -183,6 +183,7 @@ function Normalize-Any {
         'generated_at_utc',
         'created_at_utc',
         'updated_at_utc',
+        'timestamp_utc',
         'duration_ms',
         'wall_time_ms',
         'inline_byte_size',
