@@ -14,6 +14,7 @@
 #include "NativeAdapterSessions.hpp"
 #include "NativeWorkflowCompiledState.hpp"
 #include "NativeWorkflowNodePreparation.hpp"
+#include "NativeWorkflowNodeResultCommit.hpp"
 
 #include "FlightEnvPlatform/Adapter/AdapterAbi.hpp"
 #include "FlightEnvPlatform/Runtime/ReadyQueueScheduler.hpp"
@@ -25,8 +26,6 @@
 #include "FlightEnvPlatformRuntime/RuntimeDueTimeScheduler.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeEventLoop.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeEvidenceWriter.hpp"
-#include "FlightEnvPlatformRuntime/RuntimeNodeEvidenceBuilder.hpp"
-#include "FlightEnvPlatformRuntime/RuntimePortPacketWriter.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeReadyQueueExecutor.hpp"
 #include "FlightEnvPlatformRuntime/RuntimePublicFrameBuilder.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeScheduleDiagnostics.hpp"
@@ -37,7 +36,6 @@
 #include "FlightEnvPlatformRuntime/estimation/RuntimeEstimationService.hpp"
 #include "FlightEnvPlatformRuntime/estimation/SampleSetStore.hpp"
 #include "FlightEnvPlatformRuntime/time/RuntimeEventQueue.hpp"
-#include "FlightEnvPlatformRuntime/time/RuntimeMaterialization.hpp"
 #include "FlightEnvPlatformRuntime/time/RuntimePortSampleBuffer.hpp"
 
 #include <algorithm>
@@ -178,25 +176,6 @@ int jsonInt(const json& value, const std::string& key, int fallback = 0) {
   }
   if (item.is_number()) {
     return static_cast<int>(item.get<double>());
-  }
-  return fallback;
-}
-
-std::uint64_t jsonUInt64(const json& value, const std::string& key, std::uint64_t fallback = 0) {
-  if (!value.is_object() || !value.contains(key)) {
-    return fallback;
-  }
-  const auto& item = value.at(key);
-  if (item.is_number_unsigned()) {
-    return item.get<std::uint64_t>();
-  }
-  if (item.is_number_integer()) {
-    const auto signed_value = item.get<std::int64_t>();
-    return signed_value > 0 ? static_cast<std::uint64_t>(signed_value) : fallback;
-  }
-  if (item.is_number()) {
-    const auto double_value = item.get<double>();
-    return double_value > 0.0 ? static_cast<std::uint64_t>(double_value) : fallback;
   }
   return fallback;
 }
@@ -469,15 +448,6 @@ json schedulerInfo(const json& scheduler_plan, const std::string& node_id) {
   return info;
 }
 
-flightenv::platform::SimulationTimePoint simulationTimePointFromJson(const json& value) {
-  flightenv::platform::SimulationTimePoint point;
-  point.run_time_s = jsonDouble(value, "run_time_s", 0.0);
-  point.tick_index = jsonInt(value, "tick_index", 0);
-  point.source_time_s = jsonDouble(value, "source_time_s", point.run_time_s);
-  point.stamp_ns = static_cast<long long>(jsonDouble(value, "stamp_ns", 0.0));
-  return point;
-}
-
 json readyQueueSchedulerEvidence(const flightenv::platform::ReadyQueueScheduler& scheduler) {
   return {
       {"type", "FlightEnvPlatform::ReadyQueueScheduler"},
@@ -495,8 +465,6 @@ json readyQueueSchedulerEvidence(const flightenv::platform::ReadyQueueScheduler&
   };
 }
 
-json runtimePacketToJson(const flightenv::platform::RuntimePacket& packet);
-
 json threadPoolExecutorEvidence(const flightenv::platform::ThreadPoolExecutorDescriptor& executor) {
   return {
       {"type", "FlightEnvPlatform::ThreadPoolExecutorDescriptor"},
@@ -511,7 +479,7 @@ json threadPoolExecutorEvidence(const flightenv::platform::ThreadPoolExecutorDes
 json runtimePacketArrayFromPortStore(const flightenv::platform::ThreadSafePortStore& port_store) {
   json packets = json::array();
   for (const auto& packet : port_store.snapshot_packets()) {
-    packets.push_back(runtimePacketToJson(packet));
+    packets.push_back(nativeWorkflowRuntimePacketToJson(packet));
   }
   return packets;
 }
@@ -1058,113 +1026,6 @@ class ForecastUncertaintyTracker {
   estimation::PosteriorFrame latest_;
   std::unique_ptr<estimation::IEstimatorMethod> method_;
 };
-
-flightenv::platform::RuntimePacket buildRuntimePacket(
-    const std::string& run_id,
-    const std::string& object_id,
-    const std::string& branch_id,
-    const std::string& timeline_id,
-    const std::string& node_id,
-    const json& execute_result,
-    const json& time_info,
-    const json& data_plane_entries) {
-  const json output_time = time_info.value("output_time_point", time_info.value("time_point", json::object()));
-  json output_refs = json::array();
-  json first_output_ref = json::object();
-  if (data_plane_entries.is_array()) {
-    for (const auto& entry : data_plane_entries) {
-      if (!entry.is_object() || jsonString(entry, "direction") != "output") {
-        continue;
-      }
-      output_refs.push_back(entry);
-      if (first_output_ref.empty()) {
-        first_output_ref = entry;
-      }
-    }
-  }
-  flightenv::platform::RuntimePacket packet;
-  packet.run_id = run_id;
-  packet.object_id = object_id;
-  packet.port_name = "node." + node_id + ".output";
-  packet.node_id = node_id;
-  packet.time_point = simulationTimePointFromJson(output_time);
-  packet.producer_node = node_id;
-  packet.payload_kind = "inline_summary_json";
-  packet.inline_payload_json = json{
-      {"status", jsonString(execute_result, "status", "ok")},
-      {"output_ports", execute_result.value("outputs", json::object())},
-      {"data_plane_refs", output_refs},
-      {"summary", summarizeJson(execute_result)},
-  }.dump(-1, ' ', false, json::error_handler_t::replace);
-  packet.payload_ref = "runtime_node_snapshot.json";
-  if (first_output_ref.is_object()) {
-    packet.contract_id = jsonString(first_output_ref, "contract_id");
-    packet.typed_schema_id = jsonString(first_output_ref, "typed_schema_id");
-    packet.typed_dto_name = jsonString(first_output_ref, "typed_dto_name");
-    packet.typed_payload_ref = jsonString(first_output_ref, "typed_payload_ref");
-    packet.typed_buffer_ref = jsonString(first_output_ref, "typed_buffer_ref");
-    packet.buffer_layout_id = jsonString(first_output_ref, "buffer_layout_id",
-                                         jsonString(first_output_ref, "layout_ref"));
-    packet.buffer_bytes = jsonUInt64(first_output_ref, "buffer_bytes", 0);
-    packet.zero_copy_eligible = jsonBool(first_output_ref, "zero_copy_eligible", false);
-  }
-  packet.tags["created_at_utc"] = nowUtcIso();
-  packet.tags["branch_id"] = branch_id;
-  packet.tags["timeline_id"] = timeline_id;
-  packet.tags["data_plane_ref_count"] = std::to_string(output_refs.size());
-  return packet;
-}
-
-json runtimePacketToJson(const flightenv::platform::RuntimePacket& packet) {
-  json payload = json::object();
-  try {
-    payload = json::parse(packet.inline_payload_json);
-  } catch (...) {
-    payload = {{"raw", packet.inline_payload_json}};
-  }
-  return {
-      {"run_id", packet.run_id},
-      {"object_id", packet.object_id},
-      {"branch_id", packet.tags.count("branch_id") ? packet.tags.at("branch_id") : ""},
-      {"timeline_id", packet.tags.count("timeline_id") ? packet.tags.at("timeline_id") : ""},
-      {"port_name", packet.port_name},
-      {"node_id", packet.node_id},
-      {"time_s", packet.time_point.run_time_s},
-      {"tick_index", packet.time_point.tick_index},
-      {"source_time_s", packet.time_point.source_time_s},
-      {"stamp_ns", packet.time_point.stamp_ns},
-      {"version", packet.version},
-      {"producer_node", packet.producer_node},
-      {"payload_kind", packet.payload_kind},
-      {"payload", payload},
-      {"payload_ref", packet.payload_ref},
-      {"contract_id", packet.contract_id},
-      {"typed_schema_id", packet.typed_schema_id},
-      {"typed_dto_name", packet.typed_dto_name},
-      {"typed_payload_ref", packet.typed_payload_ref},
-      {"typed_buffer_ref", packet.typed_buffer_ref},
-      {"buffer_layout_id", packet.buffer_layout_id},
-      {"buffer_bytes", packet.buffer_bytes},
-      {"zero_copy_eligible", packet.zero_copy_eligible},
-      {"checksum", packet.checksum},
-      {"tags", packet.tags},
-      {"created_at_utc", packet.tags.count("created_at_utc") ? packet.tags.at("created_at_utc") : nowUtcIso()},
-  };
-}
-
-json makeDataPlaneEntries(
-    const json& data_plane_info,
-    const json& input_payload,
-    const json& output_payload,
-    const json& time_info,
-    int iteration_index) {
-  return RuntimeMaterialization::makeDataPlaneEntries(
-      data_plane_info,
-      input_payload,
-      output_payload,
-      time_info,
-      iteration_index);
-}
 
 }  // namespace
 
@@ -1996,79 +1857,40 @@ class NativeWorkflowRunner::Impl {
     const json flush_result = session.flush(context, json::object());
     logLifecycle(lifecycle_events, node, "flush", "ok", time_info, flush_result, iteration_index);
 
-    appendTrace(req.run_dir, "execute_node_dataplane_begin iteration=" + std::to_string(iteration_index) +
-                                   " node=" + node_id);
-    const json node_data_plane_entries =
-        makeDataPlaneEntries(data_plane_info, upstream, execute_result, time_info, iteration_index);
-    for (const auto& entry : node_data_plane_entries) {
-      data_plane_entries.push_back(entry);
-    }
-    appendTrace(req.run_dir, "execute_node_dataplane_end iteration=" + std::to_string(iteration_index) +
-                                 " node=" + node_id);
-
-    appendTrace(req.run_dir, "execute_node_packet_build_begin iteration=" + std::to_string(iteration_index) +
-                                 " node=" + node_id);
-    flightenv::platform::RuntimePacket packet_candidate =
-        buildRuntimePacket(
+    const json uncertainty_info = nodePlanInfo(compiled_.uncertainty_plan, node_id);
+    const json state_store_info = nodePlanInfo(compiled_.state_store_plan, node_id);
+    const NativeWorkflowNodeResultCommitResult commit_result =
+        commitNativeWorkflowNodeResult({
             req.run_id,
             compiled_.object_id,
             req.branch_id,
             req.timeline_id,
             node_id,
-            execute_result,
+            jsonString(node, "operator_id"),
+            jsonString(node, "adapter_id"),
+            jsonString(node, "execution_kind"),
+            session.protocol(),
+            execution_tag,
+            iteration_index,
             time_info,
-            node_data_plane_entries);
-    appendTrace(req.run_dir, "execute_node_packet_build_end iteration=" + std::to_string(iteration_index) +
-                               " node=" + node_id +
-                               " payload_bytes=" + std::to_string(packet_candidate.inline_payload_json.size()));
-    appendTrace(req.run_dir, "execute_node_portstore_write_begin iteration=" + std::to_string(iteration_index) +
-                                 " node=" + node_id);
-    const flightenv::platform::RuntimePacket runtime_packet = port_store.write(packet_candidate);
-    appendTrace(req.run_dir, "execute_node_portstore_write_end iteration=" + std::to_string(iteration_index) +
-                               " node=" + node_id);
-    appendTrace(req.run_dir, "execute_node_packet_json_begin iteration=" + std::to_string(iteration_index) +
-                               " node=" + node_id);
-    const json runtime_packet_json = runtimePacketToJson(runtime_packet);
-    appendTrace(req.run_dir, "execute_node_packet_json_end iteration=" + std::to_string(iteration_index) +
-                             " node=" + node_id);
-    appendTrace(req.run_dir, "execute_node_port_packets_begin iteration=" + std::to_string(iteration_index) +
-                               " node=" + node_id);
-    const RuntimePortPacketWriteResult port_packet_result =
-        RuntimePortPacketWriter::writeOutputPortPackets(
-            port_store,
-            RuntimePortPacketWriteRequest{
-                req.run_id,
-                compiled_.object_id,
-                req.branch_id,
-                req.timeline_id,
-                node_id,
-                execute_result,
-                time_info,
-                node_data_plane_entries,
-            });
-    appendTrace(req.run_dir, "execute_node_port_packets_end iteration=" + std::to_string(iteration_index) +
-                               " node=" + node_id +
-                               " count=" + std::to_string(port_packet_result.packets.size()));
-    const json uncertainty_info = nodePlanInfo(compiled_.uncertainty_plan, node_id);
-    const json state_store_info = nodePlanInfo(compiled_.state_store_plan, node_id);
-    const RuntimeNodeEvidenceResult node_evidence = RuntimeNodeEvidenceBuilder::build({
-        node_id,
-        jsonString(node, "operator_id"),
-        jsonString(node, "adapter_id"),
-        jsonString(node, "execution_kind"),
-        session.protocol(),
-        execution_tag,
-        iteration_index,
-        time_info,
-        snapshot,
-        runtime_packet_json,
-        port_packet_result.packets,
-        uncertainty_info.value("uncertainty_contract", json::object()),
-        input_summary,
-        output_summary,
-        jsonString(state_store_info, "checkpoint_kind", "snapshot_only"),
-        jsonString(state_store_info, "replay_mode", "record_replay"),
-    });
+            data_plane_info,
+            upstream,
+            execute_result,
+            snapshot,
+            uncertainty_info,
+            state_store_info,
+            input_summary,
+            output_summary,
+            &port_store,
+            [&](const std::string& message) {
+              appendTrace(req.run_dir, message);
+            },
+        });
+
+    for (const auto& entry : commit_result.data_plane_entries) {
+      data_plane_entries.push_back(entry);
+    }
+    const RuntimeNodeEvidenceResult& node_evidence = commit_result.node_evidence;
     input_artifacts.push_back(node_evidence.input_artifact);
     output_artifacts.push_back(node_evidence.output_artifact);
 
@@ -2082,9 +1904,9 @@ class NativeWorkflowRunner::Impl {
         {"node_snapshot", node_evidence.node_snapshot},
         {"uncertainty_node", node_evidence.uncertainty_node},
         {"checkpoint", node_evidence.checkpoint},
-        {"runtime_packet", runtime_packet_json},
-        {"runtime_port_packets", port_packet_result.packets},
-        {"runtime_port_packet_by_port", port_packet_result.packet_by_port},
+        {"runtime_packet", commit_result.runtime_packet},
+        {"runtime_port_packets", commit_result.runtime_port_packets},
+        {"runtime_port_packet_by_port", commit_result.runtime_port_packet_by_port},
     };
   }
 
