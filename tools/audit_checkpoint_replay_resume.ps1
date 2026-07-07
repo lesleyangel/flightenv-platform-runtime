@@ -1,5 +1,5 @@
 param(
-    [string]$Python = 'python',
+    [string]$Python = 'auto',
 
     [ValidateSet('Release', 'Debug')]
     [string]$Configuration = 'Release',
@@ -8,6 +8,8 @@ param(
     [string]$Platform = 'x64',
 
     [string]$RunIdPrefix = 'gate_h_checkpoint_replay',
+
+    [string]$ExternalObservationStream = '',
 
     [int]$OnlineFrames = 2,
 
@@ -34,6 +36,8 @@ $runtimeRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $workspaceRoot = [System.IO.Path]::GetFullPath((Join-Path $runtimeRoot '..'))
 $objectRoot = Join-Path $workspaceRoot 'flightenv-object-reentry-vehicle'
 $pdkRoot = Join-Path $workspaceRoot 'flightenv-platform-pdk'
+Import-Module (Join-Path $pdkRoot 'tools\PdkPython.psm1') -Force
+$Python = Resolve-PdkPython -Python $Python -PdkRoot $pdkRoot
 $compiledRoot = Join-Path $workspaceRoot '_local_artifacts\platform-pdk\compiled-workflows'
 $compiledOnline = Join-Path $compiledRoot 'reentry.online_filtering_external_input.v1'
 $compiledFuture = Join-Path $compiledRoot 'reentry.posterior_future_prediction.v1'
@@ -43,8 +47,19 @@ $runRoot = Join-Path $workspaceRoot '_local_artifacts\platform-runtime\runtime-h
 $reportRoot = Join-Path $workspaceRoot '_local_artifacts\platform-runtime\scheduler-acceptance'
 $reportPath = Join-Path $reportRoot 'checkpoint_replay_resume_audit.json'
 
+if ([string]::IsNullOrWhiteSpace($ExternalObservationStream)) {
+    $ExternalObservationStream = Join-Path $objectRoot 'fixtures\sensor_stream_db70_real_db.json'
+    if (-not (Test-Path -LiteralPath $ExternalObservationStream -PathType Leaf)) {
+        $ExternalObservationStream = Join-Path $objectRoot 'fixtures\sensor_stream_db70.json'
+    }
+}
+$ExternalObservationStream = [System.IO.Path]::GetFullPath($ExternalObservationStream)
+
 if ($TargetIterations -le $InitialIterations) {
     throw 'TargetIterations must be greater than InitialIterations for a resume audit.'
+}
+if (-not (Test-Path -LiteralPath $ExternalObservationStream -PathType Leaf)) {
+    throw "External observation stream not found: $ExternalObservationStream"
 }
 
 function Read-JsonFile {
@@ -141,9 +156,7 @@ function Invoke-Smoke {
         '-PredictionEveryFrames', "$PredictionEveryFrames",
         '-FutureMaxIterations', "$FutureIterations",
         '-BranchChunkIterations', '1',
-        '-ZeroCopyMode', 'require',
-        '-TypedBufferPersistence', 'memory_only',
-        '-RequireTypedZeroCopy'
+        '-ExternalObservationStream', $ExternalObservationStream
     )
     if ($NoBuild) {
         $args += '-SkipBuild'
@@ -200,8 +213,8 @@ $workerArgs = @(
     '--chain-dir', $resumeSeed.chain_dir,
     '--python', $Python,
     '--execution-backend', 'native_adapter_sessions',
-    '--zero-copy-mode', 'require',
-    '--typed-buffer-persistence', 'memory_only',
+    '--zero-copy-mode', 'auto',
+    '--typed-buffer-persistence', 'shadow_artifact',
     '--future-max-iterations', "$TargetIterations",
     '--branch-chunk-iterations', '1',
     '--branch-worker',

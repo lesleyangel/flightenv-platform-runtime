@@ -87,13 +87,17 @@ class RuntimeTimeScheduler {
    * @param max_iterations 请求的公开迭代范围。
    * @param base_dt_s 公开基础步长，单位为秒。
    * @param output_period_s 公开输出周期覆盖值，单位为秒。
+   * @param scheduler_table 可选的编译后 scheduler_table.json；提供时按 dispatch_table
+   *        中的 offset_s 对各节点到期栅格做相位平移，并让下游首拍不早于已知
+   *        上游首个有效输出。缺省为空对象时仅使用节点自身 depends_on 兼容旧版。
    */
   void seedWorkflowEvents(
       RuntimeEventQueue& events,
       const std::vector<nlohmann::json>& nodes,
       int max_iterations,
       double base_dt_s,
-      double output_period_s) const;
+      double output_period_s,
+      const nlohmann::json& scheduler_table = nlohmann::json::object()) const;
 
   /**
    * @brief 将已完成的节点执行记录到逐节点时钟状态。

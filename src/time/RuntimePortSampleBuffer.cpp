@@ -27,6 +27,13 @@ double jsonDouble(const nlohmann::json& value, const std::string& key, double fa
   return value.at(key).get<double>();
 }
 
+std::string jsonString(const nlohmann::json& value, const std::string& key, const std::string& fallback = "") {
+  if (!value.is_object() || !value.contains(key) || !value.at(key).is_string()) {
+    return fallback;
+  }
+  return value.at(key).get<std::string>();
+}
+
 double outputTimeS(const nlohmann::json& time_info) {
   if (time_info.is_object() && time_info.contains("public_output_time_s") &&
       time_info.at("public_output_time_s").is_number()) {
@@ -52,14 +59,26 @@ void normalizeSampleTime(RuntimePortSample& sample) {
 }  // namespace
 
 nlohmann::json RuntimePortSample::evidence() const {
+  const nlohmann::json runtime_event = time_info.value("runtime_event", nlohmann::json::object());
   return {
       {"channel_id", channel_id},
       {"source_node_id", source_node_id},
       {"source_port_id", source_port_id},
       {"time_s", time_s},
       {"time_ns", time_ns},
+      {"sample_time_s", time_s},
+      {"valid_from_s", time_s},
+      {"valid_until_s", time_info.value("valid_until_s", nlohmann::json(nullptr))},
+      {"producer_event_id", jsonString(runtime_event, "event_id")},
       {"iteration_index", iteration_index},
       {"value_kind", value.type_name()},
+      {"temporal_port_contract",
+       {
+           {"sample_time_s", time_s},
+           {"valid_from_s", time_s},
+           {"valid_until_s", time_info.value("valid_until_s", nlohmann::json(nullptr))},
+           {"producer_event_id", jsonString(runtime_event, "event_id")},
+       }},
   };
 }
 

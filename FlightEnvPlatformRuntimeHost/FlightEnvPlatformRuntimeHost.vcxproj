@@ -105,6 +105,12 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\src\main.cpp" />
+    <ClCompile Include="..\src\NativeAdapterSessions.cpp" />
+    <ClCompile Include="..\src\NativeWorkflowCompiledState.cpp" />
+    <ClCompile Include="..\src\NativeWorkflowDispatchLoop.cpp" />
+    <ClCompile Include="..\src\NativeWorkflowEvidenceWriter.cpp" />
+    <ClCompile Include="..\src\NativeWorkflowNodePreparation.cpp" />
+    <ClCompile Include="..\src\NativeWorkflowNodeResultCommit.cpp" />
     <ClCompile Include="..\src\NativeWorkflowRunner.cpp" />
     <ClCompile Include="..\src\PlatformRuntimeHost.cpp" />
     <ClCompile Include="..\src\RuntimeAdapterInvoker.cpp" />
@@ -115,6 +121,7 @@
     <ClCompile Include="..\src\RuntimeNodeEvidenceBuilder.cpp" />
     <ClCompile Include="..\src\RuntimePortBindingResolver.cpp" />
     <ClCompile Include="..\src\RuntimePortPacketWriter.cpp" />
+    <ClCompile Include="..\src\RuntimeRateTransitionExecutor.cpp" />
     <ClCompile Include="..\src\RuntimePortStoreView.cpp" />
     <ClCompile Include="..\src\RuntimeProfileUtils.cpp" />
     <ClCompile Include="..\src\RuntimePublicFrameBuilder.cpp" />
@@ -131,8 +138,19 @@
     <ClCompile Include="..\src\time\RuntimePortSampleBuffer.cpp" />
     <ClCompile Include="..\src\time\RuntimeTensorAlignment.cpp" />
     <ClCompile Include="..\src\time\RuntimeTensorInterpolator.cpp" />
+    <ClCompile Include="..\src\estimation\EstimatorMethodRegistry.cpp" />
+    <ClCompile Include="..\src\estimation\RuntimeEstimationService.cpp" />
+    <ClCompile Include="..\src\estimation\RuntimeObservationInbox.cpp" />
+    <ClCompile Include="..\src\estimation\SampleScheduler.cpp" />
+    <ClCompile Include="..\src\estimation\SampleSetStore.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\src\NativeAdapterSessions.hpp" />
+    <ClInclude Include="..\src\NativeWorkflowCompiledState.hpp" />
+    <ClInclude Include="..\src\NativeWorkflowDispatchLoop.hpp" />
+    <ClInclude Include="..\src\NativeWorkflowEvidenceWriter.hpp" />
+    <ClInclude Include="..\src\NativeWorkflowNodePreparation.hpp" />
+    <ClInclude Include="..\src\NativeWorkflowNodeResultCommit.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\AdapterSession.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\NativeWorkflowRunner.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\PlatformRuntimeHost.hpp" />
@@ -144,6 +162,7 @@
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeNodeEvidenceBuilder.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimePortBindingResolver.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimePortPacketWriter.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeRateTransitionExecutor.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimePortStoreView.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimeProfileUtils.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\RuntimePublicFrameBuilder.hpp" />
@@ -162,6 +181,11 @@
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\time\RuntimeTensorAlignment.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\time\RuntimeTensorInterpolator.hpp" />
     <ClInclude Include="..\include\FlightEnvPlatformRuntime\time\RuntimeTimeTypes.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\estimation\EstimatorMethodRegistry.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\estimation\RuntimeEstimationService.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\estimation\RuntimeObservationInbox.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\estimation\SampleScheduler.hpp" />
+    <ClInclude Include="..\include\FlightEnvPlatformRuntime\estimation\SampleSetStore.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

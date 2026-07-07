@@ -4,6 +4,7 @@
 #include "FlightEnvPlatform/Runtime/ThreadSafePortStore.hpp"
 
 #include <cstdint>
+#include <set>
 #include <string>
 
 namespace FlightEnvPlatformRuntime {
@@ -17,6 +18,13 @@ std::string jsonString(
     return fallback;
   }
   return value.at(key).get<std::string>();
+}
+
+bool jsonBool(const nlohmann::json& value, const std::string& key, bool fallback = false) {
+  if (!value.is_object() || !value.contains(key) || !value.at(key).is_boolean()) {
+    return fallback;
+  }
+  return value.at(key).get<bool>();
 }
 
 nlohmann::json ensureObject(nlohmann::json value) {
@@ -130,6 +138,68 @@ nlohmann::json bindingEvidenceBase(
   };
 }
 
+nlohmann::json rateTransitionForBinding(const nlohmann::json& binding) {
+  if (!binding.is_object() || !binding.contains("rate_transition") ||
+      !binding.at("rate_transition").is_object()) {
+    return nlohmann::json::object();
+  }
+  return binding.at("rate_transition");
+}
+
+bool bindingRequiresRuntimeRateTransition(const nlohmann::json& binding) {
+  const nlohmann::json transition = rateTransitionForBinding(binding);
+  if (transition.empty()) {
+    return false;
+  }
+  if (jsonBool(transition, "requires_runtime_transition", false)) {
+    return true;
+  }
+  const std::string relation = jsonString(transition, "rate_relation");
+  if (!relation.empty() && relation != "same_rate") {
+    return true;
+  }
+  const std::string strategy = jsonString(transition, "strategy", "direct");
+  return !strategy.empty() && strategy != "direct";
+}
+
+nlohmann::json rateTransitionEvidence(const nlohmann::json& transition) {
+  if (!transition.is_object() || transition.empty()) {
+    return nlohmann::json::object();
+  }
+  nlohmann::json evidence = {
+      {"transition_id", jsonString(transition, "transition_id")},
+      {"binding_id", jsonString(transition, "binding_id")},
+      {"transition_node_id", jsonString(transition, "transition_node_id")},
+      {"rate_relation", jsonString(transition, "rate_relation")},
+      {"strategy", jsonString(transition, "strategy")},
+      {"insertion_mode", jsonString(transition, "insertion_mode")},
+      {"source_period_s", transition.value("source_period_s", -1.0)},
+      {"target_period_s", transition.value("target_period_s", -1.0)},
+      {"requires_runtime_transition", jsonBool(transition, "requires_runtime_transition", false)},
+  };
+  if (transition.contains("max_age_s")) {
+    evidence["max_age_s"] = transition.at("max_age_s");
+  }
+  return evidence;
+}
+
+std::set<std::string> runtimeAlignedDependencySources(const nlohmann::json& node) {
+  std::set<std::string> sources;
+  if (!node.is_object() || !node.contains("edge_bindings") || !node.at("edge_bindings").is_array()) {
+    return sources;
+  }
+  for (const auto& binding : node.at("edge_bindings")) {
+    if (!binding.is_object() || !bindingRequiresRuntimeRateTransition(binding)) {
+      continue;
+    }
+    const std::string source_node_id = jsonString(binding, "source_node_id");
+    if (!source_node_id.empty()) {
+      sources.insert(source_node_id);
+    }
+  }
+  return sources;
+}
+
 }  // namespace
 
 RuntimePortBindingResolveResult RuntimePortBindingResolver::resolve(
@@ -147,18 +217,26 @@ RuntimePortBindingResolveResult RuntimePortBindingResolver::resolve(
       {"timeline_id", request.timeline_id},
       {"event_time_ns", request.event_time_ns},
       {"direct_dependency_count", 0},
+      {"direct_dependency_deferred_by_rate_transition_count", 0},
       {"explicit_binding_count", 0},
+      {"runtime_transition_alignment_count", 0},
       {"implicit_binding_count", 0},
       {"missing_explicit_bindings", nlohmann::json::array()},
       {"bindings", nlohmann::json::array()},
   };
 
+  const std::set<std::string> runtime_aligned_sources = runtimeAlignedDependencySources(request.node);
   if (request.node.contains("depends_on") && request.node.at("depends_on").is_array()) {
     for (const auto& dep : request.node.at("depends_on")) {
       if (!dep.is_string()) {
         continue;
       }
       const std::string source_node_id = dep.get<std::string>();
+      if (runtime_aligned_sources.count(source_node_id) > 0) {
+        result.evidence["direct_dependency_deferred_by_rate_transition_count"] =
+            result.evidence.value("direct_dependency_deferred_by_rate_transition_count", 0) + 1;
+        continue;
+      }
       if (request.current_outputs.is_object() && request.current_outputs.contains(source_node_id)) {
         result.upstream[source_node_id] = request.current_outputs.at(source_node_id);
         result.evidence["direct_dependency_count"] =
@@ -177,6 +255,26 @@ RuntimePortBindingResolveResult RuntimePortBindingResolver::resolve(
       const std::string source_port_id = jsonString(binding, "source_port_id");
       const std::string target_port_id = jsonString(binding, "target_port_id");
       if (source_node_id.empty() || source_port_id.empty() || target_port_id.empty()) {
+        continue;
+      }
+
+      const nlohmann::json rate_transition = rateTransitionForBinding(binding);
+      if (bindingRequiresRuntimeRateTransition(binding)) {
+        nlohmann::json binding_record = {
+            {"binding_id", jsonString(binding, "binding_id")},
+            {"source_node_id", source_node_id},
+            {"source_port_id", source_port_id},
+            {"target_node_id", node_id},
+            {"target_port_id", target_port_id},
+            {"binding_source", "runtime_rate_transition_alignment"},
+            {"branch_id", request.branch_id},
+            {"timeline_id", request.timeline_id},
+            {"rate_transition", rateTransitionEvidence(rate_transition)},
+        };
+        result.upstream["edge_bindings"].push_back(binding_record);
+        result.evidence["bindings"].push_back(binding_record);
+        result.evidence["runtime_transition_alignment_count"] =
+            result.evidence.value("runtime_transition_alignment_count", 0) + 1;
         continue;
       }
 
@@ -233,6 +331,9 @@ RuntimePortBindingResolveResult RuntimePortBindingResolver::resolve(
           {"branch_id", request.branch_id},
           {"timeline_id", request.timeline_id},
       };
+      if (!rate_transition.empty()) {
+        binding_record["rate_transition"] = rateTransitionEvidence(rate_transition);
+      }
       result.upstream["edge_bindings"].push_back(binding_record);
       result.evidence["bindings"].push_back(binding_record);
       result.evidence["explicit_binding_count"] =

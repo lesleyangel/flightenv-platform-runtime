@@ -1,5 +1,5 @@
 param(
-    [string]$Python = "python",
+    [string]$Python = "auto",
 
     [ValidateSet('Release', 'Debug')]
     [string]$Configuration = 'Release',
@@ -55,12 +55,73 @@ $runtimeRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $workspaceRoot = [System.IO.Path]::GetFullPath((Join-Path $runtimeRoot '..'))
 $objectRoot = Join-Path $workspaceRoot 'flightenv-object-reentry-vehicle'
 $pdkRoot = Join-Path $workspaceRoot 'flightenv-platform-pdk'
+Import-Module (Join-Path $pdkRoot 'tools\PdkPython.psm1') -Force
+$Python = Resolve-PdkPython -Python $Python -PdkRoot $pdkRoot
 $compiledRoot = Join-Path $workspaceRoot '_local_artifacts\platform-pdk\compiled-workflows'
 $compiledOnline = Join-Path $compiledRoot 'reentry.online_filtering_external_input.v1'
 $compiledFuture = Join-Path $compiledRoot 'reentry.posterior_future_prediction.v1'
 $exe = Join-Path $workspaceRoot "_deps\workspace\$Platform\$Configuration\FlightEnvPlatformRuntimeHost.exe"
 if ([string]::IsNullOrWhiteSpace($AdapterRegistry)) {
     $AdapterRegistry = Join-Path $objectRoot 'tools\adapter_registries\ballistic_adapters.local.json'
+}
+
+function Read-JsonFile {
+    param([Parameter(Mandatory = $true)][string]$PathValue)
+    return Get-Content -LiteralPath $PathValue -Encoding UTF8 -Raw | ConvertFrom-Json
+}
+
+function Resolve-ObjectProfilePath {
+    param([Parameter(Mandatory = $true)][string]$PathValue)
+    if ([System.IO.Path]::IsPathRooted($PathValue)) {
+        return [System.IO.Path]::GetFullPath($PathValue)
+    }
+    if ($PathValue.StartsWith("_local_artifacts") -or $PathValue.StartsWith("_deps")) {
+        return [System.IO.Path]::GetFullPath((Join-Path $workspaceRoot $PathValue))
+    }
+    return [System.IO.Path]::GetFullPath((Join-Path $objectRoot $PathValue))
+}
+
+function Resolve-DefaultExternalObservationStream {
+    $candidates = [System.Collections.Generic.List[object]]::new()
+    $profilePath = Join-Path $objectRoot 'runtime\platform_runtime_profile.json'
+    if (Test-Path -LiteralPath $profilePath -PathType Leaf) {
+        $profile = Read-JsonFile -PathValue $profilePath
+        if ($null -ne $profile.PSObject.Properties['external_observation_stream_candidates']) {
+            foreach ($candidate in @($profile.external_observation_stream_candidates)) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$candidate)) {
+                    $candidates.Add([pscustomobject]@{
+                        path = [string]$candidate
+                        source = 'object_runtime_profile.external_observation_stream_candidates'
+                    }) | Out-Null
+                }
+            }
+        }
+    }
+
+    foreach ($fallback in @(
+        'fixtures/sensor_stream_db70_real_db.json',
+        'fixtures/sensor_stream_db70.json',
+        'fixtures/sensor_stream.json'
+    )) {
+        $candidates.Add([pscustomobject]@{
+            path = $fallback
+            source = 'runtime_smoke_object_fixture_fallback'
+        }) | Out-Null
+    }
+
+    $checked = @()
+    foreach ($candidate in $candidates) {
+        $resolved = Resolve-ObjectProfilePath -PathValue ([string]$candidate.path)
+        $checked += $resolved
+        if (Test-Path -LiteralPath $resolved -PathType Leaf) {
+            return [pscustomobject]@{
+                path = $resolved
+                source = [string]$candidate.source
+                checked = $checked
+            }
+        }
+    }
+    throw "External observation stream not found from object runtime profile or fixture fallbacks. Checked: $($checked -join '; ')"
 }
 
 if (-not $SkipBuild) {
@@ -83,9 +144,15 @@ if (-not $SkipBuild) {
     -OutDir $compiledRoot `
     -RunId "$RunIdPrefix.compile.future"
 
+$ExternalObservationStreamSource = 'explicit_argument'
 if ([string]::IsNullOrWhiteSpace($ExternalObservationStream)) {
-    $ExternalObservationStream = Join-Path $workspaceRoot '_local_artifacts\platform-pdk\runtime-host-runs\reentry.online_filtering_external_input.v1\ui_external_stream_smoke_20260614.online\sensor_stream.json'
+    $resolvedStream = Resolve-DefaultExternalObservationStream
+    $ExternalObservationStream = $resolvedStream.path
+    $ExternalObservationStreamSource = $resolvedStream.source
+    Write-Host "external_observation_stream_source=$ExternalObservationStreamSource"
+    Write-Host "external_observation_stream=$ExternalObservationStream"
 }
+$ExternalObservationStream = [System.IO.Path]::GetFullPath($ExternalObservationStream)
 if (-not (Test-Path -LiteralPath $ExternalObservationStream -PathType Leaf)) {
     throw "External observation stream not found. Pass -ExternalObservationStream: $ExternalObservationStream"
 }
@@ -153,19 +220,23 @@ $summaryPath = Join-Path $chainDir 'mainline_summary.json'
 if (-not (Test-Path -LiteralPath $summaryPath -PathType Leaf)) {
     throw "mainline summary not generated: $summaryPath"
 }
+$timelinePath = Join-Path $chainDir 'run_timeline_index.json'
 $deadline = (Get-Date).AddSeconds($BranchWaitTimeoutSeconds)
 do {
     $summary = Get-Content -LiteralPath $summaryPath -Encoding UTF8 -Raw | ConvertFrom-Json
     $prediction = $summary.prediction
-    $running = 0
     $runCount = 0
-    if ($null -ne $prediction.PSObject.Properties['running_branch_count']) {
-        $running = [int]$prediction.running_branch_count
-    }
     if ($null -ne $prediction.PSObject.Properties['run_count']) {
         $runCount = [int]$prediction.run_count
     }
-    if ($runCount -gt 0 -and $running -eq 0) {
+    $futureArtifactCount = 0
+    $futureQoiCount = 0
+    if (Test-Path -LiteralPath $timelinePath -PathType Leaf) {
+        $timelineProbe = Get-Content -LiteralPath $timelinePath -Encoding UTF8 -Raw | ConvertFrom-Json
+        $futureArtifactCount = @($timelineProbe.artifact_refs | Where-Object { [string]$_.branch_id -like 'predict.*' }).Count
+        $futureQoiCount = @($timelineProbe.qoi_refs | Where-Object { [string]$_.branch_id -like 'predict.*' }).Count
+    }
+    if ($runCount -gt 0 -and $futureArtifactCount -gt 0 -and $futureQoiCount -gt 0) {
         break
     }
     Start-Sleep -Milliseconds 500
@@ -199,7 +270,6 @@ function Assert-NearlyEqual {
     }
 }
 
-$timelinePath = Join-Path $chainDir 'run_timeline_index.json'
 if (-not (Test-Path -LiteralPath $timelinePath -PathType Leaf)) {
     throw "run timeline index not generated: $timelinePath"
 }

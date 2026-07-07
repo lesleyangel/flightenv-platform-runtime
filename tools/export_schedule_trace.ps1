@@ -92,7 +92,7 @@ function Get-StageName {
     param([string]$NodeId)
     if ($NodeId -match "\.state_transition\.") { return "State transition" }
     if ($NodeId -match "\.observation_equation\.") { return "Observation" }
-    if ($NodeId -match "\.filter_algorithm\.") { return "Filter" }
+    if ($NodeId -match "\.online_estimation\.") { return "Estimation" }
     if ($NodeId -match "\.posterior_field_reconstruction\.") { return "Posterior fields" }
     if ($NodeId -match "\.failure_qoi\.") { return "QoI" }
     if ($NodeId -match "^future_step\.") { return "Future prediction" }
@@ -104,7 +104,7 @@ function Get-StageColor {
     switch ($Stage) {
         "State transition" { return "#2563eb" }
         "Observation" { return "#0891b2" }
-        "Filter" { return "#7c3aed" }
+        "Estimation" { return "#7c3aed" }
         "Posterior fields" { return "#16a34a" }
         "QoI" { return "#dc2626" }
         "Future prediction" { return "#ea580c" }
@@ -144,19 +144,27 @@ function Match-PathInt {
     return -1
 }
 
-function Get-EventPeriodSeconds {
+function Get-EventPeriodInfo {
     param([object]$EventValue, [object]$PredictionRunInfo)
     $period = [double](Number-Prop -ObjectValue $EventValue -Name "effective_delta_t_s" -DefaultValue 0.0)
-    if ($period -gt 0.0) { return $period }
+    if ($period -gt 0.0) {
+        return [pscustomobject]@{ period_s = $period; known = $true; source = "event.effective_delta_t_s" }
+    }
     $period = [double](Number-Prop -ObjectValue $EventValue -Name "output_period_s" -DefaultValue 0.0)
-    if ($period -gt 0.0) { return $period }
+    if ($period -gt 0.0) {
+        return [pscustomobject]@{ period_s = $period; known = $true; source = "event.output_period_s" }
+    }
     if ($null -ne $PredictionRunInfo) {
         $period = [double](Number-Prop -ObjectValue $PredictionRunInfo -Name "base_dt_s" -DefaultValue 0.0)
-        if ($period -gt 0.0) { return $period }
+        if ($period -gt 0.0) {
+            return [pscustomobject]@{ period_s = $period; known = $true; source = "prediction_run.base_dt_s" }
+        }
         $period = [double](Number-Prop -ObjectValue $PredictionRunInfo -Name "output_period_s" -DefaultValue 0.0)
-        if ($period -gt 0.0) { return $period }
+        if ($period -gt 0.0) {
+            return [pscustomobject]@{ period_s = $period; known = $true; source = "prediction_run.output_period_s" }
+        }
     }
-    return 2.0
+    return [pscustomobject]@{ period_s = 0.0; known = $false; source = "unknown" }
 }
 
 function Resolve-ModelTime {
@@ -174,24 +182,32 @@ function Resolve-ModelTime {
     if ($predictFrameIndex -ge 0 -and $PredictionRunByFrame.ContainsKey($predictFrameIndex)) {
         $predictionRun = $PredictionRunByFrame[$predictFrameIndex]
     }
-    $periodS = Get-EventPeriodSeconds -EventValue $StartEvent -PredictionRunInfo $predictionRun
+    $periodInfo = Get-EventPeriodInfo -EventValue $StartEvent -PredictionRunInfo $predictionRun
+    $periodS = [double]$periodInfo.period_s
 
     $modelTimeS = $localTimeS
     $origin = "workflow_local"
     if ($onlineFrameIndex -ge 0) {
-        $modelTimeS = ([double]$onlineFrameIndex * $periodS) + $localTimeS
-        $origin = "online_frame_time"
+        if ([bool]$periodInfo.known) {
+            $modelTimeS = ([double]$onlineFrameIndex * $periodS) + $localTimeS
+            $origin = "online_frame_time"
+        } else {
+            $modelTimeS = $localTimeS
+            $origin = "online_frame_time_unknown_period"
+        }
     } elseif ($predictFrameIndex -ge 0 -and $null -ne $predictionRun) {
         $triggerTimeS = [double](Number-Prop -ObjectValue $predictionRun -Name "trigger_time_s" -DefaultValue 0.0)
-        $chunkOffsetS = if ($chunkIndex -ge 0) { [double]$chunkIndex * $periodS } else { 0.0 }
+        $chunkOffsetS = if ($chunkIndex -ge 0 -and [bool]$periodInfo.known) { [double]$chunkIndex * $periodS } else { 0.0 }
         $modelTimeS = $triggerTimeS + $chunkOffsetS + $localTimeS
-        $origin = "prediction_branch_time"
+        $origin = if ([bool]$periodInfo.known) { "prediction_branch_time" } else { "prediction_branch_time_unknown_period" }
     }
 
     return [pscustomobject]@{
         local_time_s = [math]::Round($localTimeS, 6)
         model_time_s = [math]::Round($modelTimeS, 6)
-        period_s = [math]::Round($periodS, 6)
+        period_s = if ([bool]$periodInfo.known) { [math]::Round($periodS, 6) } else { $null }
+        period_known = [bool]$periodInfo.known
+        period_source = [string]$periodInfo.source
         origin = $origin
         online_frame_index = $onlineFrameIndex
         predict_frame_index = $predictFrameIndex
@@ -357,6 +373,8 @@ foreach ($file in $schedulerFiles) {
             model_time_s = $modelTime.model_time_s
             model_time_origin = $modelTime.origin
             source_period_s = $modelTime.period_s
+            source_period_known = $modelTime.period_known
+            source_period_source = $modelTime.period_source
             source_online_frame_index = $modelTime.online_frame_index
             source_predict_frame_index = $modelTime.predict_frame_index
             source_chunk_index = $modelTime.chunk_index
@@ -384,6 +402,7 @@ if ($items.Count -le 0) {
 $minStart = ($items | Measure-Object -Property start_ms -Minimum).Minimum
 $maxEnd = ($items | Measure-Object -Property end_ms -Maximum).Maximum
 $axisStartMs = if ($TimeAxis -eq "ModelTime") { 0.0 } else { [double]$minStart }
+$unknownPeriodItemCount = @($items | Where-Object { $_.source_period_known -ne $true }).Count
 foreach ($item in $items) {
     $item | Add-Member -NotePropertyName "relative_start_ms" -NotePropertyValue ([math]::Round(([double]$item.start_ms - [double]$axisStartMs), 3))
     $item | Add-Member -NotePropertyName "relative_end_ms" -NotePropertyValue ([math]::Round(([double]$item.end_ms - [double]$axisStartMs), 3))
@@ -492,6 +511,7 @@ $timeline = [ordered]@{
         max_end_ms = [math]::Round([double]$maxEnd, 3)
         axis_start_ms = [math]::Round([double]$axisStartMs, 3)
         span_ms = [math]::Round(([double]$maxEnd - [double]$axisStartMs), 3)
+        unknown_period_item_count = $unknownPeriodItemCount
     }
     rows = @($rows)
     items = @($items | Sort-Object start_ms, sequence)

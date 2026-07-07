@@ -25,10 +25,13 @@ namespace FlightEnvPlatformRuntime {
  */
 enum class RuntimeAlignmentStrategy {
   Exact,           ///< 按精确容差语义要求目标时间上存在样本。
+  LatestBefore,    ///< 使用目标时间或之前的最新样本，不做外推。
   HoldLast,        ///< 在陈旧时间边界内使用目标时间或之前的最新样本。
   Nearest,         ///< 在间隔边界内使用最接近目标时间的样本。
   Linear,          ///< 对标量样本插值，或创建 tensor 插值引用。
+  Window,          ///< 传递派发窗口内的样本序列。
   IntegrateWindow, ///< 聚合派发窗口内的样本。
+  PredictTo,       ///< 要求模型把旧样本预测到目标时间；无模型时生成阻塞证据。
   Independent,     ///< 声明节点输入不依赖上游样本。
   Unsupported,     ///< 解析后的策略不受运行时支持。
 };
@@ -37,9 +40,21 @@ enum class RuntimeAlignmentStrategy {
  * @brief 为一个上游依赖解析出的输入对齐策略。
  */
 struct RuntimeInputAlignmentPolicy {
+  std::string transition_id;
+  std::string binding_id;
+  std::string raw_strategy;
+  std::string rate_relation;
+  bool from_rate_transition = false;
+  bool requires_runtime_transition = false;
+  double source_period_s = -1.0;
+  double target_period_s = -1.0;
+  double max_age_s = -1.0;
   std::string upstream_node_id; ///< 产生样本的源节点 id。
   std::string source_port_id;   ///< 可选源端口 id；为空时选择节点级通道。
   std::string target_port_id;   ///< 对齐后要填充的可选目标输入端口 id。
+  std::string runtime_transition_node_id; ///< 非空时，目标消费平台 synthetic transition 节点输出。
+  std::string physical_source_node_id;    ///< rate transition 原始上游节点 id，用于 evidence。
+  std::string physical_source_port_id;    ///< rate transition 原始上游端口 id，用于 evidence。
   RuntimeAlignmentStrategy strategy = RuntimeAlignmentStrategy::Exact; ///< 归一化后的运行时策略。
   std::string raw_alignment;    ///< 编译后元数据中的原始 `alignment` 值。
   std::string raw_input_resampling; ///< 编译后元数据中的原始 `input_resampling` 值。
@@ -81,6 +96,10 @@ struct RuntimeInputAlignmentResult {
    * @return 至少评估过一个输入策略时为真。
    */
   bool hasEvidence() const;
+
+  bool hasUnavailableRequiredInputs() const;
+
+  nlohmann::json unavailableRequiredEvidence() const;
 
   /**
    * @brief 序列化所有已对齐输入的证据。

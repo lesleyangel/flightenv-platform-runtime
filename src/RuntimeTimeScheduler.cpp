@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <functional>
+#include <set>
 #include <utility>
 
 namespace FlightEnvPlatformRuntime {
@@ -351,14 +353,114 @@ void RuntimeTimeScheduler::seedWorkflowEvents(
     const std::vector<nlohmann::json>& nodes,
     int max_iterations,
     double base_dt_s,
-    double output_period_s) const {
+    double output_period_s,
+    const nlohmann::json& scheduler_table) const {
   const int bounded_iterations = std::max(1, max_iterations);
   const double public_period_s = runtimePublicPeriodS(base_dt_s, output_period_s);
   const RuntimeDuration public_period = RuntimeDuration::fromSeconds(public_period_s);
+  // 相位和依赖来自编译后 scheduler_table.dispatch_table；未提供表时首拍规则退化为
+  // 旧行为（快节点 = period，慢节点 = 公共拍，依赖只来自 workflow node 自身声明）。
+  std::map<std::string, std::int64_t> offset_ns_by_node;
+  std::map<std::string, std::vector<std::string>> dependencies_by_node;
+  const nlohmann::json dispatch_table =
+      scheduler_table.is_object() ? scheduler_table.value("dispatch_table", nlohmann::json::array())
+                                  : nlohmann::json::array();
+  if (dispatch_table.is_array()) {
+    for (const auto& item : dispatch_table) {
+      const std::string table_node_id = jsonString(item, "node_id");
+      const double offset_s = jsonDouble(item, "offset_s", 0.0);
+      if (!table_node_id.empty() && std::isfinite(offset_s)) {
+        offset_ns_by_node[table_node_id] = RuntimeDuration::fromSeconds(offset_s).nanoseconds;
+      }
+      const json depends_on = item.value("depends_on", json::array());
+      if (!table_node_id.empty() && depends_on.is_array()) {
+        std::vector<std::string>& deps = dependencies_by_node[table_node_id];
+        for (const auto& dep : depends_on) {
+          if (dep.is_string()) {
+            deps.push_back(dep.get<std::string>());
+          }
+        }
+      }
+    }
+  }
   const RuntimeTimePoint horizon =
       RuntimeTimePoint::fromNanoseconds((public_period * bounded_iterations).nanoseconds);
   const double horizon_s = horizon.seconds();
   constexpr double kEpsilon = 1.0e-9;
+
+  std::vector<std::string> schedulable_node_ids;
+  std::map<std::string, double> period_s_by_node;
+  std::map<std::string, std::int64_t> period_ns_by_node;
+  std::map<std::string, std::int64_t> first_due_ns_by_node;
+  for (const json& node : nodes) {
+    const std::string node_id = jsonString(node, "node_id");
+    if (node_id.empty()) {
+      continue;
+    }
+    if (dependencies_by_node.count(node_id) == 0 &&
+        node.contains("depends_on") &&
+        node.at("depends_on").is_array()) {
+      std::vector<std::string>& deps = dependencies_by_node[node_id];
+      for (const auto& dep : node.at("depends_on")) {
+        if (dep.is_string()) {
+          deps.push_back(dep.get<std::string>());
+        }
+      }
+    }
+    const double period_s = nodePeriodS(node, public_period_s);
+    if (!(period_s > kEpsilon) || !std::isfinite(period_s)) {
+      continue;
+    }
+    const RuntimeDuration period = RuntimeDuration::fromSeconds(period_s);
+    if (period.nanoseconds <= 0) {
+      continue;
+    }
+
+    const auto offset_found = offset_ns_by_node.find(node_id);
+    const std::int64_t offset_ns =
+        offset_found == offset_ns_by_node.end() ? 0 : offset_found->second;
+    schedulable_node_ids.push_back(node_id);
+    period_s_by_node[node_id] = period_s;
+    period_ns_by_node[node_id] = period.nanoseconds;
+    first_due_ns_by_node[node_id] =
+        runtimeNodeFirstDueNanoseconds(period.nanoseconds, public_period.nanoseconds, offset_ns);
+  }
+
+  std::map<std::string, std::int64_t> resolved_first_due_ns_by_node;
+  std::set<std::string> resolving_first_due_nodes;
+  std::function<std::int64_t(const std::string&)> resolveFirstDueNs =
+      [&](const std::string& node_id) -> std::int64_t {
+    const auto existing = resolved_first_due_ns_by_node.find(node_id);
+    if (existing != resolved_first_due_ns_by_node.end()) {
+      return existing->second;
+    }
+    const auto base_found = first_due_ns_by_node.find(node_id);
+    if (base_found == first_due_ns_by_node.end()) {
+      return 0;
+    }
+    std::int64_t resolved_ns = base_found->second;
+    if (resolving_first_due_nodes.count(node_id) != 0) {
+      return resolved_ns;
+    }
+    resolving_first_due_nodes.insert(node_id);
+    const auto deps_found = dependencies_by_node.find(node_id);
+    if (deps_found != dependencies_by_node.end()) {
+      for (const std::string& dep : deps_found->second) {
+        if (first_due_ns_by_node.count(dep) == 0) {
+          continue;
+        }
+        resolved_ns = runtimeNodeFirstDueAfterDependencyNanoseconds(
+            resolved_ns,
+            resolveFirstDueNs(dep));
+      }
+    }
+    resolving_first_due_nodes.erase(node_id);
+    resolved_first_due_ns_by_node[node_id] = resolved_ns;
+    return resolved_ns;
+  };
+  for (const std::string& node_id : schedulable_node_ids) {
+    (void)resolveFirstDueNs(node_id);
+  }
 
   events.pushFixedPublicTicks(bounded_iterations, base_dt_s, public_period_s);
   for (int iteration = 0; iteration < bounded_iterations; ++iteration) {
@@ -393,19 +495,27 @@ void RuntimeTimeScheduler::seedWorkflowEvents(
     if (node_id.empty()) {
       continue;
     }
-    const double period_s = nodePeriodS(node, public_period_s);
-    if (!(period_s > kEpsilon) || !std::isfinite(period_s)) {
+    const auto period_s_found = period_s_by_node.find(node_id);
+    const auto period_ns_found = period_ns_by_node.find(node_id);
+    const auto first_due_found = resolved_first_due_ns_by_node.find(node_id);
+    if (period_s_found == period_s_by_node.end() ||
+        period_ns_found == period_ns_by_node.end() ||
+        first_due_found == resolved_first_due_ns_by_node.end()) {
       continue;
     }
-    const RuntimeDuration period = RuntimeDuration::fromSeconds(period_s);
+    const double period_s = period_s_found->second;
+    const RuntimeDuration period = RuntimeDuration::fromNanoseconds(period_ns_found->second);
     if (period.nanoseconds <= 0) {
       continue;
     }
 
+    const auto offset_found = offset_ns_by_node.find(node_id);
+    const std::int64_t offset_ns =
+        offset_found == offset_ns_by_node.end() ? 0 : offset_found->second;
+    // 首拍规则与审计 trace 共用同一定义，并叠加依赖约束：下游首拍不早于
+    // 已知上游首个有效输出，消除 live 种子和 due-time trace 的相位分歧。
     const RuntimeTimePoint first_due_time =
-        period.nanoseconds > public_period.nanoseconds
-            ? RuntimeTimePoint::fromNanoseconds(public_period.nanoseconds)
-            : RuntimeTimePoint::fromNanoseconds(period.nanoseconds);
+        RuntimeTimePoint::fromNanoseconds(first_due_found->second);
     for (int due_index = 0; ; ++due_index) {
       const RuntimeTimePoint due_time = first_due_time + (period * due_index);
       if (due_time.nanoseconds > horizon.nanoseconds) {
@@ -423,6 +533,12 @@ void RuntimeTimeScheduler::seedWorkflowEvents(
               {"topological_index", static_cast<int>(node_index)},
               {"sample_period_s", period_s},
               {"sample_period_ns", period.nanoseconds},
+              {"offset_s", RuntimeDuration::fromNanoseconds(offset_ns).seconds()},
+              {"offset_ns", offset_ns},
+              {"base_first_due_time_s",
+               RuntimeTimePoint::fromNanoseconds(first_due_ns_by_node[node_id]).seconds()},
+              {"first_due_time_s", first_due_time.seconds()},
+              {"first_due_rule", "offset_plus_period_or_public_tick_dependency_floor"},
               {"scheduled_event_time_s", due_time_s},
               {"scheduled_event_time_ns", due_time.nanoseconds},
               {"public_period_s", public_period_s},
@@ -444,10 +560,22 @@ void RuntimeTimeScheduler::markExecuted(
   state.has_executed = true;
   state.last_execution_iteration = iteration_index;
   state.last_execution_public_time = dispatch.public_output_time;
-  state.next_due_public_time =
-      dispatch.output_period.nanoseconds > 0
-          ? dispatch.public_output_time + dispatch.output_period
-          : dispatch.public_output_time + RuntimeDuration::fromSeconds(1.0);
+  if (dispatch.output_period.nanoseconds > 0) {
+    // 绝对栅格推进：从触发本次派发的到期时刻按整周期前进到第一个晚于执行时刻的栅格点。
+    // 不用执行时刻重新锚定（旧行为），否则节点周期与公共拍不可整除时，每周期会被拉长
+    // 最多一个公共拍（period=2.5s、tick=1s 时退化为 3s 有效周期）；也不补发已错过的
+    // 栅格点，保持“跳过错过拍”的采样语义。事件路径的 dispatch.next_due_time 已是
+    // 下一栅格点（晚于执行时刻），下面的循环对该路径零改动。
+    RuntimeTimePoint next_due = dispatch.next_due_time.nanoseconds > 0
+                                    ? dispatch.next_due_time
+                                    : dispatch.public_output_time;
+    while (next_due.nanoseconds <= dispatch.public_output_time.nanoseconds) {
+      next_due = next_due + dispatch.output_period;
+    }
+    state.next_due_public_time = next_due;
+  } else {
+    state.next_due_public_time = dispatch.public_output_time + RuntimeDuration::fromSeconds(1.0);
+  }
   state.last_execution_public_time_s = dispatch.public_output_time_s;
   state.next_due_public_time_s = state.next_due_public_time.seconds();
   state.last_execute_result = execute_result;

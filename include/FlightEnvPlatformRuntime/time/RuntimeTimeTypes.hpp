@@ -166,6 +166,42 @@ inline double runtimeLoopPublicOutputTimeS(int iteration_index, double base_dt_s
 }
 
 /**
+ * @brief 计算节点在统一到期栅格上的首个到期时刻（内部纳秒）。
+ *
+ * 这是 live 事件种子（RuntimeTimeScheduler::seedWorkflowEvents）与审计 trace
+ * （RuntimeDueTimeScheduler）共用的唯一首拍规则，避免两处各自实现产生相位分歧：
+ * - 输出时间取区间末端：快节点（period <= 公共拍）首拍在一个自身周期处；
+ * - 慢节点（period > 公共拍）被拉到第一个公共拍，尽早产出首个样本；
+ * - offset 作为整体相位平移叠加在上述基准上。
+ *
+ * @param period_ns 节点输出周期，纳秒。
+ * @param public_period_ns 公共拍周期，纳秒；非正时退化为 period_ns。
+ * @param offset_ns 调度表声明的相位偏移，纳秒。
+ * @return 首个到期时刻，纳秒。
+ */
+inline std::int64_t runtimeNodeFirstDueNanoseconds(
+    std::int64_t period_ns,
+    std::int64_t public_period_ns,
+    std::int64_t offset_ns) {
+  const std::int64_t base =
+      (public_period_ns > 0 && period_ns > public_period_ns) ? public_period_ns : period_ns;
+  return offset_ns + base;
+}
+
+/**
+ * @brief 让节点首拍不早于已知上游首个有效输出。
+ *
+ * 这仍然是纯平台时间语义：下游节点可以比自己的基础周期晚启动，但不能在直接依赖尚未
+ * 产生第一帧之前启动。后续到期仍按节点自身绝对采样栅格推进。
+ */
+inline std::int64_t runtimeNodeFirstDueAfterDependencyNanoseconds(
+    std::int64_t candidate_first_due_ns,
+    std::int64_t dependency_first_due_ns) {
+  return dependency_first_due_ns > candidate_first_due_ns ? dependency_first_due_ns
+                                                          : candidate_first_due_ns;
+}
+
+/**
  * @brief 按公开输出周期语义构建循环 tick。
  * @param iteration_index 从零开始的公开循环迭代。
  * @param base_dt_s 基础步长，单位为秒。

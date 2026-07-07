@@ -1,5 +1,5 @@
 param(
-    [string]$Python = "python",
+    [string]$Python = "auto",
 
     [ValidateSet('Release', 'Debug')]
     [string]$Configuration = 'Release',
@@ -34,6 +34,9 @@ try {
 
 $runtimeRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $workspaceRoot = [System.IO.Path]::GetFullPath((Join-Path $runtimeRoot '..'))
+$pdkRoot = Join-Path $workspaceRoot 'flightenv-platform-pdk'
+Import-Module (Join-Path $pdkRoot 'tools\PdkPython.psm1') -Force
+$Python = Resolve-PdkPython -Python $Python -PdkRoot $pdkRoot
 $smokeScript = Join-Path $runtimeRoot 'tools\run_cpp_runtime_host_smoke.ps1'
 $reportRoot = Join-Path $workspaceRoot '_local_artifacts\platform-runtime\perf-reports'
 New-Item -ItemType Directory -Force -Path $reportRoot | Out-Null

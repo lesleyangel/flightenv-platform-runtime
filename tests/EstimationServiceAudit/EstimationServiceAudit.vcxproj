@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{F845CC3A-BFE7-496B-8B30-92D1D7A96E24}</ProjectGuid>
+    <RootNamespace>EstimationServiceAudit</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <ProjectName>EstimationServiceAudit</ProjectName>
+    <FlightEnvRepoRoot Condition="'$(FlightEnvRepoRoot)'==''">$(MSBuildThisFileDirectory)..\..\</FlightEnvRepoRoot>
+    <FlightEnvWorkspaceHome Condition="'$(FlightEnvWorkspaceHome)'==''">$(MSBuildThisFileDirectory)..\..\..\</FlightEnvWorkspaceHome>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="$(FlightEnvWorkspaceHome)tools\msbuild\FlightEnvWorkspace.props" Condition="Exists('$(FlightEnvWorkspaceHome)tools\msbuild\FlightEnvWorkspace.props')" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="Shared" />
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <TargetName>EstimationServiceAudit</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(FlightEnvRepoRoot)include;$(FlightEnvWorkspaceHome)flightenv-platform-pdk\include;$(FlightEnvSharedDepsRoot)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="EstimationServiceAudit.cpp" />
+    <ClCompile Include="..\..\src\RuntimeClock.cpp" />
+    <ClCompile Include="..\..\src\RuntimeEvidenceWriter.cpp" />
+    <ClCompile Include="..\..\src\RuntimeReadyQueueExecutor.cpp" />
+    <ClCompile Include="..\..\src\RuntimeTypedBufferStore.cpp" />
+    <ClCompile Include="..\..\src\estimation\EstimatorMethodRegistry.cpp" />
+    <ClCompile Include="..\..\src\estimation\RuntimeEstimationService.cpp" />
+    <ClCompile Include="..\..\src\estimation\RuntimeObservationInbox.cpp" />
+    <ClCompile Include="..\..\src\estimation\SampleScheduler.cpp" />
+    <ClCompile Include="..\..\src\estimation\SampleSetStore.cpp" />
+    <ClCompile Include="..\..\src\time\RuntimeEventQueue.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\include\FlightEnvPlatformRuntime\RuntimeClock.hpp" />
+    <ClInclude Include="..\..\include\FlightEnvPlatformRuntime\RuntimeEvidenceWriter.hpp" />
+    <ClInclude Include="..\..\include\FlightEnvPlatformRuntime\RuntimeReadyQueueExecutor.hpp" />
+    <ClInclude Include="..\..\include\FlightEnvPlatformRuntime\RuntimeTypedBufferStore.hpp" />
+    <ClInclude Include="..\..\include\FlightEnvPlatformRuntime\estimation\EstimatorMethodRegistry.hpp" />
+    <ClInclude Include="..\..\include\FlightEnvPlatformRuntime\estimation\RuntimeEstimationService.hpp" />
+    <ClInclude Include="..\..\include\FlightEnvPlatformRuntime\estimation\RuntimeObservationInbox.hpp" />
+    <ClInclude Include="..\..\include\FlightEnvPlatformRuntime\estimation\SampleScheduler.hpp" />
+    <ClInclude Include="..\..\include\FlightEnvPlatformRuntime\estimation\SampleSetStore.hpp" />
+    <ClInclude Include="..\..\include\FlightEnvPlatformRuntime\time\RuntimeEventQueue.hpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

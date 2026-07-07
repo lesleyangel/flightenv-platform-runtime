@@ -45,6 +45,7 @@ $typedExecuteCount = 0
 $defaultAbiCount = 0
 $maxExtraLogicalRefCount = 0
 $maxShadowArtifactCount = 0
+$maxMemoryOnlyShadowArtifactCount = 0
 $maxMemoryOnlyCount = 0
 foreach ($file in $runtimeOutputFiles) {
     $runtimeOutputs = Read-JsonFile $file.FullName
@@ -58,6 +59,14 @@ foreach ($file in $runtimeOutputFiles) {
         }
         if ($null -ne $store.PSObject.Properties['memory_only_count']) {
             $maxMemoryOnlyCount = [Math]::Max($maxMemoryOnlyCount, [int]$store.memory_only_count)
+        }
+        if ($null -ne $store.PSObject.Properties['memory_only_count'] -and
+            $null -ne $store.PSObject.Properties['shadow_artifact_count'] -and
+            [int]$store.memory_only_count -gt 0) {
+            $maxMemoryOnlyShadowArtifactCount = [Math]::Max(
+                $maxMemoryOnlyShadowArtifactCount,
+                [int]$store.shadow_artifact_count
+            )
         }
     }
     if ($null -eq $runtimeOutputs.PSObject.Properties['outputs']) {
@@ -106,8 +115,12 @@ $checks += [pscustomobject]@{
 if ($RequireMemoryOnlyTypedBuffers) {
     $checks += [pscustomobject]@{
         name = 'memory_only_shadow_artifact_budget'
-        passed = ($maxShadowArtifactCount -eq 0 -and $maxMemoryOnlyCount -gt 0)
-        evidence = @{ max_shadow_artifact_count = $maxShadowArtifactCount; max_memory_only_count = $maxMemoryOnlyCount }
+        passed = ($maxMemoryOnlyShadowArtifactCount -eq 0 -and $maxMemoryOnlyCount -gt 0)
+        evidence = @{
+            max_shadow_artifact_count = $maxShadowArtifactCount
+            max_memory_only_shadow_artifact_count = $maxMemoryOnlyShadowArtifactCount
+            max_memory_only_count = $maxMemoryOnlyCount
+        }
     }
 }
 if ($ObservedGateSeconds -ge 0.0) {
@@ -129,6 +142,7 @@ $report = [ordered]@{
     default_abi_count = $defaultAbiCount
     max_extra_logical_ref_count = $maxExtraLogicalRefCount
     max_shadow_artifact_count = $maxShadowArtifactCount
+    max_memory_only_shadow_artifact_count = $maxMemoryOnlyShadowArtifactCount
     max_memory_only_count = $maxMemoryOnlyCount
     checks = $checks
 }

@@ -1398,8 +1398,15 @@ void PlatformRuntimeHost::resolveDefaults() {
     if (env_object_root && *env_object_root) {
       options_.object_package_root = fs::path(env_object_root);
     } else {
+      env_object_root = std::getenv("FLIGHTENV_PLATFORM_OBJECT_ROOT");
+      if (env_object_root && *env_object_root) {
+        options_.object_package_root = fs::path(env_object_root);
+      }
+    }
+    if (options_.object_package_root.empty()) {
       throw std::runtime_error(
-          "object package root is required; pass --object-package-root or set FLIGHTENV_OBJECT_PACKAGE_ROOT");
+          "object package root is required; pass --object-package-root or set "
+          "FLIGHTENV_OBJECT_PACKAGE_ROOT/FLIGHTENV_PLATFORM_OBJECT_ROOT");
     }
   }
   options_.object_package_root = fs::absolute(options_.object_package_root);
@@ -1748,6 +1755,10 @@ void PlatformRuntimeHost::prepareRuntime() {
       })},
       {"adapter_registry", pathString(options_.adapter_registry)},
       {"execution_backend", options_.execution_backend},
+      {"execution_backend_class",
+       useNativeBackend() ? "production_native_adapter_sessions"
+                          : "compatibility_compiled_workflow_process_backend"},
+      {"compatibility_status", useNativeBackend() ? "production" : "compat_only"},
       {"native_session_note",
        useNativeBackend()
            ? "C++ Host directly manages adapter session lifecycle; DLL adapters stay in-process and PDK workflow process is not spawned."
@@ -1942,6 +1953,36 @@ void PlatformRuntimeHost::writeRuntimeBranchIndex(const fs::path& run_dir) const
         continue;
       }
       frame["branch_id"] = branch_id;
+      frames.push_back(frame);
+    }
+  }
+  if (frames.empty() && branch_kind == "online_mainline") {
+    const json loop_iterations_for_frames = arrayOrEmpty(runtime_loop.value("iterations", json::array()));
+    for (auto iteration : loop_iterations_for_frames) {
+      if (!iteration.is_object()) {
+        continue;
+      }
+      const int frame_index =
+          jsonInt(iteration, "frame_index", jsonInt(iteration, "loop_iteration_index", static_cast<int>(frames.size())));
+      const double sample_time_s =
+          jsonDouble(iteration, "sample_time_s", jsonDouble(iteration, "public_time_s", static_cast<double>(frame_index)));
+      json frame = {
+          {"branch_id", branch_id},
+          {"frame_index", frame_index},
+          {"loop_iteration_index", jsonInt(iteration, "loop_iteration_index", frame_index)},
+          {"sample_time_s", sample_time_s},
+          {"public_time_s", sample_time_s},
+          {"source", "runtime_loop_summary"},
+          {"source_runtime_outputs", pathString(run_dir / "runtime_outputs.json")},
+          {"posterior_checkpoint", jsonString(iteration, "posterior_checkpoint")},
+          {"status", jsonString(iteration, "status", "ok")},
+      };
+      if (iteration.contains("diagnostics")) {
+        frame["diagnostics"] = iteration.at("diagnostics");
+      }
+      if (iteration.contains("sample_scheduler")) {
+        frame["sample_scheduler"] = iteration.at("sample_scheduler");
+      }
       frames.push_back(frame);
     }
   }
@@ -2970,6 +3011,19 @@ int PlatformRuntimeHost::runBranchWorker() {
       };
       writeJson(options_.branch_run_dir / "runtime_outputs.json", latest_outputs);
 
+      const fs::path latest_chunk_dir = latest_seed_path.parent_path();
+      const json latest_chunk_runtime_evidence =
+          objectOrEmpty(readJsonIfExists(latest_chunk_dir / "runtime_evidence.json"));
+      const json latest_chunk_summary =
+          objectOrEmpty(latest_chunk_runtime_evidence.value("summary", json::object()));
+      const fs::path latest_rate_transition_plan = latest_chunk_dir / "rate_transition_plan.json";
+      if (fs::exists(latest_rate_transition_plan)) {
+        fs::copy_file(
+            latest_rate_transition_plan,
+            options_.branch_run_dir / "rate_transition_plan.json",
+            fs::copy_options::overwrite_existing);
+      }
+
       writeJson(options_.branch_run_dir / "runtime_evidence.json",
                 {
                     {"schema_version", "flightenv.platform.runtime_evidence.v1"},
@@ -2997,6 +3051,11 @@ int PlatformRuntimeHost::runBranchWorker() {
                          {"base_dt_s", base_dt_s},
                          {"output_period_s", output_period_s},
                          {"field_artifact_count", countFieldArtifactEntries(aggregate_data)},
+                         {"rate_transition_count", jsonInt(latest_chunk_summary, "rate_transition_count", 0)},
+                         {"cross_rate_transition_count",
+                          jsonInt(latest_chunk_summary, "cross_rate_transition_count", 0)},
+                         {"runtime_rate_transition_count",
+                          jsonInt(latest_chunk_summary, "runtime_rate_transition_count", 0)},
                          {"stop_reason", stop_reason},
                          {"trigger_frame_index", options_.trigger_frame_index},
                          {"trigger_time_s", options_.trigger_time_s},
@@ -3008,6 +3067,7 @@ int PlatformRuntimeHost::runBranchWorker() {
                          {"data_plane_manifest", "data_plane_manifest.json"},
                          {"state_checkpoint", "state_checkpoint.json"},
                          {"runtime_node_snapshot", "runtime_node_snapshot.json"},
+                         {"rate_transition_plan", "rate_transition_plan.json"},
                      }},
                 });
     };
@@ -4420,6 +4480,10 @@ void PlatformRuntimeHost::writeRuntimeHostEvidenceLocked(const std::string& stat
            {"implementation", "FlightEnvPlatformRuntimeHost.cpp"},
            {"role", "C++ online mainline and prediction branch scheduler"},
            {"execution_backend", options_.execution_backend},
+           {"execution_backend_class",
+            useNativeBackend() ? "production_native_adapter_sessions"
+                               : "compatibility_compiled_workflow_process_backend"},
+           {"compatibility_status", useNativeBackend() ? "production" : "compat_only"},
            {"runtime_zero_copy_mode", runtimeZeroCopyModeName(
                                           resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode))},
            {"typed_buffer_persistence", runtimeTypedBufferPersistenceName(
@@ -4430,6 +4494,8 @@ void PlatformRuntimeHost::writeRuntimeHostEvidenceLocked(const std::string& stat
             options_.branch_manager_enabled ? "background_branch_worker_process"
                                             : "native_in_process_branch_threads"},
            {"legacy_process_backend_allowed", options_.allow_legacy_process_backend},
+           {"legacy_process_backend_required_flag",
+            options_.execution_backend == "compiled_workflow_process_backend"},
            {"runtime_run_indexer", "cpp_host_internal"},
            {"wildcard_adapter_policy", "disabled_for_native_production"},
            {"native_session_note",
@@ -4575,6 +4641,10 @@ void PlatformRuntimeHost::writeFinalSummary(const std::string& status) {
       {"host",
        {
            {"execution_backend", options_.execution_backend},
+           {"execution_backend_class",
+            useNativeBackend() ? "production_native_adapter_sessions"
+                               : "compatibility_compiled_workflow_process_backend"},
+           {"compatibility_status", useNativeBackend() ? "production" : "compat_only"},
            {"in_process_adapter_sessions", useNativeBackend()},
            {"runtime_zero_copy_mode", runtimeZeroCopyModeName(
                                           resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode))},
