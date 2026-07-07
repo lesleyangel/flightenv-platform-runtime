@@ -12,6 +12,7 @@
 #include "FlightEnvPlatformRuntime/NativeWorkflowRunner.hpp"
 
 #include "NativeAdapterSessions.hpp"
+#include "NativeWorkflowCompiledState.hpp"
 
 #include "FlightEnvPlatform/Adapter/AdapterAbi.hpp"
 #include "FlightEnvPlatform/Runtime/ReadyQueueScheduler.hpp"
@@ -449,104 +450,6 @@ int runProcessCommand(
   appendTrace(trace_dir, "external_process_end exit_code=" + std::to_string(rc));
   return rc;
 #endif
-}
-
-json requireArray(const json& value, const std::string& key, const fs::path& source) {
-  if (!value.is_object() || !value.contains(key) || !value.at(key).is_array()) {
-    throw std::runtime_error("JSON array '" + key + "' missing in " + pathString(source));
-  }
-  return value.at(key);
-}
-
-std::vector<json> topoSortNodes(const json& nodes_array) {
-  std::vector<json> nodes;
-  std::set<std::string> known_ids;
-  for (const auto& item : nodes_array) {
-    if (item.is_object()) {
-      const std::string node_id = jsonString(item, "node_id");
-      if (node_id.empty()) {
-        throw std::runtime_error("Workflow execution_plan contains a node with empty node_id.");
-      }
-      if (!known_ids.insert(node_id).second) {
-        throw std::runtime_error("Workflow execution_plan contains duplicate node_id: " + node_id);
-      }
-      nodes.push_back(item);
-    }
-  }
-  for (const auto& node : nodes) {
-    const std::string node_id = jsonString(node, "node_id");
-    if (!node.contains("depends_on") || !node.at("depends_on").is_array()) {
-      continue;
-    }
-    for (const auto& dep : node.at("depends_on")) {
-      if (!dep.is_string()) {
-        throw std::runtime_error("Workflow dependency for node " + node_id + " is not a string.");
-      }
-      const std::string dep_id = dep.get<std::string>();
-      if (!known_ids.count(dep_id)) {
-        throw std::runtime_error("Workflow node " + node_id + " depends on missing node: " + dep_id);
-      }
-    }
-  }
-  std::vector<json> sorted;
-  std::set<std::string> done;
-  while (sorted.size() < nodes.size()) {
-    bool progressed = false;
-    for (const auto& node : nodes) {
-      const std::string node_id = jsonString(node, "node_id");
-      if (node_id.empty() || done.count(node_id)) {
-        continue;
-      }
-      bool ready = true;
-      if (node.contains("depends_on") && node.at("depends_on").is_array()) {
-        for (const auto& dep : node.at("depends_on")) {
-          if (dep.is_string() && !done.count(dep.get<std::string>())) {
-            ready = false;
-            break;
-          }
-        }
-      }
-      if (ready) {
-        sorted.push_back(node);
-        done.insert(node_id);
-        progressed = true;
-      }
-    }
-    if (!progressed) {
-      std::ostringstream details;
-      bool first_node = true;
-      for (const auto& node : nodes) {
-        const std::string node_id = jsonString(node, "node_id");
-        if (node_id.empty() || done.count(node_id)) {
-          continue;
-        }
-        if (!first_node) {
-          details << "; ";
-        }
-        first_node = false;
-        details << node_id << " waits_for=[";
-        bool first_dep = true;
-        if (node.contains("depends_on") && node.at("depends_on").is_array()) {
-          for (const auto& dep : node.at("depends_on")) {
-            const std::string dep_id = dep.is_string() ? dep.get<std::string>() : "<non-string>";
-            if (done.count(dep_id)) {
-              continue;
-            }
-            if (!first_dep) {
-              details << ",";
-            }
-            first_dep = false;
-            details << dep_id;
-          }
-        }
-        details << "]";
-      }
-      throw std::runtime_error(
-          "Workflow dependency graph is cyclic or unresolved; fail-fast instead of executing an invalid order. " +
-          details.str());
-    }
-  }
-  return sorted;
 }
 
 json nodePlanInfo(const json& plan, const std::string& node_id) {
@@ -1276,8 +1179,7 @@ class NativeWorkflowRunner::Impl {
     options_.adapter_registry = fs::absolute(options_.adapter_registry);
     (void)resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode);
     (void)resolveRuntimeTypedBufferPersistence(options_.typed_buffer_persistence);
-    loadCompiledWorkflow();
-    loadAdapterRegistry();
+    compiled_ = loadNativeWorkflowCompiledState(options_);
   }
 
   ~Impl() {
@@ -1291,10 +1193,10 @@ class NativeWorkflowRunner::Impl {
       req.branch_id = req.run_id.empty() ? std::string("default") : req.run_id;
     }
     if (req.timeline_id.empty()) {
-      req.timeline_id = workflow_id_.empty() ? std::string("workflow") : workflow_id_;
+      req.timeline_id = compiled_.workflow_id.empty() ? std::string("workflow") : compiled_.workflow_id;
     }
     fs::create_directories(req.run_dir);
-    appendTrace(req.run_dir, "native_workflow_run_begin workflow=" + workflow_id_ +
+    appendTrace(req.run_dir, "native_workflow_run_begin workflow=" + compiled_.workflow_id +
                                " run_id=" + req.run_id +
                                " prepare_only=" + (req.prepare_only ? std::string("true") : std::string("false")));
 
@@ -1310,13 +1212,13 @@ class NativeWorkflowRunner::Impl {
     json runtime_packets = json::array();
     json runtime_rate_transition_nodes = json::array();
     json outputs = json::object();
-    RuntimeTimeScheduler time_scheduler(time_plan_);
+    RuntimeTimeScheduler time_scheduler(compiled_.time_plan);
     int failed_nodes = 0;
     int iteration_count = 0;
     flightenv::platform::ThreadSafePortStore port_store;
     RuntimePortSampleBuffer port_sample_buffer;
     RuntimeReadyQueueExecutor ready_executor =
-        RuntimeReadyQueueExecutor::fromSchedulerPlan(scheduler_plan_);
+        RuntimeReadyQueueExecutor::fromSchedulerPlan(compiled_.scheduler_plan);
     const flightenv::platform::ReadyQueueScheduler& pdk_scheduler = ready_executor.scheduler();
     const flightenv::platform::ThreadPoolExecutorDescriptor& pdk_executor = ready_executor.executor();
 
@@ -1331,21 +1233,21 @@ class NativeWorkflowRunner::Impl {
     if (forecast_uncertainty.initialize(req.seed_runtime_outputs)) {
       appendTrace(req.run_dir, "forecast_uncertainty_tracker_enabled");
     }
-    if (!req.prepare_only && nodes_.empty() &&
-        estimation_plan_.value("summary", json::object()).value("estimation_system_count", 0) > 0) {
+    if (!req.prepare_only && compiled_.nodes.empty() &&
+        compiled_.estimation_plan.value("summary", json::object()).value("estimation_system_count", 0) > 0) {
       appendTrace(req.run_dir, "runtime_estimation_service_begin");
       estimation::RuntimeEstimationService service;
       estimation::RuntimeEstimationRequest estimation_request;
       estimation_request.run_dir = req.run_dir;
       estimation_request.compiled_workflow_dir = options_.compiled_workflow;
       estimation_request.run_id = req.run_id;
-      estimation_request.workflow_id = workflow_id_;
-      estimation_request.object_id = object_id_;
+      estimation_request.workflow_id = compiled_.workflow_id;
+      estimation_request.object_id = compiled_.object_id;
       estimation_request.branch_id = req.branch_id;
       estimation_request.timeline_id = req.timeline_id;
-      estimation_request.estimation_plan = estimation_plan_;
-      estimation_request.scheduler_plan = scheduler_plan_;
-      estimation_request.workflow_snapshot = workflow_snapshot_;
+      estimation_request.estimation_plan = compiled_.estimation_plan;
+      estimation_request.scheduler_plan = compiled_.scheduler_plan;
+      estimation_request.workflow_snapshot = compiled_.workflow_snapshot;
       estimation_request.external_observations = external_observations;
       if (!req.seed_runtime_outputs.empty()) {
         const fs::path seed_path = fs::absolute(req.seed_runtime_outputs);
@@ -1366,7 +1268,7 @@ class NativeWorkflowRunner::Impl {
     }
 
     if (req.prepare_only) {
-      for (const auto& node : nodes_) {
+      for (const auto& node : compiled_.nodes) {
         appendTrace(req.run_dir, "prepare_node_begin node=" + jsonString(node, "node_id"));
         const int unused_iteration = 0;
         const json time_info = time_scheduler.baseTimeInfo(node, unused_iteration, 0.0);
@@ -1386,7 +1288,7 @@ class NativeWorkflowRunner::Impl {
 
     RuntimeEventLoop event_loop;
     time_scheduler.seedWorkflowEvents(
-        event_loop.queue(), nodes_, max_iterations, base_dt_s, output_period_s, scheduler_table_);
+        event_loop.queue(), compiled_.nodes, max_iterations, base_dt_s, output_period_s, compiled_.scheduler_table);
     if (external_observations.is_array()) {
       const int input_event_count =
           std::min<int>(max_iterations, static_cast<int>(external_observations.size()));
@@ -1409,7 +1311,7 @@ class NativeWorkflowRunner::Impl {
       }
     }
     std::map<std::string, json> node_by_id;
-    for (const auto& node : nodes_) {
+    for (const auto& node : compiled_.nodes) {
       const std::string node_id = jsonString(node, "node_id");
       if (!node_id.empty()) {
         node_by_id[node_id] = node;
@@ -1525,7 +1427,7 @@ class NativeWorkflowRunner::Impl {
                                    " event_time=" + std::to_string(loop_event.event_time_s) +
                                    " node=" + node_id);
         const json base_upstream = previous_seed.is_object() ? previous_seed : json::object();
-        const json target_data_plane = nodePlanInfo(data_plane_plan_, node_id);
+        const json target_data_plane = nodePlanInfo(compiled_.data_plane_plan, node_id);
         RuntimePortBindingResolveRequest binding_request;
         binding_request.node = node;
         binding_request.base_upstream = base_upstream;
@@ -1559,7 +1461,7 @@ class NativeWorkflowRunner::Impl {
         const RuntimeRateTransitionExecutionResult transition_execution =
             RuntimeRateTransitionExecutor::executeForTarget({
                 req.run_id,
-                object_id_,
+                compiled_.object_id,
                 req.branch_id,
                 req.timeline_id,
                 node_id,
@@ -1657,8 +1559,8 @@ class NativeWorkflowRunner::Impl {
             {"input_binding", port_binding.evidence},
             {"input_alignment", input_alignment.evidence()},
             {"ready_queue", admission.evidence},
-            {"scheduling_level", jsonInt(schedulerInfo(scheduler_plan_, node_id), "scheduling_level", 0)},
-            {"parallel_group_id", jsonString(schedulerInfo(scheduler_plan_, node_id), "parallel_group_id")},
+            {"scheduling_level", jsonInt(schedulerInfo(compiled_.scheduler_plan, node_id), "scheduling_level", 0)},
+            {"parallel_group_id", jsonString(schedulerInfo(compiled_.scheduler_plan, node_id), "parallel_group_id")},
         });
 
         try {
@@ -1756,8 +1658,8 @@ class NativeWorkflowRunner::Impl {
       const RuntimePublicFrameResult public_frame = RuntimePublicFrameBuilder::build({
           &loop_event,
           &tick,
-          &nodes_,
-          &data_plane_plan_,
+          &compiled_.nodes,
+          &compiled_.data_plane_plan,
           &port_store,
           &time_scheduler,
           &outputs,
@@ -1787,7 +1689,7 @@ class NativeWorkflowRunner::Impl {
       if (forecast_uncertainty.enabled()) {
         const double forecast_delta_t_s = output_period_s > 0.0 ? output_period_s : base_dt_s;
         const ForecastUncertaintyStep forecast_step = forecast_uncertainty.step(
-            req, workflow_id_, object_id_, iteration, forecast_delta_t_s);
+            req, compiled_.workflow_id, compiled_.object_id, iteration, forecast_delta_t_s);
         if (!forecast_step.output.empty()) {
           outputs["__forecast_uncertainty__"] = forecast_step.output;
           checkpoints.push_back(forecast_step.checkpoint);
@@ -1827,8 +1729,8 @@ class NativeWorkflowRunner::Impl {
     return {
         {"schema_version", "flightenv.platform.native_adapter_session_summary.v1"},
         {"generated_at_utc", nowUtcIso()},
-        {"workflow_id", workflow_id_},
-        {"object_id", object_id_},
+        {"workflow_id", compiled_.workflow_id},
+        {"object_id", compiled_.object_id},
         {"execution_backend", "native_adapter_sessions"},
         {"runtime_zero_copy_mode", runtimeZeroCopyModeName(
                                        resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode))},
@@ -1854,7 +1756,7 @@ class NativeWorkflowRunner::Impl {
     std::map<std::string, int> status_counts;
     int execute_supported_count = 0;
     int production_count = 0;
-    const json registry_adapters = adapter_registry_.value("adapters", json::array());
+    const json registry_adapters = compiled_.adapter_registry.value("adapters", json::array());
     if (registry_adapters.is_array()) {
       for (const auto& adapter : registry_adapters) {
         if (!adapter.is_object()) {
@@ -1888,8 +1790,8 @@ class NativeWorkflowRunner::Impl {
     return {
         {"schema_version", "flightenv.platform.adapter_backend_capability_report.v1"},
         {"generated_at_utc", nowUtcIso()},
-        {"workflow_id", workflow_id_},
-        {"object_id", object_id_},
+        {"workflow_id", compiled_.workflow_id},
+        {"object_id", compiled_.object_id},
         {"runtime_zero_copy_mode", runtimeZeroCopyModeName(
                                        resolveRuntimeZeroCopyMode(options_.runtime_zero_copy_mode))},
         {"typed_buffer_persistence", runtimeTypedBufferPersistenceName(
@@ -1904,236 +1806,18 @@ class NativeWorkflowRunner::Impl {
     };
   }
 
-  void loadCompiledWorkflow() {
-    if (!fs::exists(options_.compiled_workflow)) {
-      throw std::runtime_error("Compiled workflow not found: " + pathString(options_.compiled_workflow));
-    }
-    execution_plan_ = readJson(options_.compiled_workflow / "execution_plan.json");
-    time_plan_ = readJsonIfExists(options_.compiled_workflow / "time_plan.json");
-    scheduler_plan_ = readJsonIfExists(options_.compiled_workflow / "scheduler_plan.json");
-    scheduler_table_ = readJsonIfExists(options_.compiled_workflow / "scheduler_table.json");
-    uncertainty_plan_ = readJsonIfExists(options_.compiled_workflow / "uncertainty_plan.json");
-    state_store_plan_ = readJsonIfExists(options_.compiled_workflow / "state_store_plan.json");
-    data_plane_plan_ = readJsonIfExists(options_.compiled_workflow / "data_plane_plan.json");
-    estimation_plan_ = readJsonIfExists(options_.compiled_workflow / "estimation_plan.json");
-    edge_binding_plan_ = readJson(options_.compiled_workflow / "edge_binding_plan.json");
-    const fs::path rate_transition_plan_path = options_.compiled_workflow / "rate_transition_plan.json";
-    const bool has_rate_transition_plan = fs::exists(rate_transition_plan_path);
-    rate_transition_plan_ = has_rate_transition_plan
-                                ? readJson(rate_transition_plan_path)
-                                : json{
-                                      {"schema_version", "flightenv.platform.rate_transition_plan.v1"},
-                                      {"transitions", json::array()},
-                                      {"summary",
-                                       {{"transition_count", 0},
-                                        {"same_rate_transition_count", 0},
-                                        {"cross_rate_transition_count", 0},
-                                        {"fast_to_slow_count", 0},
-                                        {"slow_to_fast_count", 0},
-                                        {"runtime_transition_count", 0}}},
-                                  };
-    workflow_snapshot_ = readJsonIfExists(options_.compiled_workflow / "workflow_snapshot.json");
-    operator_snapshot_ = readJsonIfExists(options_.compiled_workflow / "operator_snapshot.json");
-    resource_lock_ = readJsonIfExists(options_.compiled_workflow / "resource_lock.json");
-    model_snapshot_ = readJsonIfExists(options_.compiled_workflow / "model_snapshot.json");
-    json execution_nodes = requireArray(execution_plan_, "nodes", options_.compiled_workflow / "execution_plan.json");
-    edge_bindings_by_target_ = json::object();
-    rate_transitions_by_binding_ = json::object();
-    rate_transitions_by_target_ = json::object();
-    const json compiled_transitions = rate_transition_plan_.value("transitions", json::array());
-    if (compiled_transitions.is_array()) {
-      for (const auto& transition : compiled_transitions) {
-        if (!transition.is_object()) {
-          continue;
-        }
-        const std::string transition_id = jsonString(transition, "transition_id");
-        const std::string binding_id = jsonString(transition, "binding_id");
-        const std::string target_node_id = jsonString(transition, "target_node_id");
-        const std::string source_node_id = jsonString(transition, "source_node_id");
-        const std::string source_port_id = jsonString(transition, "source_port_id");
-        const std::string target_port_id = jsonString(transition, "target_port_id");
-        if (transition_id.empty() || binding_id.empty() || target_node_id.empty() ||
-            source_node_id.empty() || source_port_id.empty() || target_port_id.empty()) {
-          throw std::runtime_error("rate_transition_plan.json contains an incomplete transition");
-        }
-        if (rate_transitions_by_binding_.contains(binding_id)) {
-          throw std::runtime_error(
-              "rate_transition_plan.json contains duplicate transition for binding: " + binding_id);
-        }
-        rate_transitions_by_binding_[binding_id] = transition;
-        rate_transitions_by_target_[target_node_id].push_back(transition);
-      }
-    }
-    const json compiled_bindings = edge_binding_plan_.value("bindings", json::array());
-    if (compiled_bindings.is_array()) {
-      for (const auto& binding : compiled_bindings) {
-        if (!binding.is_object()) {
-          continue;
-        }
-        const std::string target_node_id = jsonString(binding, "target_node_id");
-        const std::string source_node_id = jsonString(binding, "source_node_id");
-        const std::string source_port_id = jsonString(binding, "source_port_id");
-        const std::string target_port_id = jsonString(binding, "target_port_id");
-        if (target_node_id.empty() || source_node_id.empty() ||
-            source_port_id.empty() || target_port_id.empty()) {
-          throw std::runtime_error("edge_binding_plan.json contains an incomplete binding");
-        }
-        json enriched_binding = binding;
-        const std::string binding_id = jsonString(enriched_binding, "binding_id");
-        if (!binding_id.empty() && rate_transitions_by_binding_.contains(binding_id)) {
-          enriched_binding["rate_transition"] = rate_transitions_by_binding_.at(binding_id);
-        } else if (has_rate_transition_plan) {
-          throw std::runtime_error(
-              "rate_transition_plan.json is missing a transition for edge binding: " + binding_id);
-        }
-        edge_bindings_by_target_[target_node_id].push_back(enriched_binding);
-      }
-    }
-    if (edge_bindings_by_target_.empty() &&
-        envFlagEnabled("FLIGHTENV_ALLOW_WORKFLOW_SNAPSHOT_EDGE_BINDING_FALLBACK")) {
-      const json workflow = workflow_snapshot_.value("workflow", json::object());
-      const json phases = workflow.value("phases", json::array());
-      if (phases.is_array()) {
-        for (const auto& phase : phases) {
-          if (!phase.is_object()) {
-            continue;
-          }
-          const std::string phase_id = jsonString(phase, "phase_id");
-          const json stages = phase.value("stages", json::array());
-          if (!stages.is_array()) {
-            continue;
-          }
-          for (const auto& stage : stages) {
-            if (!stage.is_object()) {
-              continue;
-            }
-            const std::string stage_id = jsonString(stage, "stage_id");
-            const json subgraph = stage.value("subgraph", json::object());
-            const json edges = subgraph.value("edges", json::array());
-            if (!edges.is_array()) {
-              continue;
-            }
-            for (const auto& edge : edges) {
-              if (!edge.is_object()) {
-                continue;
-              }
-              const json from = edge.value("from", json::object());
-              const json to = edge.value("to", json::object());
-              const std::string from_node = jsonString(from, "node_id");
-              const std::string to_node = jsonString(to, "node_id");
-              if (from_node.empty() || to_node.empty()) {
-                continue;
-              }
-              const std::string source_node_id = phase_id + "." + stage_id + "." + from_node;
-              const std::string target_node_id = phase_id + "." + stage_id + "." + to_node;
-              edge_bindings_by_target_[target_node_id].push_back({
-                  {"source_node_id", source_node_id},
-                  {"source_port_id", jsonString(from, "port_id")},
-                  {"target_node_id", target_node_id},
-                  {"target_port_id", jsonString(to, "port_id")},
-                  {"source", "workflow_snapshot_fallback"},
-              });
-            }
-          }
-        }
-      }
-    }
-    for (auto& node : execution_nodes) {
-      if (!node.is_object()) {
-        continue;
-      }
-      const std::string node_id = jsonString(node, "node_id");
-      if (!edge_bindings_by_target_.contains(node_id)) {
-        continue;
-      }
-      if (!node.contains("depends_on") || !node.at("depends_on").is_array()) {
-        node["depends_on"] = json::array();
-      }
-      std::set<std::string> deps;
-      for (const auto& dep : node.at("depends_on")) {
-        if (dep.is_string()) {
-          deps.insert(dep.get<std::string>());
-        }
-      }
-      for (const auto& binding : edge_bindings_by_target_.at(node_id)) {
-        const std::string source_node_id = jsonString(binding, "source_node_id");
-        if (!source_node_id.empty() && deps.insert(source_node_id).second) {
-          node["depends_on"].push_back(source_node_id);
-        }
-      }
-      node["edge_bindings"] = edge_bindings_by_target_.at(node_id);
-      if (rate_transitions_by_target_.contains(node_id)) {
-        node["rate_transitions"] = rate_transitions_by_target_.at(node_id);
-      }
-    }
-    nodes_ = topoSortNodes(execution_nodes);
-    workflow_id_ = jsonString(execution_plan_, "workflow_id", "workflow");
-    object_id_ = jsonString(execution_plan_, "object_id", "object");
-
-    for (const auto& item : operator_snapshot_.value("operators", json::array())) {
-      operator_by_id_[jsonString(item, "operator_id")] = item;
-    }
-    for (const auto& item : resource_lock_.value("resources", json::array())) {
-      resource_by_id_[jsonString(item, "resource_id")] = item;
-    }
-    for (const auto& item : model_snapshot_.value("operator_bindings", json::array())) {
-      model_binding_by_operator_[jsonString(item, "operator_id")] = item;
-    }
-  }
-
-  void loadAdapterRegistry() {
-    if (options_.adapter_registry.empty() || !fs::exists(options_.adapter_registry)) {
-      if (options_.require_adapter_registry) {
-        throw std::runtime_error("Adapter registry not found: " + pathString(options_.adapter_registry));
-      }
-      adapter_registry_ = json::object();
-      return;
-    }
-    adapter_registry_ = readJson(options_.adapter_registry);
-  }
-
-  json resolveAdapterEntry(const json& node) const {
-    if (!adapter_registry_.is_object() || !adapter_registry_.contains("adapters") ||
-        !adapter_registry_.at("adapters").is_array()) {
-      return json::object();
-    }
-    const std::string adapter_id = jsonString(node, "adapter_id");
-    const std::string execution_kind = jsonString(node, "execution_kind");
-    json wildcard = json::object();
-    json by_kind = json::object();
-    for (const auto& entry : adapter_registry_.at("adapters")) {
-      if (!entry.is_object()) {
-        continue;
-      }
-      const std::string id = jsonString(entry, "adapter_id");
-      if (id == adapter_id) {
-        return entry;
-      }
-      if (id == execution_kind && by_kind.empty()) {
-        by_kind = entry;
-      }
-      if (id == "*" && options_.allow_wildcard_adapter && wildcard.empty()) {
-        wildcard = entry;
-      }
-    }
-    if (!by_kind.empty()) {
-      return by_kind;
-    }
-    return wildcard;
-  }
-
   IAdapterSession& sessionForNode(const json& node, const fs::path& trace_dir = {}) {
     const std::string node_id = jsonString(node, "node_id");
     auto found = sessions_.find(node_id);
     if (found != sessions_.end()) {
       return *found->second;
     }
-    json registry_entry = resolveAdapterEntry(node);
+    json registry_entry = compiled_.resolveAdapterEntry(node, options_.allow_wildcard_adapter);
     const std::string operator_id = jsonString(node, "operator_id");
     auto session = createNativeAdapterSession(
         node,
-        operator_by_id_.count(operator_id) ? operator_by_id_.at(operator_id) : json::object(),
-        model_binding_by_operator_.count(operator_id) ? model_binding_by_operator_.at(operator_id)
+        compiled_.operator_by_id.count(operator_id) ? compiled_.operator_by_id.at(operator_id) : json::object(),
+        compiled_.model_binding_by_operator.count(operator_id) ? compiled_.model_binding_by_operator.at(operator_id)
                                                       : json::object(),
         registry_entry,
         options_,
@@ -2144,9 +1828,9 @@ class NativeWorkflowRunner::Impl {
   }
 
   json workflowLoopPolicy(int runtime_max_iterations) const {
-    const json workflow = workflow_snapshot_.value("workflow", json::object());
+    const json workflow = compiled_.workflow_snapshot.value("workflow", json::object());
     const json stop_policy = workflow.value("stop_policy", json::object());
-    const json solver_policy = time_plan_.value("solver_policy", workflow.value("solver_policy", json::object()));
+    const json solver_policy = compiled_.time_plan.value("solver_policy", workflow.value("solver_policy", json::object()));
     const double base_dt = jsonDouble(solver_policy, "base_dt_s", 0.0);
     const double output_period = jsonDouble(solver_policy, "output_period_s", base_dt);
     int max_iterations = jsonInt(stop_policy, "max_iterations", jsonInt(solver_policy, "max_steps", 1));
@@ -2184,17 +1868,17 @@ class NativeWorkflowRunner::Impl {
     json adapter_node = node;
     const std::string node_id = jsonString(node, "node_id");
     adapter_node["runtime_time"] = time_info;
-    adapter_node["data_plane"] = nodePlanInfo(data_plane_plan_, node_id);
+    adapter_node["data_plane"] = nodePlanInfo(compiled_.data_plane_plan, node_id);
     adapter_node["loop_iteration_index"] = iteration_index;
     return {
         {"run_id", req.run_id},
-        {"workflow_id", workflow_id_},
-        {"object_id", object_id_},
+        {"workflow_id", compiled_.workflow_id},
+        {"object_id", compiled_.object_id},
         {"run_dir", adapterRunDirString(req.run_dir)},
         {"trace_run_dir", pathString(req.run_dir)},
         {"loop_iteration_index", iteration_index},
         {"node", adapter_node},
-        {"resource_locks", resourcePayload(resource_by_id_, node)},
+        {"resource_locks", resourcePayload(compiled_.resource_by_id, node)},
     };
   }
 
@@ -2298,7 +1982,7 @@ class NativeWorkflowRunner::Impl {
     const std::string execution_tag = runtimeExecutionTag(time_info, iteration_index, node_id);
     const json input_summary = summarizeJson(upstream);
 
-    const json data_plane_info = nodePlanInfo(data_plane_plan_, node_id);
+    const json data_plane_info = nodePlanInfo(compiled_.data_plane_plan, node_id);
     RuntimeAdapterInvokeRequest invoke_request;
     invoke_request.run_dir = req.run_dir;
     invoke_request.context = context;
@@ -2338,7 +2022,7 @@ class NativeWorkflowRunner::Impl {
     flightenv::platform::RuntimePacket packet_candidate =
         buildRuntimePacket(
             req.run_id,
-            object_id_,
+            compiled_.object_id,
             req.branch_id,
             req.timeline_id,
             node_id,
@@ -2365,7 +2049,7 @@ class NativeWorkflowRunner::Impl {
             port_store,
             RuntimePortPacketWriteRequest{
                 req.run_id,
-                object_id_,
+                compiled_.object_id,
                 req.branch_id,
                 req.timeline_id,
                 node_id,
@@ -2376,8 +2060,8 @@ class NativeWorkflowRunner::Impl {
     appendTrace(req.run_dir, "execute_node_port_packets_end iteration=" + std::to_string(iteration_index) +
                                " node=" + node_id +
                                " count=" + std::to_string(port_packet_result.packets.size()));
-    const json uncertainty_info = nodePlanInfo(uncertainty_plan_, node_id);
-    const json state_store_info = nodePlanInfo(state_store_plan_, node_id);
+    const json uncertainty_info = nodePlanInfo(compiled_.uncertainty_plan, node_id);
+    const json state_store_info = nodePlanInfo(compiled_.state_store_plan, node_id);
     const RuntimeNodeEvidenceResult node_evidence = RuntimeNodeEvidenceBuilder::build({
         node_id,
         jsonString(node, "operator_id"),
@@ -2434,8 +2118,8 @@ class NativeWorkflowRunner::Impl {
     return {
         {"schema_version", "flightenv.platform.sensor_stream.v1"},
         {"run_id", req.run_id},
-        {"workflow_id", workflow_id_},
-        {"object_id", object_id_},
+        {"workflow_id", compiled_.workflow_id},
+        {"object_id", compiled_.object_id},
         {"generated_at_utc", nowUtcIso()},
         {"source_operator_id", "external.measurement_driver"},
         {"source_stream_path", pathString(req.external_observation_stream)},
@@ -2527,8 +2211,8 @@ class NativeWorkflowRunner::Impl {
         "adapter_lifecycle_log.json",
         {{"schema_version", "flightenv.platform.adapter_lifecycle_log.v1"},
                {"run_id", req.run_id},
-               {"workflow_id", workflow_id_},
-               {"object_id", object_id_},
+               {"workflow_id", compiled_.workflow_id},
+               {"object_id", compiled_.object_id},
                {"generated_at_utc", nowUtcIso()},
                {"execution_backend", "native_adapter_sessions"},
                {"events", lifecycle_events}});
@@ -2536,24 +2220,24 @@ class NativeWorkflowRunner::Impl {
         "scheduler_timeline.json",
         {{"schema_version", "flightenv.platform.scheduler_timeline.v1"},
                {"run_id", req.run_id},
-               {"workflow_id", workflow_id_},
-               {"object_id", object_id_},
+               {"workflow_id", compiled_.workflow_id},
+               {"object_id", compiled_.object_id},
                {"generated_at_utc", nowUtcIso()},
                {"events", scheduler_events}});
     evidence_writer.writeJson(
         "runtime_node_snapshot.json",
         {{"schema_version", "flightenv.platform.runtime_node_snapshot.v1"},
                {"run_id", req.run_id},
-               {"workflow_id", workflow_id_},
-               {"object_id", object_id_},
+               {"workflow_id", compiled_.workflow_id},
+               {"object_id", compiled_.object_id},
                {"generated_at_utc", nowUtcIso()},
                {"nodes", node_snapshots}});
     evidence_writer.writeJson(
         "runtime_outputs.json",
         {{"schema_version", "flightenv.platform.runtime_outputs.v1"},
                {"run_id", req.run_id},
-               {"workflow_id", workflow_id_},
-               {"object_id", object_id_},
+               {"workflow_id", compiled_.workflow_id},
+               {"object_id", compiled_.object_id},
                {"generated_at_utc", nowUtcIso()},
                {"last_loop_iteration_index", std::max(0, iteration_count - 1)},
                {"typed_buffer_store", typed_buffer_store_summary},
@@ -2562,8 +2246,8 @@ class NativeWorkflowRunner::Impl {
         "runtime_loop_summary.json",
         {{"schema_version", "flightenv.platform.runtime_loop_summary.v1"},
                {"run_id", req.run_id},
-               {"workflow_id", workflow_id_},
-               {"object_id", object_id_},
+               {"workflow_id", compiled_.workflow_id},
+               {"object_id", compiled_.object_id},
                {"generated_at_utc", nowUtcIso()},
                {"iterations", loop_iterations},
                {"summary",
@@ -2584,8 +2268,8 @@ class NativeWorkflowRunner::Impl {
         "runtime_packets.json",
         {{"schema_version", "flightenv.platform.runtime_packets.v1"},
                {"run_id", req.run_id},
-               {"workflow_id", workflow_id_},
-               {"object_id", object_id_},
+               {"workflow_id", compiled_.workflow_id},
+               {"object_id", compiled_.object_id},
                {"branch_id", req.branch_id},
                {"timeline_id", req.timeline_id},
                {"generated_at_utc", nowUtcIso()},
@@ -2610,8 +2294,8 @@ class NativeWorkflowRunner::Impl {
         "runtime_rate_transition_nodes.json",
         {{"schema_version", "flightenv.platform.runtime_rate_transition_nodes.v1"},
                {"run_id", req.run_id},
-               {"workflow_id", workflow_id_},
-               {"object_id", object_id_},
+               {"workflow_id", compiled_.workflow_id},
+               {"object_id", compiled_.object_id},
                {"branch_id", req.branch_id},
                {"timeline_id", req.timeline_id},
                {"generated_at_utc", nowUtcIso()},
@@ -2624,8 +2308,8 @@ class NativeWorkflowRunner::Impl {
         "data_plane_manifest.json",
         {{"schema_version", "flightenv.platform.data_plane_manifest.v1"},
                {"run_id", req.run_id},
-               {"workflow_id", workflow_id_},
-               {"object_id", object_id_},
+               {"workflow_id", compiled_.workflow_id},
+               {"object_id", compiled_.object_id},
                {"generated_at_utc", nowUtcIso()},
                {"entries", data_plane_entries},
                {"summary", {{"entry_count", data_plane_entries.size()}}}});
@@ -2633,16 +2317,16 @@ class NativeWorkflowRunner::Impl {
         "uncertainty_evidence.json",
         {{"schema_version", "flightenv.platform.uncertainty_evidence.v1"},
                {"run_id", req.run_id},
-               {"workflow_id", workflow_id_},
-               {"object_id", object_id_},
+               {"workflow_id", compiled_.workflow_id},
+               {"object_id", compiled_.object_id},
                {"generated_at_utc", nowUtcIso()},
                {"nodes", uncertainty_nodes}});
     evidence_writer.writeJson(
         "forecast_uncertainty_evidence.json",
         {{"schema_version", "flightenv.platform.forecast_uncertainty_evidence.v1"},
                {"run_id", req.run_id},
-               {"workflow_id", workflow_id_},
-               {"object_id", object_id_},
+               {"workflow_id", compiled_.workflow_id},
+               {"object_id", compiled_.object_id},
                {"branch_id", req.branch_id},
                {"timeline_id", req.timeline_id},
                {"generated_at_utc", nowUtcIso()},
@@ -2652,48 +2336,48 @@ class NativeWorkflowRunner::Impl {
         "state_checkpoint.json",
         {{"schema_version", "flightenv.platform.state_checkpoint.v1"},
                {"run_id", req.run_id},
-               {"workflow_id", workflow_id_},
-               {"object_id", object_id_},
+               {"workflow_id", compiled_.workflow_id},
+               {"object_id", compiled_.object_id},
                {"generated_at_utc", nowUtcIso()},
                {"checkpoints", checkpoints}});
     evidence_writer.writeJson(
         "runtime_artifacts.json",
         {{"schema_version", "flightenv.platform.runtime_artifacts.v1"},
                {"run_id", req.run_id},
-               {"workflow_id", workflow_id_},
-               {"object_id", object_id_},
+               {"workflow_id", compiled_.workflow_id},
+               {"object_id", compiled_.object_id},
                {"generated_at_utc", nowUtcIso()},
                {"inputs", input_artifacts},
                {"outputs", output_artifacts}});
     evidence_writer.writeJson("sensor_stream.json", buildSensorStreamArtifact(req, external_observations));
     evidence_writer.writeJson("adapter_session_summary.json", sessionSummary());
     evidence_writer.writeJson("adapter_backend_capability_report.json", backend_capability_report);
-    evidence_writer.writeJson("edge_binding_plan.json", edge_binding_plan_);
-    evidence_writer.writeJson("rate_transition_plan.json", rate_transition_plan_);
+    evidence_writer.writeJson("edge_binding_plan.json", compiled_.edge_binding_plan);
+    evidence_writer.writeJson("rate_transition_plan.json", compiled_.rate_transition_plan);
     json scheduler_due_time_trace = json::object();
     json scheduler_diagnostics = json::object();
-    if (!scheduler_table_.empty()) {
-      evidence_writer.writeJson("scheduler_table.json", scheduler_table_);
-      scheduler_due_time_trace = RuntimeDueTimeScheduler(scheduler_table_).buildTrace();
+    if (!compiled_.scheduler_table.empty()) {
+      evidence_writer.writeJson("scheduler_table.json", compiled_.scheduler_table);
+      scheduler_due_time_trace = RuntimeDueTimeScheduler(compiled_.scheduler_table).buildTrace();
       evidence_writer.writeJson("scheduler_due_time_trace.json", scheduler_due_time_trace);
       scheduler_diagnostics = RuntimeScheduleDiagnostics(
-          scheduler_table_,
+          compiled_.scheduler_table,
           scheduler_due_time_trace,
           pdk_executor.options.max_workers)
                                   .build();
       evidence_writer.writeJson("scheduler_diagnostics.json", scheduler_diagnostics);
     }
     const json time_plan_summary =
-        time_plan_.contains("summary") && time_plan_.at("summary").is_object()
-            ? time_plan_.at("summary")
+        compiled_.time_plan.contains("summary") && compiled_.time_plan.at("summary").is_object()
+            ? compiled_.time_plan.at("summary")
             : json::object();
     const json scheduler_plan_summary =
-        scheduler_plan_.contains("summary") && scheduler_plan_.at("summary").is_object()
-            ? scheduler_plan_.at("summary")
+        compiled_.scheduler_plan.contains("summary") && compiled_.scheduler_plan.at("summary").is_object()
+            ? compiled_.scheduler_plan.at("summary")
             : json::object();
     const json scheduler_table_summary =
-        scheduler_table_.contains("summary") && scheduler_table_.at("summary").is_object()
-            ? scheduler_table_.at("summary")
+        compiled_.scheduler_table.contains("summary") && compiled_.scheduler_table.at("summary").is_object()
+            ? compiled_.scheduler_table.at("summary")
             : json::object();
     const json scheduler_due_time_trace_summary =
         scheduler_due_time_trace.contains("summary") && scheduler_due_time_trace.at("summary").is_object()
@@ -2707,8 +2391,8 @@ class NativeWorkflowRunner::Impl {
         "runtime_evidence.json",
         {{"schema_version", "flightenv.platform.runtime_evidence.v1"},
                {"run_id", req.run_id},
-               {"workflow_id", workflow_id_},
-               {"object_id", object_id_},
+               {"workflow_id", compiled_.workflow_id},
+               {"object_id", compiled_.object_id},
                {"branch_id", req.branch_id},
                {"timeline_id", req.timeline_id},
                {"status", status},
@@ -2719,7 +2403,7 @@ class NativeWorkflowRunner::Impl {
                {"compiled_workflow_dir", pathString(options_.compiled_workflow)},
                {"initial_seed", seed},
                {"summary",
-                {{"node_count", nodes_.size()},
+                {{"node_count", compiled_.nodes.size()},
                  {"iteration_count", iteration_count},
                  {"failed_nodes", failed_nodes},
                  {"input_alignment_blocked_count",
@@ -2753,13 +2437,13 @@ class NativeWorkflowRunner::Impl {
                   forecast_uncertainty_summary.value("latest_covariance_trace", 0.0)},
                  {"forecast_uncertainty_growth_ratio",
                   forecast_uncertainty_summary.value("growth_ratio", 0.0)},
-                 {"edge_binding_count", edge_binding_plan_.value("summary", json::object()).value("binding_count", 0)},
+                 {"edge_binding_count", compiled_.edge_binding_plan.value("summary", json::object()).value("binding_count", 0)},
                  {"rate_transition_count",
-                  rate_transition_plan_.value("summary", json::object()).value("transition_count", 0)},
+                  compiled_.rate_transition_plan.value("summary", json::object()).value("transition_count", 0)},
                  {"cross_rate_transition_count",
-                  rate_transition_plan_.value("summary", json::object()).value("cross_rate_transition_count", 0)},
+                  compiled_.rate_transition_plan.value("summary", json::object()).value("cross_rate_transition_count", 0)},
                  {"runtime_rate_transition_count",
-                  rate_transition_plan_.value("summary", json::object()).value("runtime_transition_count", 0)},
+                  compiled_.rate_transition_plan.value("summary", json::object()).value("runtime_transition_count", 0)},
                  {"time_plan_node_count", time_plan_summary.value("node_count", 0)},
                  {"time_plan_distinct_delta_t_s",
                   time_plan_summary.value("distinct_delta_t_s", json::array())},
@@ -2827,7 +2511,7 @@ class NativeWorkflowRunner::Impl {
                  {"runtime_rate_transition_nodes", "runtime_rate_transition_nodes.json"},
                  {"edge_binding_plan", "edge_binding_plan.json"},
                  {"rate_transition_plan", "rate_transition_plan.json"},
-                 {"scheduler_table", scheduler_table_.empty() ? "" : "scheduler_table.json"},
+                 {"scheduler_table", compiled_.scheduler_table.empty() ? "" : "scheduler_table.json"},
                  {"scheduler_due_time_trace",
                   scheduler_due_time_trace.empty() ? "" : "scheduler_due_time_trace.json"},
                  {"scheduler_diagnostics",
@@ -2839,31 +2523,8 @@ class NativeWorkflowRunner::Impl {
   }
 
   NativeWorkflowOptions options_;
-  json execution_plan_ = json::object();
-  json time_plan_ = json::object();
-  json scheduler_plan_ = json::object();
-  json scheduler_table_ = json::object();
-  json uncertainty_plan_ = json::object();
-  json state_store_plan_ = json::object();
-  json data_plane_plan_ = json::object();
-  json estimation_plan_ = json::object();
-  json edge_binding_plan_ = json::object();
-  json rate_transition_plan_ = json::object();
-  json workflow_snapshot_ = json::object();
-  json operator_snapshot_ = json::object();
-  json resource_lock_ = json::object();
-  json model_snapshot_ = json::object();
-  json adapter_registry_ = json::object();
-  json edge_bindings_by_target_ = json::object();
-  json rate_transitions_by_binding_ = json::object();
-  json rate_transitions_by_target_ = json::object();
-  std::vector<json> nodes_;
-  std::map<std::string, json> operator_by_id_;
-  std::map<std::string, json> resource_by_id_;
-  std::map<std::string, json> model_binding_by_operator_;
+  NativeWorkflowCompiledState compiled_;
   std::map<std::string, std::unique_ptr<IAdapterSession>> sessions_;
-  std::string workflow_id_;
-  std::string object_id_;
   json scratch_scheduler_events_ = json::array();
 };
 
