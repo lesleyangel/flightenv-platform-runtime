@@ -13,6 +13,7 @@
 
 #include "NativeAdapterSessions.hpp"
 #include "NativeWorkflowCompiledState.hpp"
+#include "NativeWorkflowNodePreparation.hpp"
 
 #include "FlightEnvPlatform/Adapter/AdapterAbi.hpp"
 #include "FlightEnvPlatform/Runtime/ReadyQueueScheduler.hpp"
@@ -25,9 +26,7 @@
 #include "FlightEnvPlatformRuntime/RuntimeEventLoop.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeEvidenceWriter.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeNodeEvidenceBuilder.hpp"
-#include "FlightEnvPlatformRuntime/RuntimePortBindingResolver.hpp"
 #include "FlightEnvPlatformRuntime/RuntimePortPacketWriter.hpp"
-#include "FlightEnvPlatformRuntime/RuntimeRateTransitionExecutor.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeReadyQueueExecutor.hpp"
 #include "FlightEnvPlatformRuntime/RuntimePublicFrameBuilder.hpp"
 #include "FlightEnvPlatformRuntime/RuntimeScheduleDiagnostics.hpp"
@@ -38,7 +37,6 @@
 #include "FlightEnvPlatformRuntime/estimation/RuntimeEstimationService.hpp"
 #include "FlightEnvPlatformRuntime/estimation/SampleSetStore.hpp"
 #include "FlightEnvPlatformRuntime/time/RuntimeEventQueue.hpp"
-#include "FlightEnvPlatformRuntime/time/RuntimeInputAlignment.hpp"
 #include "FlightEnvPlatformRuntime/time/RuntimeMaterialization.hpp"
 #include "FlightEnvPlatformRuntime/time/RuntimePortSampleBuffer.hpp"
 
@@ -1428,24 +1426,32 @@ class NativeWorkflowRunner::Impl {
                                    " node=" + node_id);
         const json base_upstream = previous_seed.is_object() ? previous_seed : json::object();
         const json target_data_plane = nodePlanInfo(compiled_.data_plane_plan, node_id);
-        RuntimePortBindingResolveRequest binding_request;
-        binding_request.node = node;
-        binding_request.base_upstream = base_upstream;
-        binding_request.external_seed =
-            externalObservationSeed(external_observations, iteration, req.external_observation_stream);
-        binding_request.current_outputs = outputs;
-        binding_request.data_plane_info = target_data_plane;
-        binding_request.port_store = &port_store;
-        binding_request.branch_id = req.branch_id;
-        binding_request.timeline_id = req.timeline_id;
-        binding_request.event_time_ns = loop_event.event_time.nanoseconds;
-        binding_request.allow_implicit_contract_port_binding =
-            envFlagEnabled("FLIGHTENV_ALLOW_IMPLICIT_CONTRACT_PORT_BINDING");
-        binding_request.trace = [&](const std::string& message) {
-          appendTrace(req.run_dir, message);
-        };
-        const RuntimePortBindingResolveResult port_binding =
-            RuntimePortBindingResolver::resolve(binding_request);
+        const RuntimeNodeDispatch cadence =
+            time_scheduler.planEventDispatch(node, loop_event, base_dt_s, output_period_s);
+        const json time_info = cadence.time_info;
+        const NativeWorkflowNodeInputPreparationResult input_preparation =
+            prepareNativeWorkflowNodeInputs({
+                req.run_id,
+                compiled_.object_id,
+                req.branch_id,
+                req.timeline_id,
+                node_id,
+                node,
+                base_upstream,
+                externalObservationSeed(external_observations, iteration, req.external_observation_stream),
+                outputs,
+                target_data_plane,
+                time_info,
+                loop_event.event_time.nanoseconds,
+                iteration,
+                &port_store,
+                &port_sample_buffer,
+                envFlagEnabled("FLIGHTENV_ALLOW_IMPLICIT_CONTRACT_PORT_BINDING"),
+                [&](const std::string& message) {
+                  appendTrace(req.run_dir, message);
+                },
+            });
+        const RuntimePortBindingResolveResult& port_binding = input_preparation.port_binding;
         json input_binding_event = RuntimeEventLoop::schedulerEvent(
             loop_event,
             "input_binding",
@@ -1453,24 +1459,9 @@ class NativeWorkflowRunner::Impl {
         input_binding_event["node_id"] = node_id;
         input_binding_event["input_binding"] = port_binding.evidence;
         scheduler_events.push_back(input_binding_event);
-        json upstream = port_binding.upstream;
-
-        const RuntimeNodeDispatch cadence =
-            time_scheduler.planEventDispatch(node, loop_event, base_dt_s, output_period_s);
-        const json time_info = cadence.time_info;
-        const RuntimeRateTransitionExecutionResult transition_execution =
-            RuntimeRateTransitionExecutor::executeForTarget({
-                req.run_id,
-                compiled_.object_id,
-                req.branch_id,
-                req.timeline_id,
-                node_id,
-                node,
-                time_info,
-                iteration,
-                &port_sample_buffer,
-                &port_store,
-            });
+        json upstream = input_preparation.upstream;
+        const RuntimeRateTransitionExecutionResult& transition_execution =
+            input_preparation.transition_execution;
         if (transition_execution.hasEvidence()) {
           for (const auto& event : transition_execution.events) {
             scheduler_events.push_back(event);
@@ -1480,9 +1471,7 @@ class NativeWorkflowRunner::Impl {
             runtime_packets.push_back(packet);
           }
         }
-        const RuntimeInputAlignmentResult input_alignment =
-            RuntimeInputAlignment::alignNodeInputs(node, time_info, port_sample_buffer);
-        RuntimeInputAlignment::applyAlignedInputs(input_alignment, upstream);
+        const RuntimeInputAlignmentResult& input_alignment = input_preparation.input_alignment;
         public_tick_effective_delta_t_by_node[node_id] = cadence.effective_delta_t_s;
         if (input_alignment.hasUnavailableRequiredInputs()) {
           scheduler_events.push_back({

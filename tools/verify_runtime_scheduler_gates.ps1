@@ -165,6 +165,8 @@ function Assert-PlatformRuntimeStaticGate {
         'include\FlightEnvPlatformRuntime\RuntimeTimelineMaterializer.hpp',
         'src\RuntimeTimeScheduler.cpp',
         'src\RuntimeEventLoop.cpp',
+        'src\NativeWorkflowNodePreparation.cpp',
+        'src\NativeWorkflowNodePreparation.hpp',
         'src\RuntimeReadyQueueExecutor.cpp',
         'src\RuntimePublicFrameBuilder.cpp',
         'src\RuntimePublicFramePolicy.cpp',
@@ -177,10 +179,12 @@ function Assert-PlatformRuntimeStaticGate {
     }
 
     $runner = Join-Path $runtimeRoot 'src\NativeWorkflowRunner.cpp'
+    $nodePreparation = Join-Path $runtimeRoot 'src\NativeWorkflowNodePreparation.cpp'
     Assert-TextContains -PathValue $runner -Pattern 'RuntimeEventLoop event_loop' -Label 'Gate B event loop hot path'
     Assert-TextContains -PathValue $runner -Pattern 'recordExternalObservationSample' -Label 'Gate B input_arrived sample-buffer ingestion'
-    Assert-TextContains -PathValue $runner -Pattern 'RuntimePortBindingResolver::resolve' -Label 'Gate D strict port binding hot path'
-    Assert-TextContains -PathValue $runner -Pattern 'RuntimeInputAlignment::alignNodeInputs' -Label 'Gate D input alignment hot path'
+    Assert-TextContains -PathValue $runner -Pattern 'prepareNativeWorkflowNodeInputs' -Label 'Gate D node input preparation hot path'
+    Assert-TextContains -PathValue $nodePreparation -Pattern 'RuntimePortBindingResolver::resolve' -Label 'Gate D strict port binding hot path'
+    Assert-TextContains -PathValue $nodePreparation -Pattern 'RuntimeInputAlignment::alignNodeInputs' -Label 'Gate D input alignment hot path'
     Assert-TextContains -PathValue $runner -Pattern 'ready_executor.admitNode' -Label 'Gate C ReadyQueue admission hot path'
     Assert-TextContains -PathValue $runner -Pattern 'RuntimePublicFrameBuilder::build' -Label 'Gate F public materialization hot path'
 
